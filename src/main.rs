@@ -123,6 +123,7 @@ struct RegionPlan {
     owned_ami_count: usize,
     owned_snapshot_count: usize,
     referenced_ami_count: usize,
+    unresolved_ami_references: Vec<String>,
     referenced_snapshot_count_after_ami_keeps: usize,
     deregister_amis: Vec<AmiInfo>,
     delete_snapshots: Vec<SnapshotInfo>,
@@ -137,7 +138,9 @@ struct RegionPlan {
 #[derive(Clone, Debug, Default)]
 struct ExecutionSummary {
     deregistered_amis: usize,
+    skipped_amis: usize,
     deleted_snapshots: usize,
+    skipped_snapshots: usize,
     deleted_backup_recovery_points: usize,
     skipped_backup_recovery_points: usize,
     failures: Vec<String>,
@@ -148,6 +151,18 @@ struct LaunchTemplateRef {
     launch_template_id: Option<String>,
     launch_template_name: Option<String>,
     version: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct AmiReferenceScan {
+    referenced_ami_ids: HashSet<String>,
+    unresolved_references: HashSet<String>,
+}
+
+#[derive(Debug)]
+enum ImageReferenceResolution {
+    Ami(String),
+    Unresolved(String),
 }
 
 #[tokio::main]
@@ -206,8 +221,15 @@ async fn main() -> AppResult<()> {
             Ok(plan) => {
                 print_region_plan(&plan);
                 if args.execute {
-                    let summary =
-                        execute_region_plan(&ec2_client, &backup_client, &plan, &args).await;
+                    let summary = execute_region_plan(
+                        &ec2_client,
+                        &asg_client,
+                        &backup_client,
+                        &ssm_client,
+                        &plan,
+                        &args,
+                    )
+                    .await;
                     print_execution_summary(&region, &summary);
                     if !summary.failures.is_empty() {
                         had_failures = true;
@@ -246,6 +268,7 @@ async fn resolve_regions(args: &Args, ec2_client: &ec2::Client) -> AppResult<Vec
     let mut regions = response
         .regions()
         .iter()
+        .filter(|region| is_enabled_region(region.opt_in_status()))
         .filter_map(|region| region.region_name().map(ToString::to_string))
         .collect::<Vec<String>>();
 
@@ -253,6 +276,13 @@ async fn resolve_regions(args: &Args, ec2_client: &ec2::Client) -> AppResult<Vec
     regions.dedup();
 
     Ok(regions)
+}
+
+fn is_enabled_region(opt_in_status: Option<&str>) -> bool {
+    match opt_in_status {
+        Some("opted-in" | "opt-in-not-required") | None => true,
+        Some(_) => false,
+    }
 }
 
 async fn build_region_plan(
@@ -265,30 +295,61 @@ async fn build_region_plan(
 ) -> AppResult<RegionPlan> {
     let owned_amis = list_owned_amis(ec2_client).await?;
     let owned_snapshots = list_owned_snapshots(ec2_client).await?;
-    let referenced_ami_ids = collect_referenced_ami_ids(ec2_client, asg_client, ssm_client).await?;
+    let reference_scan = collect_referenced_ami_ids(ec2_client, asg_client, ssm_client).await?;
 
-    let mut plan = plan_region(args, region, owned_amis, owned_snapshots, referenced_ami_ids);
+    let mut plan =
+        plan_region(args, region, owned_amis, owned_snapshots, reference_scan.referenced_ami_ids);
 
-    match discover_backup_recovery_points(backup_client, &plan.backup_managed_snapshots).await {
-        Ok((mut resolved, unresolved)) => {
+    if !reference_scan.unresolved_references.is_empty() {
+        plan.unresolved_ami_references =
+            reference_scan.unresolved_references.into_iter().collect::<Vec<String>>();
+        plan.unresolved_ami_references.sort_unstable();
+        if !plan.deregister_amis.is_empty() {
+            plan.skipped_amis += plan.deregister_amis.len();
+            plan.deregister_amis.clear();
+        }
+    }
+
+    let snapshot_delete_candidates = plan.delete_snapshots.clone();
+    match discover_backup_recovery_points(backup_client, &snapshot_delete_candidates).await {
+        Ok((resolved, snapshots_without_recovery_points)) => {
+            let recovery_point_snapshot_ids = resolved
+                .iter()
+                .map(|recovery_point| recovery_point.snapshot_id.clone())
+                .collect::<HashSet<String>>();
+
+            plan.backup_managed_snapshots = snapshot_delete_candidates
+                .iter()
+                .filter(|snapshot| recovery_point_snapshot_ids.contains(&snapshot.snapshot_id))
+                .cloned()
+                .collect::<Vec<SnapshotInfo>>();
+
             let mut tag_filtered = 0usize;
-            resolved.retain(|recovery_point| {
+            let mut recovery_points_to_delete = resolved;
+            recovery_points_to_delete.retain(|recovery_point| {
                 let allowed = backup_recovery_point_deletion_tag_allows(&recovery_point.tags, args);
                 if !allowed {
                     tag_filtered += 1;
                 }
                 allowed
             });
+
+            plan.delete_snapshots = snapshots_without_recovery_points;
             plan.tag_filtered_backup_recovery_points = tag_filtered;
-            plan.delete_backup_recovery_points = resolved;
-            plan.unresolved_backup_snapshots = unresolved;
+            plan.delete_backup_recovery_points = recovery_points_to_delete;
+            plan.unresolved_backup_snapshots = Vec::new();
         }
         Err(error) => {
+            // Fail closed for snapshot deletion if backup inventory can't be trusted.
             warn!(
-                "Failed to map backup-managed snapshots to recovery points in region {}: {}",
+                "Failed to map snapshots to backup recovery points in region {}: {}",
                 region, error
             );
-            plan.unresolved_backup_snapshots = plan.backup_managed_snapshots.clone();
+            plan.unresolved_backup_snapshots = snapshot_delete_candidates;
+            plan.delete_snapshots.clear();
+            plan.backup_managed_snapshots.clear();
+            plan.delete_backup_recovery_points.clear();
+            plan.tag_filtered_backup_recovery_points = 0;
         }
     }
 
@@ -342,7 +403,6 @@ fn plan_region(
         .collect::<HashSet<String>>();
 
     let mut delete_snapshots = Vec::new();
-    let mut backup_managed_snapshots = Vec::new();
     let mut skipped_snapshots = 0usize;
 
     for snapshot in &owned_snapshots {
@@ -361,11 +421,7 @@ fn plan_region(
             continue;
         }
 
-        if looks_like_backup_managed(snapshot) {
-            backup_managed_snapshots.push(snapshot.clone());
-        } else {
-            delete_snapshots.push(snapshot.clone());
-        }
+        delete_snapshots.push(snapshot.clone());
     }
 
     RegionPlan {
@@ -373,10 +429,11 @@ fn plan_region(
         owned_ami_count: owned_amis.len(),
         owned_snapshot_count: owned_snapshots.len(),
         referenced_ami_count: referenced_ami_ids.len(),
+        unresolved_ami_references: Vec::new(),
         referenced_snapshot_count_after_ami_keeps: remaining_ami_snapshot_refs.len(),
         deregister_amis,
         delete_snapshots,
-        backup_managed_snapshots,
+        backup_managed_snapshots: Vec::new(),
         delete_backup_recovery_points: Vec::new(),
         unresolved_backup_snapshots: Vec::new(),
         tag_filtered_backup_recovery_points: 0,
@@ -463,17 +520,6 @@ fn backup_recovery_point_deletion_tag_allows(tags: &HashMap<String, String>, arg
         &args.backup_delete_tag,
         optional_expected_value(&args.backup_delete_tag_value),
     )
-}
-
-fn looks_like_backup_managed(snapshot: &SnapshotInfo) -> bool {
-    if snapshot.tags.keys().any(|key| key.starts_with("aws:backup:")) {
-        return true;
-    }
-
-    snapshot.description.as_deref().is_some_and(|description| {
-        let lowered = description.to_ascii_lowercase();
-        lowered.contains("aws backup") || lowered.contains("recovery point")
-    })
 }
 
 fn select_latest_ami_ids_by_family(amis: &[AmiInfo], keep_count: usize) -> HashSet<String> {
@@ -614,7 +660,9 @@ async fn discover_backup_recovery_points(
         .map(|snapshot| snapshot.snapshot_id.clone())
         .collect::<HashSet<String>>();
 
-    let mut resolved_by_snapshot: HashMap<String, BackupRecoveryPoint> = HashMap::new();
+    let mut resolved = Vec::<BackupRecoveryPoint>::new();
+    let mut seen_recovery_point_arns = HashSet::new();
+    let mut matched_snapshot_ids = HashSet::new();
 
     let mut vault_pages = backup_client.list_backup_vaults().into_paginator().page_size(100).send();
     while let Some(vault_page) = vault_pages.next().await {
@@ -662,28 +710,29 @@ async fn discover_backup_recovery_points(
                             }
                         };
 
-                    resolved_by_snapshot.entry(snapshot_id.to_string()).or_insert_with(|| {
-                        BackupRecoveryPoint {
+                    if seen_recovery_point_arns.insert(recovery_point_arn.to_string()) {
+                        matched_snapshot_ids.insert(snapshot_id.to_string());
+                        resolved.push(BackupRecoveryPoint {
                             snapshot_id: snapshot_id.to_string(),
                             backup_vault_name: vault_name.to_string(),
                             recovery_point_arn: recovery_point_arn.to_string(),
                             tags,
-                        }
-                    });
+                        });
+                    }
                 }
             }
         }
     }
 
-    let mut resolved = resolved_by_snapshot.into_values().collect::<Vec<BackupRecoveryPoint>>();
-    resolved.sort_by(|left, right| left.snapshot_id.cmp(&right.snapshot_id));
-
-    let resolved_snapshot_ids =
-        resolved.iter().map(|entry| entry.snapshot_id.clone()).collect::<HashSet<String>>();
+    resolved.sort_by(|left, right| {
+        left.snapshot_id
+            .cmp(&right.snapshot_id)
+            .then_with(|| left.recovery_point_arn.cmp(&right.recovery_point_arn))
+    });
 
     let unresolved = backup_managed_snapshots
         .iter()
-        .filter(|snapshot| !resolved_snapshot_ids.contains(&snapshot.snapshot_id))
+        .filter(|snapshot| !matched_snapshot_ids.contains(&snapshot.snapshot_id))
         .cloned()
         .collect::<Vec<SnapshotInfo>>();
 
@@ -715,17 +764,32 @@ async fn collect_referenced_ami_ids(
     ec2_client: &ec2::Client,
     asg_client: &autoscaling::Client,
     ssm_client: &ssm::Client,
-) -> AppResult<HashSet<String>> {
-    let mut references = HashSet::new();
+) -> AppResult<AmiReferenceScan> {
+    let mut scan = AmiReferenceScan::default();
     let mut ssm_cache = HashMap::new();
 
-    references.extend(collect_instance_ami_ids(ec2_client).await?);
-    references
-        .extend(collect_launch_template_ami_ids(ec2_client, ssm_client, &mut ssm_cache).await?);
-    references
-        .extend(collect_asg_ami_ids(ec2_client, asg_client, ssm_client, &mut ssm_cache).await?);
+    scan.referenced_ami_ids.extend(collect_instance_ami_ids(ec2_client).await?);
+    scan.referenced_ami_ids.extend(
+        collect_launch_template_ami_ids(
+            ec2_client,
+            ssm_client,
+            &mut ssm_cache,
+            &mut scan.unresolved_references,
+        )
+        .await?,
+    );
+    scan.referenced_ami_ids.extend(
+        collect_asg_ami_ids(
+            ec2_client,
+            asg_client,
+            ssm_client,
+            &mut ssm_cache,
+            &mut scan.unresolved_references,
+        )
+        .await?,
+    );
 
-    Ok(references)
+    Ok(scan)
 }
 
 async fn collect_instance_ami_ids(ec2_client: &ec2::Client) -> AppResult<HashSet<String>> {
@@ -767,6 +831,7 @@ async fn collect_launch_template_ami_ids(
     ec2_client: &ec2::Client,
     ssm_client: &ssm::Client,
     ssm_cache: &mut HashMap<String, Option<String>>,
+    unresolved_references: &mut HashSet<String>,
 ) -> AppResult<HashSet<String>> {
     let mut references = HashSet::new();
 
@@ -793,10 +858,16 @@ async fn collect_launch_template_ami_ids(
                     if let Some(image_reference) = version
                         .launch_template_data()
                         .and_then(|launch_template_data| launch_template_data.image_id())
-                        && let Some(resolved_ami_id) =
-                            resolve_image_reference(image_reference, ssm_client, ssm_cache).await?
                     {
-                        references.insert(resolved_ami_id);
+                        match resolve_image_reference(image_reference, ssm_client, ssm_cache).await
+                        {
+                            ImageReferenceResolution::Ami(resolved_ami_id) => {
+                                references.insert(resolved_ami_id);
+                            }
+                            ImageReferenceResolution::Unresolved(reason) => {
+                                unresolved_references.insert(reason);
+                            }
+                        }
                     }
                 }
             }
@@ -811,6 +882,7 @@ async fn collect_asg_ami_ids(
     asg_client: &autoscaling::Client,
     ssm_client: &ssm::Client,
     ssm_cache: &mut HashMap<String, Option<String>>,
+    unresolved_references: &mut HashSet<String>,
 ) -> AppResult<HashSet<String>> {
     let mut references = HashSet::new();
 
@@ -825,6 +897,7 @@ async fn collect_asg_ami_ids(
                     ec2_client,
                     ssm_client,
                     ssm_cache,
+                    unresolved_references,
                     &LaunchTemplateRef {
                         launch_template_id: launch_template_spec
                             .launch_template_id()
@@ -848,6 +921,7 @@ async fn collect_asg_ami_ids(
                         ec2_client,
                         ssm_client,
                         ssm_cache,
+                        unresolved_references,
                         &LaunchTemplateRef {
                             launch_template_id: base_spec
                                 .launch_template_id()
@@ -868,6 +942,7 @@ async fn collect_asg_ami_ids(
                             ec2_client,
                             ssm_client,
                             ssm_cache,
+                            unresolved_references,
                             &LaunchTemplateRef {
                                 launch_template_id: template_spec
                                     .launch_template_id()
@@ -907,6 +982,7 @@ async fn resolve_launch_template_ref_image_ids(
     ec2_client: &ec2::Client,
     ssm_client: &ssm::Client,
     ssm_cache: &mut HashMap<String, Option<String>>,
+    unresolved_references: &mut HashSet<String>,
     launch_template_ref: &LaunchTemplateRef,
 ) -> AppResult<HashSet<String>> {
     let mut request = ec2_client.describe_launch_template_versions();
@@ -928,10 +1004,15 @@ async fn resolve_launch_template_ref_image_ids(
             if let Some(image_reference) = version
                 .launch_template_data()
                 .and_then(|launch_template_data| launch_template_data.image_id())
-                && let Some(resolved_ami_id) =
-                    resolve_image_reference(image_reference, ssm_client, ssm_cache).await?
             {
-                references.insert(resolved_ami_id);
+                match resolve_image_reference(image_reference, ssm_client, ssm_cache).await {
+                    ImageReferenceResolution::Ami(resolved_ami_id) => {
+                        references.insert(resolved_ami_id);
+                    }
+                    ImageReferenceResolution::Unresolved(reason) => {
+                        unresolved_references.insert(reason);
+                    }
+                }
             }
         }
 
@@ -948,10 +1029,15 @@ async fn resolve_launch_template_ref_image_ids(
             if let Some(image_reference) = version
                 .launch_template_data()
                 .and_then(|launch_template_data| launch_template_data.image_id())
-                && let Some(resolved_ami_id) =
-                    resolve_image_reference(image_reference, ssm_client, ssm_cache).await?
             {
-                references.insert(resolved_ami_id);
+                match resolve_image_reference(image_reference, ssm_client, ssm_cache).await {
+                    ImageReferenceResolution::Ami(resolved_ami_id) => {
+                        references.insert(resolved_ami_id);
+                    }
+                    ImageReferenceResolution::Unresolved(reason) => {
+                        unresolved_references.insert(reason);
+                    }
+                }
             }
         }
     }
@@ -963,18 +1049,25 @@ async fn resolve_image_reference(
     image_reference: &str,
     ssm_client: &ssm::Client,
     ssm_cache: &mut HashMap<String, Option<String>>,
-) -> AppResult<Option<String>> {
+) -> ImageReferenceResolution {
     if image_reference.starts_with("ami-") {
-        return Ok(Some(image_reference.to_string()));
+        return ImageReferenceResolution::Ami(image_reference.to_string());
     }
 
     let Some(parameter_name) = extract_ssm_parameter_name(image_reference) else {
-        warn!("Ignoring non-AMI launch-template image reference: {}", image_reference);
-        return Ok(None);
+        let reason = format!("unresolved launch template image reference '{}'", image_reference);
+        warn!("{}", reason);
+        return ImageReferenceResolution::Unresolved(reason);
     };
 
     if let Some(cached) = ssm_cache.get(&parameter_name) {
-        return Ok(cached.clone());
+        return match cached {
+            Some(ami_id) => ImageReferenceResolution::Ami(ami_id.clone()),
+            None => ImageReferenceResolution::Unresolved(format!(
+                "failed to resolve launch template SSM image parameter '{}'",
+                parameter_name
+            )),
+        };
     }
 
     let response = ssm_client.get_parameter().name(parameter_name.clone()).send().await;
@@ -991,7 +1084,13 @@ async fn resolve_image_reference(
     };
 
     ssm_cache.insert(parameter_name, resolved_ami.clone());
-    Ok(resolved_ami)
+    match resolved_ami {
+        Some(ami_id) => ImageReferenceResolution::Ami(ami_id),
+        None => ImageReferenceResolution::Unresolved(format!(
+            "failed to resolve launch template SSM image parameter '{}'",
+            image_reference
+        )),
+    }
 }
 
 fn extract_ssm_parameter_name(image_reference: &str) -> Option<String> {
@@ -1011,9 +1110,10 @@ fn extract_ssm_parameter_name(image_reference: &str) -> Option<String> {
 fn print_region_plan(plan: &RegionPlan) {
     println!("\n=== Region {} ===", plan.region);
     println!(
-        "owned_amis={} referenced_amis={} candidate_amis={} skipped_amis={}",
+        "owned_amis={} referenced_amis={} unresolved_ami_references={} candidate_amis={} skipped_amis={}",
         plan.owned_ami_count,
         plan.referenced_ami_count,
+        plan.unresolved_ami_references.len(),
         plan.deregister_amis.len(),
         plan.skipped_amis,
     );
@@ -1040,6 +1140,19 @@ fn print_region_plan(plan: &RegionPlan) {
                 ami.last_launched_time
                     .map(|value| value.to_rfc3339())
                     .unwrap_or_else(|| "never/unknown".to_string())
+            );
+        }
+    }
+
+    if !plan.unresolved_ami_references.is_empty() {
+        println!("unresolved_ami_references:");
+        for unresolved in plan.unresolved_ami_references.iter().take(20) {
+            println!("  {}", unresolved);
+        }
+        if plan.unresolved_ami_references.len() > 20 {
+            println!(
+                "  ... {} additional unresolved references omitted",
+                plan.unresolved_ami_references.len() - 20
             );
         }
     }
@@ -1077,13 +1190,83 @@ fn print_region_plan(plan: &RegionPlan) {
 
 async fn execute_region_plan(
     ec2_client: &ec2::Client,
+    asg_client: &autoscaling::Client,
     backup_client: &backup::Client,
+    ssm_client: &ssm::Client,
     plan: &RegionPlan,
     args: &Args,
 ) -> ExecutionSummary {
     let mut summary = ExecutionSummary::default();
+    let now = Utc::now();
+    let min_age_cutoff = now - Duration::days(args.min_age_days);
+    let recent_launch_cutoff = now - Duration::days(args.ami_recent_launch_days);
+
+    let reference_scan = match collect_referenced_ami_ids(ec2_client, asg_client, ssm_client).await
+    {
+        Ok(scan) => scan,
+        Err(error) => {
+            summary
+                .failures
+                .push(format!("failed to collect AMI references at execution time: {}", error));
+            summary.skipped_amis += plan.deregister_amis.len();
+            AmiReferenceScan::default()
+        }
+    };
+
+    let mut execution_references = reference_scan.referenced_ami_ids;
+    if !reference_scan.unresolved_references.is_empty() {
+        summary.failures.push(format!(
+            "skipped AMI deregistration due unresolved AMI references: {}",
+            reference_scan.unresolved_references.len()
+        ));
+        summary.skipped_amis += plan.deregister_amis.len();
+        execution_references.clear();
+    }
+
+    let mut current_owned_amis = HashMap::<String, AmiInfo>::new();
+    if summary.skipped_amis == 0 {
+        match list_owned_amis(ec2_client).await {
+            Ok(amis) => {
+                current_owned_amis = amis
+                    .into_iter()
+                    .map(|ami| (ami.ami_id.clone(), ami))
+                    .collect::<HashMap<_, _>>();
+            }
+            Err(error) => {
+                summary
+                    .failures
+                    .push(format!("failed to refresh AMI inventory at execution time: {}", error));
+                summary.skipped_amis += plan.deregister_amis.len();
+            }
+        }
+    }
 
     for ami in &plan.deregister_amis {
+        if summary.skipped_amis > 0 && current_owned_amis.is_empty() {
+            break;
+        }
+
+        let Some(current_ami) = current_owned_amis.get(&ami.ami_id) else {
+            summary.skipped_amis += 1;
+            continue;
+        };
+
+        if execution_references.contains(&ami.ami_id)
+            || current_ami.creation_date >= min_age_cutoff
+            || has_expected_tag(
+                &current_ami.tags,
+                &args.protect_tag,
+                optional_expected_value(&args.protect_tag_value),
+            )
+            || !deletion_tag_allows(&current_ami.tags, args)
+            || current_ami
+                .last_launched_time
+                .is_some_and(|last_launched| last_launched >= recent_launch_cutoff)
+        {
+            summary.skipped_amis += 1;
+            continue;
+        }
+
         match deregister_ami_with_retries(
             ec2_client,
             &ami.ami_id,
@@ -1102,7 +1285,63 @@ async fn execute_region_plan(
         }
     }
 
+    let current_snapshot_references = match list_owned_amis(ec2_client).await {
+        Ok(amis) => amis
+            .iter()
+            .flat_map(|ami| ami.snapshot_ids.iter().cloned())
+            .collect::<HashSet<String>>(),
+        Err(error) => {
+            summary.failures.push(format!(
+                "failed to refresh AMI snapshot references before snapshot deletion: {}",
+                error
+            ));
+            summary.skipped_snapshots += plan.delete_snapshots.len();
+            HashSet::new()
+        }
+    };
+
+    let current_snapshots = if summary.skipped_snapshots == 0 {
+        match list_owned_snapshots(ec2_client).await {
+            Ok(snapshots) => snapshots
+                .into_iter()
+                .map(|snapshot| (snapshot.snapshot_id.clone(), snapshot))
+                .collect::<HashMap<String, SnapshotInfo>>(),
+            Err(error) => {
+                summary.failures.push(format!(
+                    "failed to refresh snapshot inventory at execution time: {}",
+                    error
+                ));
+                summary.skipped_snapshots += plan.delete_snapshots.len();
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     for snapshot in &plan.delete_snapshots {
+        if summary.skipped_snapshots > 0 && current_snapshots.is_empty() {
+            break;
+        }
+
+        let Some(current_snapshot) = current_snapshots.get(&snapshot.snapshot_id) else {
+            summary.skipped_snapshots += 1;
+            continue;
+        };
+
+        if current_snapshot_references.contains(&snapshot.snapshot_id)
+            || current_snapshot.start_time >= min_age_cutoff
+            || has_expected_tag(
+                &current_snapshot.tags,
+                &args.protect_tag,
+                optional_expected_value(&args.protect_tag_value),
+            )
+            || !deletion_tag_allows(&current_snapshot.tags, args)
+        {
+            summary.skipped_snapshots += 1;
+            continue;
+        }
+
         match delete_snapshot_with_retries(
             ec2_client,
             &snapshot.snapshot_id,
@@ -1125,8 +1364,30 @@ async fn execute_region_plan(
 
     if args.execute_backup_recovery_point_deletes {
         for recovery_point in &plan.delete_backup_recovery_points {
+            let tags = match list_backup_recovery_point_tags(
+                backup_client,
+                &recovery_point.recovery_point_arn,
+            )
+            .await
+            {
+                Ok(tags) => tags,
+                Err(error) => {
+                    summary.failures.push(format!(
+                        "failed to fetch tags for recovery point {}: {}",
+                        recovery_point.recovery_point_arn, error
+                    ));
+                    summary.skipped_backup_recovery_points += 1;
+                    continue;
+                }
+            };
+
+            if !backup_recovery_point_deletion_tag_allows(&tags, args) {
+                summary.skipped_backup_recovery_points += 1;
+                continue;
+            }
+
             if args.dry_run {
-                summary.deleted_backup_recovery_points += 1;
+                summary.skipped_backup_recovery_points += 1;
                 continue;
             }
 
@@ -1259,10 +1520,12 @@ fn retry_delay_for_attempt(base_delay_ms: u64, attempt: u32) -> StdDuration {
 
 fn print_execution_summary(region: &str, summary: &ExecutionSummary) {
     println!(
-        "execution region={} deregistered_amis={} deleted_snapshots={} deleted_backup_recovery_points={} skipped_backup_recovery_points={} failures={}",
+        "execution region={} deregistered_amis={} skipped_amis={} deleted_snapshots={} skipped_snapshots={} deleted_backup_recovery_points={} skipped_backup_recovery_points={} failures={}",
         region,
         summary.deregistered_amis,
+        summary.skipped_amis,
         summary.deleted_snapshots,
+        summary.skipped_snapshots,
         summary.deleted_backup_recovery_points,
         summary.skipped_backup_recovery_points,
         summary.failures.len(),
@@ -1379,6 +1642,14 @@ mod tests {
     }
 
     #[test]
+    fn is_enabled_region_only_allows_opted_in_or_not_required() {
+        assert!(is_enabled_region(Some("opted-in")));
+        assert!(is_enabled_region(Some("opt-in-not-required")));
+        assert!(is_enabled_region(None));
+        assert!(!is_enabled_region(Some("not-opted-in")));
+    }
+
+    #[test]
     fn select_latest_ami_ids_by_family_keeps_latest_per_group() {
         let now = Utc::now();
 
@@ -1460,7 +1731,7 @@ mod tests {
             HashMap::from([("cleanup".to_string(), "true".to_string())]),
         );
 
-        let backup_managed_snapshot = make_snapshot(
+        let candidate_for_backup_classification = make_snapshot(
             "snap-backup",
             now - Duration::days(90),
             Some("AWS Backup recovery point"),
@@ -1471,17 +1742,16 @@ mod tests {
             &args,
             "us-east-1",
             vec![deletable_ami, referenced_ami, protected_ami],
-            vec![deletable_snapshot, referenced_snapshot, backup_managed_snapshot],
+            vec![deletable_snapshot, referenced_snapshot, candidate_for_backup_classification],
             HashSet::from(["ami-ref".to_string()]),
         );
 
         assert_eq!(plan.deregister_amis.len(), 1);
         assert_eq!(plan.deregister_amis[0].ami_id, "ami-delete");
 
-        assert_eq!(plan.delete_snapshots.len(), 1);
-        assert_eq!(plan.delete_snapshots[0].snapshot_id, "snap-delete");
-
-        assert_eq!(plan.backup_managed_snapshots.len(), 1);
-        assert_eq!(plan.backup_managed_snapshots[0].snapshot_id, "snap-backup");
+        assert_eq!(plan.delete_snapshots.len(), 2);
+        assert!(plan.delete_snapshots.iter().any(|snapshot| snapshot.snapshot_id == "snap-delete"));
+        assert!(plan.delete_snapshots.iter().any(|snapshot| snapshot.snapshot_id == "snap-backup"));
+        assert!(plan.backup_managed_snapshots.is_empty());
     }
 }
