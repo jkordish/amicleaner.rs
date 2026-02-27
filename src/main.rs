@@ -1,26 +1,20 @@
-#![cfg_attr(
-    feature = "cargo-clippy",
-    warn(clippy::all)
-)]
-
 use std::{env, error::Error, io::stdin, process::exit};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_sdk_ec2::{
+    Client,
     operation::describe_images::DescribeImagesOutput,
     types::{Filter, VolumeState},
-    Client
 };
 use aws_types::region::Region as AwsRegion;
-use chrono::{DateTime, Duration, NaiveDateTime, Utc};
-use clap::{Arg, Command};
+use chrono::{DateTime, Duration, Utc};
+use clap::{Arg, ArgAction, Command};
 use console::Emoji;
 use hashbrown::HashMap;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{self, info};
-use prettytable::{format, row, Table};
+use prettytable::{Table, format, row};
 use serde_json::Value;
-use tokio_stream::StreamExt;
 
 static SPARKLE: Emoji<'_, '_> = Emoji("\u{2728}", "");
 static DEATH: Emoji<'_, '_> = Emoji("\u{2620}", "");
@@ -41,75 +35,82 @@ async fn main() -> Result<(), Box<dyn Error>> {
             Arg::new("input")
                 .short('i')
                 .long("input")
-                .takes_value(true)
-                .help("Input string(s) to match against. Can pass comma separated list.")
+                .num_args(1)
+                .help("Input string(s) to match against. Can pass comma separated list."),
         )
         .arg(
             Arg::new("days")
                 .short('d')
                 .long("older-than")
-                .takes_value(true)
+                .num_args(1)
                 .default_value("7")
-                .help("Anything older than days should be terminated")
+                .help("Anything older than days should be terminated"),
         )
         .arg(
             Arg::new("keep")
                 .short('k')
                 .long("keep-previous")
-                .takes_value(true)
+                .num_args(1)
                 .conflicts_with("days")
-                .help("Number of previous to keep")
+                .help("Number of previous to keep"),
         )
         .arg(
             Arg::new("region")
                 .short('r')
                 .long("aws-region")
-                .takes_value(true)
+                .num_args(1)
                 .default_value("us-west-2")
-                .help("Region(s) to check. Can pass comma separated list.")
+                .help("Region(s) to check. Can pass comma separated list."),
         )
         .arg(
             Arg::new("force")
                 .short('f')
                 .long("force-delete")
-                .takes_value(false)
-                .help("Skip confirmation")
+                .action(ArgAction::SetTrue)
+                .help("Skip confirmation"),
         )
         .arg(
             Arg::new("orphans")
                 .short('o')
                 .long("check-orphans")
-                .takes_value(false)
-                .help("Process orphan EBS volumes/snapshots")
+                .action(ArgAction::SetTrue)
+                .help("Process orphan EBS volumes/snapshots"),
         )
         .arg(
             Arg::new("manifest")
                 .short('m')
                 .long("manifest")
-                .takes_value(true)
-                .required(true)
+                .num_args(1)
                 .default_value("22.04")
-                .help("Exclude Manifest(s). Can pass comma separated list")
+                .help("Exclude Manifest(s). Can pass comma separated list"),
         )
         .get_matches();
 
     // handle comma separated list of potential regions
     let regions = matches
-        .value_of("region")
-        .unwrap()
+        .get_one::<String>("region")
+        .map_or("us-west-2", String::as_str)
         .split(',')
         .map(String::from)
         .collect::<Vec<String>>();
 
     // handle comma separated list of potential inputs
     let inputs = matches
-        .value_of("input")
-        .unwrap_or("")
+        .get_one::<String>("input")
+        .map_or("", |value| value.as_str())
         .split(',')
         .map(String::from)
         .collect::<Vec<String>>();
 
-    let helix_manifest_amis = include_helix_manifest(matches.value_of("manifest").unwrap()).await?;
+    let days =
+        matches.get_one::<String>("days").and_then(|input| input.parse::<i64>().ok()).unwrap_or(7);
+
+    let cutoff_date = Utc::now().checked_sub_signed(Duration::days(days)).unwrap_or_else(Utc::now);
+
+    let helix_manifest_amis = include_helix_manifest(
+        matches.get_one::<String>("manifest").map_or("22.04", String::as_str),
+    )
+    .await?;
 
     info!("Image IDs from provided manifests: {}", &helix_manifest_amis.len(),);
 
@@ -142,12 +143,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     Ok(amis) => {
                         if let Some(ami) = amis.images {
                             for entry in ami {
-                                let image_id = entry.image_id.unwrap();
-                                let name = entry.name.unwrap();
-                                let creation_date =
-                                    entry.creation_date.unwrap().parse::<DateTime<Utc>>()?;
+                                let (Some(image_id), Some(name), Some(creation_raw)) =
+                                    (entry.image_id(), entry.name(), entry.creation_date())
+                                else {
+                                    continue;
+                                };
+
+                                let creation_date = creation_raw.parse::<DateTime<Utc>>()?;
                                 if !ami_image_ids.contains(&image_id.to_string()) {
-                                    collected.push((name, creation_date, image_id, &region));
+                                    collected.push((
+                                        name.to_string(),
+                                        creation_date,
+                                        image_id.to_string(),
+                                        &region,
+                                    ));
                                 }
                             }
                         }
@@ -163,25 +172,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 collected.sort_by_key(|key| key.1);
 
                 // run if "days" was provided a value
-                if matches.value_of("days").is_some() {
-                    collected = collected
-                        .into_iter()
-                        .filter(|(_, date, ..)| {
-                            *date
-                                < Utc::now()
-                                    .checked_sub_signed(Duration::days(
-                                        matches.value_of("days").unwrap().parse::<i64>().unwrap()
-                                    ))
-                                    .unwrap()
-                        })
-                        .collect::<Vec<(String, DateTime<Utc>, String, &str)>>();
-                }
+                collected = collected
+                    .into_iter()
+                    .filter(|(_, date, ..)| *date < cutoff_date)
+                    .collect::<Vec<(String, DateTime<Utc>, String, &str)>>();
 
                 // run if "keep" was provided a value
-                if matches.value_of("keep").is_some() {
+                if let Some(keep_input) = matches.get_one::<String>("keep") {
                     // keep what we want
-                    let keep =
-                        collected.len() - matches.value_of("keep").unwrap().parse::<usize>()?;
+                    let keep = collected.len() - keep_input.parse::<usize>()?;
                     // truncate it by dropping the excess keeping what we want
                     collected.truncate(keep);
                 }
@@ -192,7 +191,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // print a pretty table
                     make_table(&collected);
 
-                    if matches.is_present("force") {
+                    if matches.get_flag("force") {
                         // short circuit if "forced" is passed
                         info!("Not even going to look? yolo {}", DISAPPROVE);
                         destroy_image_id(&region, &collected).await?;
@@ -200,20 +199,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         // otherwise we should prompt for user input
                         let mut confirmation = String::new();
                         println!("Destroy found Image IDs? y/n");
-                        stdin().read_line(&mut confirmation).expect("Failed to read line");
+                        if let Err(error) = stdin().read_line(&mut confirmation) {
+                            eprintln!("Failed to read line: {error}");
+                            continue;
+                        }
                         match confirmation.trim().to_ascii_lowercase().as_str() {
                             "n" | "N" => continue,
                             "y" | "Y" => destroy_image_id(&region, &collected).await?,
-                            _ => eprintln!("Please use either y or n")
+                            _ => eprintln!("Please use either y or n"),
                         }
                     }
                 }
 
-                if matches.is_present("orphans") {
+                if matches.get_flag("orphans") {
                     let orphans = fetch_orphans(&region).await?;
                     if orphans.is_empty() {
                         info!("No Orphans Found. Skipping");
-                    } else if matches.is_present("force") {
+                    } else if matches.get_flag("force") {
                         make_table_orphans(&region, &orphans);
                         // short circuit if "forced" is passed
                         info!("Not even going to look? yolo {}", DISAPPROVE);
@@ -224,14 +226,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         // otherwise we should prompt for user input
                         let mut confirmation = String::new();
                         println!("Destroy found Orphans? y/n");
-                        stdin().read_line(&mut confirmation).expect("Failed to read line");
+                        if let Err(error) = stdin().read_line(&mut confirmation) {
+                            eprintln!("Failed to read line: {error}");
+                            continue;
+                        }
                         match confirmation.trim().to_ascii_lowercase().as_str() {
                             "n" | "N" => continue,
                             "y" | "Y" => {
                                 info!("pew pew");
                                 destroy_orphans_id(&region, &orphans).await?;
                             }
-                            _ => eprintln!("Please use either y or n")
+                            _ => eprintln!("Please use either y or n"),
                         }
                     }
                 }
@@ -246,7 +251,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// Finds Image IDs from that we are the owner of
 async fn fetch_available_image_ids(
     input: &str,
-    region: &str
+    region: &str,
 ) -> Result<DescribeImagesOutput, Box<dyn Error>> {
     // Retrieve from your aws account your custom AMIs
 
@@ -264,25 +269,26 @@ async fn fetch_available_image_ids(
 
     match client.describe_images().set_filters(Some(filter)).send().await {
         Ok(result) => Ok(result),
-        Err(e) => Err(e.into())
+        Err(e) => Err(e.into()),
     }
 }
 
 /// Finds Image IDs from non-terminated EC2 Instances
 async fn fetch_instances_image_ids(region: &str) -> Result<Vec<String>, Box<dyn Error>> {
-
     let client = get_aws_client(region).await?;
 
-    let filter = vec![Filter::builder()
-        .set_name(Some("instance-state-name".into()))
-        .set_values(Some(vec![
-            "pending".to_string(),
-            "running".to_string(),
-            "shutting-down".to_string(),
-            "stopping".to_string(),
-            "stopped".to_string(),
-        ]))
-        .build()];
+    let filter = vec![
+        Filter::builder()
+            .set_name(Some("instance-state-name".into()))
+            .set_values(Some(vec![
+                "pending".to_string(),
+                "running".to_string(),
+                "shutting-down".to_string(),
+                "stopping".to_string(),
+                "stopped".to_string(),
+            ]))
+            .build(),
+    ];
 
     let mut image_ids: Vec<String> = vec![];
 
@@ -295,12 +301,11 @@ async fn fetch_instances_image_ids(region: &str) -> Result<Vec<String>, Box<dyn 
 
     info!("Fetching all instances for their image id");
     while let Some(results) = request.next().await {
-        if let Some(reservations) = results.unwrap().reservations() {
-            for reservation in reservations {
-                for instance in reservation.instances().unwrap() {
-                    if let Some(id) = instance.image_id() {
-                        image_ids.push(id.to_string());
-                    }
+        let result = results?;
+        for reservation in result.reservations() {
+            for instance in reservation.instances() {
+                if let Some(id) = instance.image_id() {
+                    image_ids.push(id.to_string());
                 }
             }
         }
@@ -312,7 +317,6 @@ async fn fetch_instances_image_ids(region: &str) -> Result<Vec<String>, Box<dyn 
 /// Finds Image IDs from launch configurations that are unattached to an
 /// autoscaling group
 async fn fetch_unattached_lc_image_ids(region: &str) -> Result<Vec<String>, Box<dyn Error>> {
-
     let client = get_aws_client(region).await?;
 
     let mut image_ids: Vec<String> = vec![];
@@ -331,15 +335,12 @@ async fn fetch_unattached_lc_image_ids(region: &str) -> Result<Vec<String>, Box<
 
     info!("Looking up in use launch_templates for their image id");
     while let Some(results) = request.next().await {
-        if let Ok(result) = results {
-            if let Some(templates) = result.launch_template_versions() {
-                for template in templates {
-                    if let Some(data) = template.launch_template_data() {
-                        if let Some(id) = data.image_id() {
-                            image_ids.push(id.to_string());
-                        }
-                    }
-                }
+        let result = results?;
+        for template in result.launch_template_versions() {
+            if let Some(data) = template.launch_template_data()
+                && let Some(id) = data.image_id()
+            {
+                image_ids.push(id.to_string());
             }
         }
     }
@@ -350,9 +351,8 @@ async fn fetch_unattached_lc_image_ids(region: &str) -> Result<Vec<String>, Box<
 /// Find potential orphaned EBS Volumes and Snapshots
 #[allow(clippy::too_many_lines)]
 async fn fetch_orphans(
-    region: &str
+    region: &str,
 ) -> Result<HashMap<String, (String, DateTime<Utc>)>, Box<dyn Error>> {
-
     let client = get_aws_client(region).await?;
 
     // Snapshots
@@ -382,30 +382,24 @@ async fn fetch_orphans(
 
     info!("Looking up snapshots");
     while let Some(results) = request.next().await {
-        if let Ok(result) = results {
-            if let Some(snapshots) = result.snapshots() {
-                for snapshot in snapshots {
-                    let mut name = String::new();
-                    if let Some(tags) = snapshot.tags() {
-                        for tag in tags {
-                            if tag.key == Some("Name".into()) {
-                                name = tag.value().unwrap().into();
-                            }
-                        }
-                    }
+        let result = results?;
+        for snapshot in result.snapshots() {
+            let mut name = String::new();
+            for tag in snapshot.tags() {
+                if tag.key() == Some("Name") {
+                    name = tag.value().unwrap_or_default().into();
+                }
+            }
 
-                    if let Some(start_time) = snapshot.start_time() {
-                        if Duration::seconds(start_time.secs()).num_weeks() > 14 {
-                            let creation = DateTime::<Utc>::from_utc(
-                                NaiveDateTime::from_timestamp_opt(start_time.secs(), 0).unwrap(),
-                                Utc
-                            );
-                            collection.insert(
-                                snapshot.snapshot_id.as_ref().unwrap().to_string(),
-                                (name.to_string(), creation)
-                            );
-                        };
-                    }
+            if let Some(start_time) = snapshot.start_time()
+                && Duration::seconds(start_time.secs()).num_weeks() > 14
+            {
+                let Some(creation) = DateTime::<Utc>::from_timestamp(start_time.secs(), 0) else {
+                    continue;
+                };
+
+                if let Some(snapshot_id) = snapshot.snapshot_id() {
+                    collection.insert(snapshot_id.to_string(), (name.to_string(), creation));
                 }
             }
         }
@@ -413,10 +407,12 @@ async fn fetch_orphans(
 
     // EBS Volumes
 
-    let filter = vec![Filter::builder()
-        .set_name(Some("status".into()))
-        .set_values(Some(vec!["available".to_string()]))
-        .build()];
+    let filter = vec![
+        Filter::builder()
+            .set_name(Some("status".into()))
+            .set_values(Some(vec!["available".to_string()]))
+            .build(),
+    ];
 
     let mut in_use_volumes = HashMap::new();
     let mut available_volumes = HashMap::new();
@@ -426,37 +422,38 @@ async fn fetch_orphans(
 
     info!("Looking up volumes");
     while let Some(results) = request.next().await {
-        if let Ok(result) = results {
-            if let Some(volumes) = result.volumes() {
-                for volume in volumes {
-                    let mut name = String::new();
-                    if let Some(tags) = volume.tags() {
-                        for tag in tags {
-                            if tag.key == Some("Name".into()) {
-                                name = tag.value().unwrap().into();
-                            }
-                        }
-                    }
-                    let volume_id = volume.volume_id().unwrap();
-                    let snapshot_id = volume.snapshot_id().unwrap();
-                    let creation = DateTime::<Utc>::from_utc(
-                        NaiveDateTime::from_timestamp_opt(volume.create_time().unwrap().secs(), 0)
-                            .unwrap(),
-                        Utc
-                    );
-
-                    match volume.state().unwrap() {
-                        VolumeState::Available => {
-                            available_volumes.insert(volume_id.to_string(), (name, creation));
-                        }
-                        VolumeState::InUse => {
-                            in_use_volumes
-                                .insert(snapshot_id.to_string(), (name.to_string(), creation));
-                        }
-                        _ => {}
-                    };
+        let result = results?;
+        for volume in result.volumes() {
+            let mut name = String::new();
+            for tag in volume.tags() {
+                if tag.key() == Some("Name") {
+                    name = tag.value().unwrap_or_default().into();
                 }
             }
+            let Some(volume_id) = volume.volume_id() else {
+                continue;
+            };
+
+            let Some(create_time) = volume.create_time() else {
+                continue;
+            };
+
+            let Some(creation) = DateTime::<Utc>::from_timestamp(create_time.secs(), 0) else {
+                continue;
+            };
+
+            match volume.state() {
+                Some(VolumeState::Available) => {
+                    available_volumes.insert(volume_id.to_string(), (name, creation));
+                }
+                Some(VolumeState::InUse) => {
+                    if let Some(snapshot_id) = volume.snapshot_id() {
+                        in_use_volumes
+                            .insert(snapshot_id.to_string(), (name.to_string(), creation));
+                    }
+                }
+                _ => {}
+            };
         }
     }
 
@@ -471,7 +468,7 @@ async fn fetch_orphans(
 
 async fn destroy_image_id(
     region: &str,
-    data: &[(String, DateTime<Utc>, String, &str)]
+    data: &[(String, DateTime<Utc>, String, &str)],
 ) -> Result<(), Box<dyn Error>> {
     // create a progress bar
     let pb = ProgressBar::new(data.len() as u64);
@@ -479,7 +476,7 @@ async fn destroy_image_id(
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {msg}")?
-            .progress_chars("#>-")
+            .progress_chars("#>-"),
     );
 
     let client = get_aws_client(region).await?;
@@ -496,7 +493,7 @@ async fn destroy_image_id(
 
 async fn destroy_orphans_id(
     region: &str,
-    orphans: &HashMap<String, (String, DateTime<Utc>)>
+    orphans: &HashMap<String, (String, DateTime<Utc>)>,
 ) -> Result<(), Box<dyn Error>> {
     // create a progress bar
     let pb = ProgressBar::new(orphans.len() as u64);
@@ -504,7 +501,7 @@ async fn destroy_orphans_id(
     pb.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {msg}")?
-            .progress_chars("#>-")
+            .progress_chars("#>-"),
     );
 
     let client = get_aws_client(region).await?;
@@ -549,7 +546,7 @@ fn make_table_orphans(region: &str, volumes: &HashMap<String, (String, DateTime<
         .borders('|')
         .separators(
             &[format::LinePosition::Top, format::LinePosition::Bottom],
-            format::LineSeparator::new('-', '+', '+', '+')
+            format::LineSeparator::new('-', '+', '+', '+'),
         )
         .padding(1, 1)
         .build();
@@ -569,7 +566,7 @@ fn make_table(data: &[(String, DateTime<Utc>, String, &str)]) {
         .borders('|')
         .separators(
             &[format::LinePosition::Top, format::LinePosition::Bottom],
-            format::LineSeparator::new('-', '+', '+', '+')
+            format::LineSeparator::new('-', '+', '+', '+'),
         )
         .padding(1, 1)
         .build();
@@ -583,12 +580,11 @@ fn make_table(data: &[(String, DateTime<Utc>, String, &str)]) {
 }
 
 async fn include_helix_manifest(manifests: &str) -> Result<Vec<String>, Box<dyn Error>> {
-    let user = env::var("GITHUB_USER").expect("GITHUB_USER is not set");
-    let pass = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN is not set");
+    let user = env::var("GITHUB_USER")?;
+    let pass = env::var("GITHUB_TOKEN")?;
 
     let mut amis = vec![];
-    let mut manifests =
-        manifests.split(',').map(String::from).collect::<Vec<String>>();
+    let mut manifests = manifests.split(',').map(String::from).collect::<Vec<String>>();
     manifests.push("ci".into());
 
     info!("Grabbing manifests");
@@ -604,15 +600,19 @@ async fn include_helix_manifest(manifests: &str) -> Result<Vec<String>, Box<dyn 
 
         let manifest: Value = serde_json::from_str(body.as_str())?;
 
-        // probably a better way to do this
-        manifest["amis"].as_object().unwrap().into_iter().for_each(|(_, v)| {
-            v.as_object().unwrap().into_iter().for_each(|(_, v)| amis.push(v.to_string()));
-        });
+        if let Some(amis_object) = manifest.get("amis").and_then(Value::as_object) {
+            for value in amis_object.values() {
+                if let Some(entries) = value.as_object() {
+                    for ami in entries.values() {
+                        amis.push(ami.to_string());
+                    }
+                }
+            }
+        }
     }
 
     Ok(amis)
 }
-
 
 async fn get_aws_client(region: &str) -> Result<Client, Box<dyn Error>> {
     let credentials_provider = DefaultCredentialsChain::builder().build().await;

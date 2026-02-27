@@ -1,8 +1,9 @@
 [package]
 name = "amicleaner"
 version = "2.0.0"
-authors = ["Joseph Kordish <joe@unicornclouds.com"]
+authors = ["Joseph Kordish <joe@unicornclouds.com>"]
 edition = "2024"
+rust-version = "1.93.1"
 readme = "README.md"
 license = "The MIT License (MIT)"
 autobins = false
@@ -14,21 +15,21 @@ path = "./src/main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-ec2 = { version = "1" }
-aws-types = { version = "1"}
-chrono = { version = "0.4" }
-clap = { version = "3" }
-console = { version = "0.16" }
-hashbrown = { version = "0.15" }
-indicatif = { version = "0.18.0" }
-log = { version = "0.4" }
-prettytable-rs = { version = "0.10" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-serde_json = { version = "1", default-features = false, features = ["alloc"] }
-simple_logger = { version = "5", default-features = false }
-tokio = { version = "1", default_features = false, features = ["full"] }
-tokio-stream = { version = "0.1" }
+aws-config = { version = "1.8.14", features = ["behavior-version-latest"] }
+aws-sdk-ec2 = { version = "1.215.0" }
+aws-types = { version = "1.3.13" }
+chrono = { version = "0.4.44" }
+clap = { version = "4.5.60" }
+console = { version = "0.16.2" }
+hashbrown = { version = "0.16.1" }
+indicatif = { version = "0.18.4" }
+log = { version = "0.4.29" }
+prettytable-rs = { version = "0.10.0" }
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls"] }
+serde_json = { version = "1.0.149", default-features = false, features = ["alloc"] }
+simple_logger = { version = "5.2.0", default-features = false }
+tokio = { version = "1.49.0", default-features = false, features = ["full"] }
+tokio-stream = { version = "0.1.18" }
 
 [profile.release]
 codegen-units = 1
