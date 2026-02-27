@@ -1,4 +1,4 @@
-use std::{env, error::Error, io::stdin, process::exit};
+use std::{env, error::Error, io::stdin};
 
 use aws_config::default_provider::credentials::DefaultCredentialsChain;
 use aws_sdk_ec2::{
@@ -86,51 +86,79 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .get_matches();
 
+    let force_delete = matches.get_flag("force");
+    let check_orphans = matches.get_flag("orphans");
+
     // handle comma separated list of potential regions
     let regions = matches
         .get_one::<String>("region")
         .map_or("us-west-2", String::as_str)
         .split(',')
+        .map(str::trim)
+        .filter(|region| !region.is_empty())
         .map(String::from)
         .collect::<Vec<String>>();
 
     // handle comma separated list of potential inputs
     let inputs = matches
         .get_one::<String>("input")
-        .map_or("", |value| value.as_str())
-        .split(',')
-        .map(String::from)
-        .collect::<Vec<String>>();
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|input| !input.is_empty())
+                .map(String::from)
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
 
     let days =
         matches.get_one::<String>("days").and_then(|input| input.parse::<i64>().ok()).unwrap_or(7);
 
+    if days < 0 {
+        return Err("older-than days cannot be negative".into());
+    }
+
     let cutoff_date = Utc::now().checked_sub_signed(Duration::days(days)).unwrap_or_else(Utc::now);
 
-    let helix_manifest_amis = include_helix_manifest(
-        matches.get_one::<String>("manifest").map_or("22.04", String::as_str),
-    )
-    .await?;
+    let keep_previous =
+        matches.get_one::<String>("keep").map(|input| input.parse::<usize>()).transpose()?;
 
-    info!("Image IDs from provided manifests: {}", &helix_manifest_amis.len(),);
+    let helix_manifest_amis = if inputs.is_empty() {
+        Vec::new()
+    } else {
+        include_helix_manifest(
+            matches.get_one::<String>("manifest").map_or("22.04", String::as_str),
+        )
+        .await?
+    };
+
+    if !inputs.is_empty() {
+        info!("Image IDs from provided manifests: {}", &helix_manifest_amis.len(),);
+    }
+
+    if inputs.is_empty() && !check_orphans {
+        info!("No --input values provided and --check-orphans not set. Nothing to do.");
+        return Ok(());
+    }
 
     for region in regions {
         info!("working {}", &region);
 
-        let mut ami_image_ids = fetch_instances_image_ids(&region).await?;
-        let unattached_lc_image_ids = fetch_unattached_lc_image_ids(&region).await?;
-
-        info!("Image IDs from non-terminated instances: {}", &ami_image_ids.len());
-        info!("Image IDs from launch templates: {}", &unattached_lc_image_ids.len());
-
-        ami_image_ids.extend(unattached_lc_image_ids);
-        ami_image_ids.extend(helix_manifest_amis.clone());
-        ami_image_ids.sort_unstable();
-        ami_image_ids.dedup();
-
-        info!("Total of {} utilized Image IDs", &ami_image_ids.len());
-
         if !inputs.is_empty() {
+            let mut ami_image_ids = fetch_instances_image_ids(&region).await?;
+            let unattached_lc_image_ids = fetch_unattached_lc_image_ids(&region).await?;
+
+            info!("Image IDs from non-terminated instances: {}", &ami_image_ids.len());
+            info!("Image IDs from launch templates: {}", &unattached_lc_image_ids.len());
+
+            ami_image_ids.extend(unattached_lc_image_ids);
+            ami_image_ids.extend(helix_manifest_amis.clone());
+            ami_image_ids.sort_unstable();
+            ami_image_ids.dedup();
+
+            info!("Total of {} utilized Image IDs", &ami_image_ids.len());
+
             for input in &inputs {
                 let input = input.trim();
                 info!("Searching off of {} in {}", &input, &region);
@@ -163,8 +191,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         info!("Total of {} {} Image IDs", collected.len(), &region);
                     }
                     Err(e) => {
-                        eprint!("{DEATH} {e:?}");
-                        exit(1)
+                        eprintln!(
+                            "{DEATH} failed to fetch images for input '{input}' in {region}: {e}"
+                        );
+                        continue;
                     }
                 }
 
@@ -178,11 +208,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .collect::<Vec<(String, DateTime<Utc>, String, &str)>>();
 
                 // run if "keep" was provided a value
-                if let Some(keep_input) = matches.get_one::<String>("keep") {
-                    // keep what we want
-                    let keep = collected.len() - keep_input.parse::<usize>()?;
-                    // truncate it by dropping the excess keeping what we want
-                    collected.truncate(keep);
+                if let Some(keep) = keep_previous {
+                    if keep >= collected.len() {
+                        collected.clear();
+                    } else {
+                        let delete_count = collected.len() - keep;
+                        collected.truncate(delete_count);
+                    }
                 }
 
                 if collected.is_empty() {
@@ -191,7 +223,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     // print a pretty table
                     make_table(&collected);
 
-                    if matches.get_flag("force") {
+                    if force_delete {
                         // short circuit if "forced" is passed
                         info!("Not even going to look? yolo {}", DISAPPROVE);
                         destroy_image_id(&region, &collected).await?;
@@ -210,39 +242,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         }
                     }
                 }
+            }
+        } else {
+            info!("No --input values provided. Skipping AMI cleanup for {}", &region);
+        }
 
-                if matches.get_flag("orphans") {
-                    let orphans = fetch_orphans(&region).await?;
-                    if orphans.is_empty() {
-                        info!("No Orphans Found. Skipping");
-                    } else if matches.get_flag("force") {
-                        make_table_orphans(&region, &orphans);
-                        // short circuit if "forced" is passed
-                        info!("Not even going to look? yolo {}", DISAPPROVE);
+        if check_orphans {
+            let orphans = fetch_orphans(&region).await?;
+            if orphans.is_empty() {
+                info!("No Orphans Found. Skipping");
+            } else if force_delete {
+                make_table_orphans(&region, &orphans);
+                // short circuit if "forced" is passed
+                info!("Not even going to look? yolo {}", DISAPPROVE);
+                info!("pew pew");
+                destroy_orphans_id(&region, &orphans).await?;
+            } else {
+                make_table_orphans(&region, &orphans);
+                // otherwise we should prompt for user input
+                let mut confirmation = String::new();
+                println!("Destroy found Orphans? y/n");
+                if let Err(error) = stdin().read_line(&mut confirmation) {
+                    eprintln!("Failed to read line: {error}");
+                    continue;
+                }
+                match confirmation.trim().to_ascii_lowercase().as_str() {
+                    "n" | "N" => continue,
+                    "y" | "Y" => {
                         info!("pew pew");
                         destroy_orphans_id(&region, &orphans).await?;
-                    } else {
-                        make_table_orphans(&region, &orphans);
-                        // otherwise we should prompt for user input
-                        let mut confirmation = String::new();
-                        println!("Destroy found Orphans? y/n");
-                        if let Err(error) = stdin().read_line(&mut confirmation) {
-                            eprintln!("Failed to read line: {error}");
-                            continue;
-                        }
-                        match confirmation.trim().to_ascii_lowercase().as_str() {
-                            "n" | "N" => continue,
-                            "y" | "Y" => {
-                                info!("pew pew");
-                                destroy_orphans_id(&region, &orphans).await?;
-                            }
-                            _ => eprintln!("Please use either y or n"),
-                        }
                     }
+                    _ => eprintln!("Please use either y or n"),
                 }
-                info!("Finished! {}", PARTY);
             }
         }
+
+        info!("Finished! {}", PARTY);
     }
 
     Ok(())
