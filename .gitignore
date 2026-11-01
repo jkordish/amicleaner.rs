@@ -18,7 +18,6 @@
 debug/
 release/
 config/
-Cargo.lock
 
 target/
 **/*.rs.bk
