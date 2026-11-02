@@ -16,6 +16,7 @@ use crate::errors::{AppResult, error_chain};
 use crate::inventory::{
     list_owned_amis, list_owned_snapshots, lookup_ami_external_use, lookup_snapshot_external_use,
 };
+use crate::lt_prune::{plan_launch_template_pruning, prune_block_reason};
 use crate::model::{AmiInfo, Cutoffs, ExternalUse, KeepReason, Kept, RegionPlan, SnapshotInfo};
 use crate::policy::{
     ami_keep_reason, select_latest_ami_ids_by_family, should_deregister_ami, snapshot_keep_reason,
@@ -100,6 +101,25 @@ pub(crate) async fn build_region_plan(
         &reference_scan,
         &external_use,
     );
+
+    if args.prune_launch_template_versions {
+        match prune_block_reason(&reference_scan, reference_clients) {
+            Some(reason) => {
+                warn!("region {region}: {reason}");
+                plan.blocked.push(reason);
+            }
+            None => {
+                let owned_ids = owned_amis.iter().map(|ami| ami.ami_id.as_str()).collect();
+                plan.launch_template_prune = Some(plan_launch_template_pruning(
+                    &reference_scan,
+                    &owned_ids,
+                    usize::from(args.keep_launch_template_versions),
+                    Cutoffs::new(args, now).min_age,
+                    args,
+                ));
+            }
+        }
+    }
 
     // Snapshots shared to other accounts are kept, like shared AMIs. Checked before the Backup
     // classification so shared recovery-point snapshots are kept too.
@@ -270,6 +290,7 @@ pub(crate) fn plan_region(
         kept_snapshots,
         ami_reference_sources,
         blocked,
+        launch_template_prune: None,
     }
 }
 

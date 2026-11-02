@@ -8,6 +8,7 @@ mod cli;
 mod errors;
 mod execute;
 mod inventory;
+mod lt_prune;
 mod model;
 mod plan;
 mod policy;
@@ -98,6 +99,11 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
             &region_config,
             &args.skip_reference_sources,
             usize::from(args.max_concurrency),
+        )
+        .with_eks(
+            &region_config,
+            &args.skip_reference_sources,
+            args.prune_launch_template_versions,
         )
         .with_lt_cache(lt_cache_config(args, &region_config, &mut account_id).await);
 

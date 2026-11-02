@@ -16,6 +16,7 @@ use crate::errors::{describe_sdk_error, error_chain};
 use crate::inventory::{
     list_owned_amis, list_owned_snapshots, lookup_ami_external_use, lookup_snapshot_external_use,
 };
+use crate::lt_prune::execute_launch_template_pruning;
 use crate::model::{
     AmiInfo, BackupRecoveryPoint, Cutoffs, ExecutionSummary, ExternalUse, RegionPlan, RetryPolicy,
     SnapshotInfo,
@@ -82,6 +83,9 @@ pub(crate) async fn execute_region_plan(
         &mut summary,
     )
     .await;
+
+    // Last, so AMIs a pruned version referenced are only reconsidered on the next run.
+    execute_launch_template_pruning(ec2_client, reference_clients, plan, args, &mut summary).await;
 
     summary
 }
@@ -426,8 +430,23 @@ fn snapshot_unshared(
 pub(crate) async fn send_with_retries<T, E, R, F, Fut>(
     policy: RetryPolicy,
     dry_run: bool,
-    mut send: F,
+    send: F,
 ) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SdkError<E, R>>>,
+    E: ProvideErrorMetadata + Error + 'static,
+    R: Debug + 'static,
+{
+    send_with_retries_output(policy, dry_run, send).await.map(|_| ())
+}
+
+/// Like `send_with_retries`, but returns the response (`None` when a dry run passed).
+pub(crate) async fn send_with_retries_output<T, E, R, F, Fut>(
+    policy: RetryPolicy,
+    dry_run: bool,
+    mut send: F,
+) -> Result<Option<T>, String>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, SdkError<E, R>>>,
@@ -437,12 +456,13 @@ where
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let Err(error) = send().await else {
-            return Ok(());
+        let error = match send().await {
+            Ok(output) => return Ok(Some(output)),
+            Err(error) => error,
         };
 
         if dry_run && error.code() == Some(DRY_RUN_OPERATION) {
-            return Ok(());
+            return Ok(None);
         }
 
         if attempt > policy.max_retries || !is_retryable(&error) {

@@ -1,6 +1,7 @@
 //! Optional reference sources beyond EC2 and Auto Scaling: Image Builder, CloudFormation, Batch
 //! and EMR, plus the text parsers they use.
 
+use aws_sdk_ec2::error::ProvideErrorMetadata;
 use aws_sdk_emr as emr;
 use aws_sdk_imagebuilder as imagebuilder;
 use futures_util::{StreamExt, stream};
@@ -180,6 +181,68 @@ impl ReferenceCollector<'_> {
                 );
                 for image_reference in image_references {
                     self.record(&image_reference, &source).await;
+                }
+                if let Some(template) = resources.launch_template() {
+                    self.scan.pin_launch_template(
+                        template.launch_template_id(),
+                        template.launch_template_name(),
+                        template.version(),
+                    );
+                    for template_override in template.overrides() {
+                        self.scan.pin_launch_template(
+                            template_override.launch_template_id(),
+                            template_override.launch_template_name(),
+                            template_override.version(),
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// EKS managed node groups name a launch template version; EKS launches from a copy, but
+    /// scaling and upgrades go back to the pinned version, so it must survive pruning.
+    pub(crate) async fn collect_eks_nodegroups(&mut self) -> AppResult<()> {
+        let Some(client) = self.clients.eks.clone() else {
+            return Ok(());
+        };
+
+        let mut clusters = Vec::new();
+        let mut cluster_pages = client.list_clusters().into_paginator().send();
+        while let Some(page) = cluster_pages.next().await {
+            clusters.extend(page.aws_context("ListClusters")?.clusters().iter().cloned());
+        }
+
+        for cluster in clusters {
+            let mut nodegroups = Vec::new();
+            let mut nodegroup_pages =
+                client.list_nodegroups().cluster_name(&cluster).into_paginator().send();
+            while let Some(page) = nodegroup_pages.next().await {
+                nodegroups.extend(page.aws_context("ListNodegroups")?.nodegroups().iter().cloned());
+            }
+            for nodegroup in nodegroups {
+                let output = match client
+                    .describe_nodegroup()
+                    .cluster_name(&cluster)
+                    .nodegroup_name(&nodegroup)
+                    .send()
+                    .await
+                {
+                    Ok(output) => output,
+                    // Deleted since it was listed: it pins nothing any more.
+                    Err(error) if error.code() == Some("ResourceNotFoundException") => continue,
+                    Err(error) => return Err(error).aws_context("DescribeNodegroup"),
+                };
+                if let Some(template) =
+                    output.nodegroup().and_then(|nodegroup| nodegroup.launch_template())
+                {
+                    self.scan.pin_launch_template(
+                        template.id(),
+                        template.name(),
+                        template.version(),
+                    );
                 }
             }
         }

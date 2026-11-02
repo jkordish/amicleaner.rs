@@ -1,12 +1,13 @@
 //! Pure eligibility rules: tags, protection, keep-latest, and the deregister/delete predicates.
 //! Plan and execute both call these, so a rule change applies to both phases.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 
 use crate::cli::Args;
-use crate::model::{AmiInfo, Cutoffs, KeepReason, LastLaunched, SnapshotInfo};
+use crate::model::{AmiInfo, Cutoffs, KeepReason, LastLaunched, SnapshotInfo, VersionKeepReason};
+use crate::references::LaunchTemplateInventory;
 
 /// Tag that groups AMIs for `--keep-latest-per-family`.
 const FAMILY_TAG: &str = "ImageFamily";
@@ -236,4 +237,85 @@ pub(crate) fn select_latest_ami_ids_by_family(
     }
 
     keep_ids
+}
+
+/// Tag prefixes of services that create and manage launch templates themselves. Their versions are
+/// never pruned.
+const MANAGED_TEMPLATE_TAG_PREFIXES: &[&str] = &[
+    "eks:",
+    "karpenter.",
+    "aws:batch:",
+    "aws:cloudformation:",
+    "aws:ec2launchtemplate:",
+];
+
+/// Why a whole launch template is left alone, or `None` when its versions may be pruned.
+/// `pins` is every version string something launches this template with.
+pub(crate) fn template_keep_reason(
+    template: &LaunchTemplateInventory,
+    pins: &HashSet<String>,
+    args: &Args,
+) -> Option<VersionKeepReason> {
+    if let Some(key) = template
+        .tags
+        .keys()
+        .find(|key| MANAGED_TEMPLATE_TAG_PREFIXES.iter().any(|prefix| key.starts_with(prefix)))
+    {
+        return Some(VersionKeepReason::ManagedTemplate(key.clone()));
+    }
+    if is_protected(&template.tags, args) {
+        return Some(VersionKeepReason::Protected);
+    }
+    if let Some(pin) = pins.iter().find(|pin| parse_pinned_version(pin).is_none()) {
+        return Some(VersionKeepReason::UnrecognizedPin(pin.clone()));
+    }
+    None
+}
+
+/// A pinned version string as EC2 accepts it: a number, `$Latest` or `$Default`. The symbolic
+/// ones come back as `Some(None)`: they resolve to versions that are always kept.
+pub(crate) fn parse_pinned_version(pin: &str) -> Option<Option<i64>> {
+    let pin = pin.trim();
+    if pin.eq_ignore_ascii_case("$Latest") || pin.eq_ignore_ascii_case("$Default") {
+        return Some(None);
+    }
+    pin.parse::<i64>().ok().filter(|number| *number > 0).map(Some)
+}
+
+/// The newest `keep` versions plus the latest, by number, among the versions that exist.
+pub(crate) fn recent_versions(template: &LaunchTemplateInventory, keep: usize) -> BTreeSet<i64> {
+    let mut recent = template
+        .versions
+        .keys()
+        .rev()
+        .take(keep.saturating_add(1))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    recent.extend(template.latest_version);
+    recent
+}
+
+/// The first rule that keeps one version of a prunable template, or `None` when it may be deleted.
+pub(crate) fn version_keep_reason(
+    version: i64,
+    created: Option<DateTime<Utc>>,
+    template: &LaunchTemplateInventory,
+    recent: &BTreeSet<i64>,
+    pinned: &HashSet<i64>,
+    min_age_cutoff: DateTime<Utc>,
+) -> Option<VersionKeepReason> {
+    if recent.contains(&version) || template.latest_version.is_none_or(|latest| version >= latest) {
+        return Some(VersionKeepReason::Recent);
+    }
+    if template.default_version.is_none_or(|default| default == version) {
+        return Some(VersionKeepReason::Default);
+    }
+    if pinned.contains(&version) {
+        return Some(VersionKeepReason::Pinned);
+    }
+    match created {
+        None => Some(VersionKeepReason::CreateTimeUnknown),
+        Some(created) if created >= min_age_cutoff => Some(VersionKeepReason::TooNew),
+        Some(_) => None,
+    }
 }

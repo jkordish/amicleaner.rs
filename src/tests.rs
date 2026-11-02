@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::process::ExitCode;
 use std::time::Duration as StdDuration;
 
@@ -30,19 +30,26 @@ use crate::execute::{
 use crate::inventory::{
     ami_has_external_launch_permissions, is_ami_id, list_owned_amis, lookup_snapshot_external_use,
 };
+use crate::lt_prune::{
+    execute_launch_template_pruning, plan_launch_template_pruning, prune_block_reason,
+};
 use crate::model::Cutoffs;
 use crate::model::{
     AmiInfo, EXIT_BLOCKED, ExecutionSummary, ExternalUse, KeepReason, LastLaunched,
     RecoveryPointRecord, RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
 };
+use crate::model::{LaunchTemplatePrunePlan, TemplatePrune, VersionKeepReason};
 use crate::plan::{apply_snapshot_external_use, plan_region};
 use crate::policy::{ami_keep_reason, looks_lifecycle_managed, snapshot_keep_reason};
 use crate::policy::{
     backup_recovery_point_deletion_tag_allows, has_expected_tag, is_protected,
     looks_backup_created, optional_expected_value, select_latest_ami_ids_by_family,
 };
+use crate::policy::{parse_pinned_version, template_keep_reason};
+use crate::references::LaunchTemplateInventory;
 use crate::references::lt_cache::{
-    CachedTemplate, FetchPlan, LaunchTemplateCache, LtCacheConfig, default_cache_dir, fetch_plan,
+    CachedTemplate, CachedVersion, FetchPlan, LaunchTemplateCache, LtCacheConfig,
+    default_cache_dir, fetch_plan,
 };
 use crate::references::services::{
     OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids,
@@ -122,6 +129,7 @@ fn scan(referenced: &[&str], unresolved: &[&str]) -> AmiReferenceScan {
             .map(|entry| ((*entry).to_string(), vec!["test reference".to_string()]))
             .collect(),
         references_seen: referenced.len(),
+        ..AmiReferenceScan::default()
     }
 }
 
@@ -875,6 +883,7 @@ fn reference_clients(asg: autoscaling::Client, ssm: ssm::Client) -> ReferenceCli
         cloudformation: None,
         batch: None,
         emr: None,
+        eks: None,
         concurrency: 4,
         region: "us-east-1".to_string(),
         lt_cache: None,
@@ -1644,6 +1653,7 @@ async fn execution_time_safety_blocks_are_blocks_not_failures() {
         ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder()
             .launch_template_versions(
                 ec2::types::LaunchTemplateVersion::builder()
+                    .version_number(1)
                     .launch_template_data(
                         ec2::types::ResponseLaunchTemplateData::builder().image_id("not-an-ami").build(),
                     )
@@ -2228,6 +2238,7 @@ fn template_versions_rule(id: &'static str, image_id: &'static str) -> aws_smith
                 .launch_template_versions(
                     ec2::types::LaunchTemplateVersion::builder()
                         .launch_template_id(id)
+                        .version_number(1)
                         .launch_template_data(ec2::types::ResponseLaunchTemplateData::builder().image_id(image_id).build())
                         .build(),
                 )
@@ -2654,6 +2665,7 @@ fn range_rule(min: &'static str, image_id: &'static str) -> aws_smithy_mocks::Ru
             ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder()
                 .launch_template_versions(
                     ec2::types::LaunchTemplateVersion::builder()
+                        .version_number(min.parse::<i64>().unwrap())
                         .launch_template_data(ec2::types::ResponseLaunchTemplateData::builder().image_id(image_id).build())
                         .build(),
                 )
@@ -2798,7 +2810,16 @@ fn cached_template(
     CachedTemplate {
         scanned_through,
         full_scan_at: Utc::now() - Duration::days(age_days),
-        versions: versions.iter().map(|(number, image)| (*number, (*image).to_string())).collect(),
+        versions: versions
+            .iter()
+            .map(|(number, image)| {
+                let version = CachedVersion {
+                    image: Some((*image).to_string()),
+                    created: Some(Utc::now() - Duration::days(90)),
+                };
+                (*number, version)
+            })
+            .collect(),
     }
 }
 
@@ -2917,6 +2938,13 @@ fn unusable_cache_files_are_ignored() {
     other_account.save(&path).unwrap();
     assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty);
     assert_eq!(LaunchTemplateCache::load(&path, "999999999999", "us-west-2").templates.len(), 0);
+
+    std::fs::write(
+        &path,
+        r#"{"schema_version":1,"account_id":"123456789012","region":"us-east-1","templates":{"lt-1":{"scanned_through":1,"full_scan_at":"2026-01-01T00:00:00Z","versions":{"1":"ami-0123456789abcdef0"}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty, "v1 format");
 
     std::fs::write(&path, "{ not json").unwrap();
     assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty, "corrupt");
@@ -3077,4 +3105,382 @@ async fn cached_template_deleted_mid_scan_is_dropped_from_the_cache() {
     assert!(!collector.scanned_launch_templates.contains(CACHED_LT));
     assert!(saved_cache(&clients).templates.is_empty());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Launch template version pruning
+// ---------------------------------------------------------------------------------------------
+
+use aws_sdk_eks as eks;
+
+/// A template whose versions 1..=latest all exist and are 90 days old; `images` sets image refs.
+fn inventory(
+    id: &str,
+    latest: i64,
+    default: i64,
+    images: &[(i64, &str)],
+    tag_pairs: &[(&str, &str)],
+) -> LaunchTemplateInventory {
+    let old = Utc::now() - Duration::days(90);
+    LaunchTemplateInventory {
+        id: id.to_string(),
+        name: Some(format!("{id}-name")),
+        latest_version: Some(latest),
+        default_version: Some(default),
+        tags: tags(tag_pairs),
+        versions: (1..=latest)
+            .map(|number| {
+                let image = images
+                    .iter()
+                    .find(|(version, _)| *version == number)
+                    .map(|(_, image)| (*image).to_string());
+                (number, CachedVersion { image, created: Some(old) })
+            })
+            .collect(),
+    }
+}
+
+fn pins(pairs: &[(&str, &[&str])]) -> HashMap<String, HashSet<String>> {
+    pairs
+        .iter()
+        .map(|(key, versions)| {
+            (
+                (*key).to_string(),
+                versions.iter().map(|version| (*version).to_string()).collect(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn pinned_versions_are_numbers_or_latest_or_default() {
+    assert_eq!(parse_pinned_version("12"), Some(Some(12)));
+    assert_eq!(parse_pinned_version(" $Latest "), Some(None));
+    assert_eq!(parse_pinned_version("$default"), Some(None));
+    assert_eq!(parse_pinned_version("0"), None);
+    assert_eq!(parse_pinned_version("banana"), None);
+}
+
+#[test]
+fn managed_protected_and_oddly_pinned_templates_are_left_alone() {
+    let args = test_args();
+    let none = HashSet::new();
+    let eks_template = inventory("lt-1", 5, 1, &[], &[("eks:cluster-name", "dev")]);
+    assert_eq!(
+        template_keep_reason(&eks_template, &none, &args),
+        Some(VersionKeepReason::ManagedTemplate("eks:cluster-name".to_string()))
+    );
+    let karpenter = inventory("lt-1", 5, 1, &[], &[("karpenter.sh/nodepool", "x")]);
+    assert!(matches!(
+        template_keep_reason(&karpenter, &none, &args),
+        Some(VersionKeepReason::ManagedTemplate(_))
+    ));
+    let protected = inventory("lt-1", 5, 1, &[], &[(args.protect_tag.as_str(), "true")]);
+    assert_eq!(
+        template_keep_reason(&protected, &none, &args),
+        Some(VersionKeepReason::Protected)
+    );
+    let plain = inventory("lt-1", 5, 1, &[], &[]);
+    let odd = HashSet::from(["$Latest".to_string(), "banana".to_string()]);
+    assert_eq!(
+        template_keep_reason(&plain, &odd, &args),
+        Some(VersionKeepReason::UnrecognizedPin("banana".to_string()))
+    );
+    assert_eq!(template_keep_reason(&plain, &HashSet::from(["7".to_string()]), &args), None);
+}
+
+#[test]
+fn pruning_keeps_recent_default_pinned_and_new_versions_and_projects_freed_amis() {
+    let args = test_args();
+    let mut busy = inventory(
+        "lt-a",
+        10,
+        1,
+        &[(2, AMI_A), (3, AMI_B), (9, AMI_B), (5, AMI_C), (6, "resolve:ssm:/golden")],
+        &[],
+    );
+    busy.versions.get_mut(&4).unwrap().created = Some(Utc::now() - Duration::days(1));
+    let scan = AmiReferenceScan {
+        launch_templates: vec![
+            busy,
+            inventory("lt-eks", 6, 1, &[], &[("eks:nodegroup-name", "ng")]),
+            inventory("lt-odd", 8, 1, &[], &[]),
+        ],
+        pinned_launch_template_versions: pins(&[
+            ("lt-a", &["5"]),
+            ("lt-odd-name", &["$Latest", "banana"]),
+        ]),
+        reference_counts: HashMap::from([
+            (AMI_A.to_string(), 1),
+            (AMI_B.to_string(), 2),
+            (AMI_C.to_string(), 1),
+        ]),
+        ..AmiReferenceScan::default()
+    };
+    let owned = HashSet::from([AMI_A, AMI_B, AMI_C]);
+    let cutoff = Utc::now() - Duration::days(30);
+
+    let plan = plan_launch_template_pruning(&scan, &owned, 3, cutoff, &args);
+
+    assert_eq!(plan.templates.len(), 1);
+    assert_eq!(plan.templates[0].template_id, "lt-a");
+    // 1 default, 4 too new, 5 pinned, 7..=10 newest 3 + latest.
+    assert_eq!(plan.templates[0].delete_versions, vec![2, 3, 6]);
+    assert_eq!(plan.amis_freed, vec![AMI_A.to_string()], "AMI_B is still used by v9");
+    let expected = BTreeMap::from([
+        ("default_version", 1),
+        ("managed_template", 6),
+        ("pinned", 1),
+        ("recent", 4),
+        ("too_new", 1),
+        ("unrecognized_pin", 8),
+    ]);
+    assert_eq!(plan.kept_by_reason, expected);
+}
+
+#[test]
+fn pruning_is_blocked_when_pins_are_not_fully_known() {
+    let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+    clients.batch = Some(mock_client!(
+        aws_sdk_batch,
+        RuleMode::MatchAny,
+        Vec::<&aws_smithy_mocks::Rule>::new()
+    ));
+    clients.eks = Some(mock_client!(
+        aws_sdk_eks,
+        RuleMode::MatchAny,
+        Vec::<&aws_smithy_mocks::Rule>::new()
+    ));
+    assert_eq!(prune_block_reason(&AmiReferenceScan::default(), &clients), None);
+
+    let unresolved = scan(&[], &["failed to describe launch template lt-x"]);
+    assert!(prune_block_reason(&unresolved, &clients).unwrap().contains("unresolved"));
+
+    let no_eks = ReferenceClients { eks: None, ..clients.clone() };
+    assert!(prune_block_reason(&AmiReferenceScan::default(), &no_eks).unwrap().contains("EKS"));
+    let no_batch = ReferenceClients { batch: None, ..clients };
+    assert!(prune_block_reason(&AmiReferenceScan::default(), &no_batch).unwrap().contains("Batch"));
+}
+
+#[tokio::test]
+async fn auto_scaling_groups_pin_launch_template_versions() {
+    let groups = mock!(autoscaling::Client::describe_auto_scaling_groups).then_output(|| {
+        let override_spec = autoscaling::types::LaunchTemplateOverrides::builder()
+            .launch_template_specification(
+                autoscaling::types::LaunchTemplateSpecification::builder()
+                    .launch_template_name("web")
+                    .version("$Latest")
+                    .build(),
+            )
+            .build();
+        autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput::builder()
+            .auto_scaling_groups(
+                autoscaling::types::AutoScalingGroup::builder()
+                    .auto_scaling_group_name("app")
+                    .launch_template(
+                        autoscaling::types::LaunchTemplateSpecification::builder()
+                            .launch_template_id("lt-a")
+                            .version("12")
+                            .build(),
+                    )
+                    .mixed_instances_policy(
+                        autoscaling::types::MixedInstancesPolicy::builder()
+                            .launch_template(
+                                autoscaling::types::LaunchTemplate::builder()
+                                    .overrides(override_spec)
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let asg_client = mock_client!(aws_sdk_autoscaling, RuleMode::MatchAny, [&groups]);
+    let versions = any_versions_rule();
+    let ec2_client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&versions], no_sdk_retries);
+    let clients = reference_clients(asg_client, no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_auto_scaling_groups().await.unwrap();
+
+    let pinned = &collector.scan.pinned_launch_template_versions;
+    assert_eq!(pinned["lt-a"], HashSet::from(["12".to_string()]));
+    assert_eq!(pinned["web"], HashSet::from(["$Latest".to_string()]));
+}
+
+#[tokio::test]
+async fn eks_node_groups_pin_launch_template_versions() {
+    let clusters = mock!(eks::Client::list_clusters).then_output(|| {
+        eks::operation::list_clusters::ListClustersOutput::builder().clusters("dev").build()
+    });
+    let nodegroups = mock!(eks::Client::list_nodegroups).then_output(|| {
+        eks::operation::list_nodegroups::ListNodegroupsOutput::builder()
+            .nodegroups("workers")
+            .nodegroups("gone")
+            .build()
+    });
+    let gone = mock!(eks::Client::describe_nodegroup)
+        .match_requests(|request| request.nodegroup_name() == Some("gone"))
+        .then_error(|| {
+            eks::operation::describe_nodegroup::DescribeNodegroupError::generic(
+                ErrorMetadata::builder().code("ResourceNotFoundException").message("gone").build(),
+            )
+        });
+    let workers = mock!(eks::Client::describe_nodegroup).then_output(|| {
+        eks::operation::describe_nodegroup::DescribeNodegroupOutput::builder()
+            .nodegroup(
+                eks::types::Nodegroup::builder()
+                    .nodegroup_name("workers")
+                    .launch_template(
+                        eks::types::LaunchTemplateSpecification::builder()
+                            .id("lt-a")
+                            .version("7")
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+    clients.eks = Some(mock_client!(
+        aws_sdk_eks,
+        RuleMode::MatchAny,
+        [&clusters, &nodegroups, &gone, &workers]
+    ));
+    let ec2_client = empty_ec2();
+    let mut eks_collector = collector(&ec2_client, &clients);
+
+    eks_collector.collect_eks_nodegroups().await.unwrap();
+
+    assert_eq!(
+        eks_collector.scan.pinned_launch_template_versions["lt-a"],
+        HashSet::from(["7".to_string()])
+    );
+
+    let denied = mock!(eks::Client::list_clusters).then_error(|| {
+        eks::operation::list_clusters::ListClustersError::generic(
+            ErrorMetadata::builder().code("AccessDeniedException").message("no").build(),
+        )
+    });
+    clients.eks = Some(mock_client!(aws_sdk_eks, RuleMode::MatchAny, [&denied]));
+    let mut denied_collector = collector(&ec2_client, &clients);
+    let error = denied_collector.collect_eks_nodegroups().await.unwrap_err();
+    assert!(error_chain(error.as_ref()).contains("AccessDeniedException"));
+}
+
+#[tokio::test]
+async fn execute_rechecks_versions_and_reports_partial_failures() {
+    // At plan time v1..=v3 were deletable; since then v2 became the default version.
+    let templates = mock!(ec2::Client::describe_launch_templates).then_output(|| {
+        ec2::operation::describe_launch_templates::DescribeLaunchTemplatesOutput::builder()
+            .launch_templates(
+                ec2::types::LaunchTemplate::builder()
+                    .launch_template_id("lt-a")
+                    .latest_version_number(10)
+                    .default_version_number(2)
+                    .build(),
+            )
+            .build()
+    });
+    let versions = mock!(ec2::Client::describe_launch_template_versions).then_output(|| {
+        let created = ec2::primitives::DateTime::from_secs((Utc::now() - Duration::days(90)).timestamp());
+        let mut output = ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder();
+        for number in 1..=10 {
+            output = output.launch_template_versions(
+                ec2::types::LaunchTemplateVersion::builder()
+                    .launch_template_id("lt-a")
+                    .version_number(number)
+                    .create_time(created)
+                    .build(),
+            );
+        }
+        output.build()
+    });
+    let delete = mock!(ec2::Client::delete_launch_template_versions)
+        .match_requests(|request| request.versions() == ["1".to_string(), "3".to_string()])
+        .then_output(|| {
+            ec2::operation::delete_launch_template_versions::DeleteLaunchTemplateVersionsOutput::builder()
+                .successfully_deleted_launch_template_versions(
+                    ec2::types::DeleteLaunchTemplateVersionsResponseSuccessItem::builder()
+                        .launch_template_id("lt-a")
+                        .version_number(1)
+                        .build(),
+                )
+                .unsuccessfully_deleted_launch_template_versions(
+                    ec2::types::DeleteLaunchTemplateVersionsResponseErrorItem::builder()
+                        .launch_template_id("lt-a")
+                        .version_number(3)
+                        .response_error(
+                            ec2::types::ResponseError::builder()
+                                .code(ec2::types::LaunchTemplateErrorCode::UnexpectedError)
+                                .message("try later")
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build()
+        });
+    let mut rules = vec![templates, versions];
+    rules.extend(empty_reference_scan_rules());
+    let ec2_client = ec2_with(rules, &[&delete]);
+    let batch = mock!(batch::Client::describe_compute_environments).then_output(|| {
+        batch::operation::describe_compute_environments::DescribeComputeEnvironmentsOutput::builder(
+        )
+        .build()
+    });
+    let clusters = mock!(eks::Client::list_clusters)
+        .then_output(|| eks::operation::list_clusters::ListClustersOutput::builder().build());
+    let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+    clients.batch = Some(mock_client!(aws_sdk_batch, RuleMode::MatchAny, [&batch]));
+    clients.eks = Some(mock_client!(aws_sdk_eks, RuleMode::MatchAny, [&clusters]));
+    let mut args = test_args();
+    args.prune_launch_template_versions = true;
+    let plan = RegionPlan {
+        region: "us-east-1".to_string(),
+        launch_template_prune: Some(LaunchTemplatePrunePlan {
+            templates: vec![TemplatePrune {
+                template_id: "lt-a".to_string(),
+                template_name: None,
+                delete_versions: vec![1, 2, 3],
+            }],
+            ..LaunchTemplatePrunePlan::default()
+        }),
+        ..RegionPlan::default()
+    };
+    let mut summary = ExecutionSummary::default();
+
+    execute_launch_template_pruning(&ec2_client, &clients, &plan, &args, &mut summary).await;
+
+    assert_eq!(delete.num_calls(), 1, "only v1 and v3 are still deletable");
+    assert_eq!(summary.deleted_launch_template_versions, 1);
+    assert_eq!(summary.skipped_launch_template_versions, 1);
+    assert_eq!(summary.failures.len(), 1);
+    assert!(summary.failures[0].contains("lt-a v3"), "{:?}", summary.failures);
+    assert!(summary.blocked.is_empty());
+}
+
+#[tokio::test]
+async fn execute_blocks_pruning_when_a_pin_source_is_skipped() {
+    let ec2_client = ec2_with(empty_reference_scan_rules(), &[]);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let args = test_args();
+    let plan = RegionPlan {
+        launch_template_prune: Some(LaunchTemplatePrunePlan {
+            templates: vec![TemplatePrune {
+                template_id: "lt-a".to_string(),
+                template_name: None,
+                delete_versions: vec![1, 2],
+            }],
+            ..LaunchTemplatePrunePlan::default()
+        }),
+        ..RegionPlan::default()
+    };
+    let mut summary = ExecutionSummary::default();
+
+    execute_launch_template_pruning(&ec2_client, &clients, &plan, &args, &mut summary).await;
+
+    assert_eq!(summary.deleted_launch_template_versions, 0);
+    assert_eq!(summary.skipped_launch_template_versions, 2);
+    assert_eq!(summary.blocked.len(), 1);
 }

@@ -1,6 +1,6 @@
 //! Plain data types shared by planning and execution.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::process::ExitCode;
 
@@ -107,6 +107,8 @@ pub(crate) struct RegionPlan {
     pub(crate) ami_reference_sources: HashMap<String, Vec<String>>,
     /// Why safety checks cancelled planned deletions. Non-empty means exit code 3.
     pub(crate) blocked: Vec<String>,
+    /// Launch template versions to delete, with `--prune-launch-template-versions`.
+    pub(crate) launch_template_prune: Option<LaunchTemplatePrunePlan>,
 }
 
 // Count helpers used by the tests; reports derive their numbers from the lists directly.
@@ -227,9 +229,88 @@ pub(crate) struct ExecutionSummary {
     pub(crate) skipped_snapshots: usize,
     pub(crate) deleted_backup_recovery_points: usize,
     pub(crate) skipped_backup_recovery_points: usize,
+    pub(crate) deleted_launch_template_versions: usize,
+    pub(crate) skipped_launch_template_versions: usize,
     /// Safety checks that cancelled work at execution time. Non-empty means exit code 3.
     pub(crate) blocked: Vec<String>,
     pub(crate) failures: Vec<String>,
+}
+
+/// Why a launch template version survives `--prune-launch-template-versions`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum VersionKeepReason {
+    /// Among the newest `--keep-launch-template-versions` (plus the latest).
+    Recent,
+    /// The template's default version (`$Default`, and launches that name no version).
+    Default,
+    /// An ASG, fleet, Batch environment or EKS node group launches from it by number.
+    Pinned,
+    /// Newer than `--min-age-days`.
+    TooNew,
+    CreateTimeUnknown,
+    /// The template belongs to a service that manages its versions (tag key).
+    ManagedTemplate(String),
+    /// The template carries the protect tag.
+    Protected,
+    /// Something pins a version string we can't interpret, so the whole template is kept.
+    UnrecognizedPin(String),
+}
+
+impl VersionKeepReason {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Recent => "recent",
+            Self::Default => "default_version",
+            Self::Pinned => "pinned",
+            Self::TooNew => "too_new",
+            Self::CreateTimeUnknown => "create_time_unknown",
+            Self::ManagedTemplate(_) => "managed_template",
+            Self::Protected => "protected",
+            Self::UnrecognizedPin(_) => "unrecognized_pin",
+        }
+    }
+}
+
+impl fmt::Display for VersionKeepReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Recent => f.write_str("among the newest versions"),
+            Self::Default => f.write_str("default version"),
+            Self::Pinned => f.write_str("launched from by number"),
+            Self::TooNew => f.write_str("newer than --min-age-days"),
+            Self::CreateTimeUnknown => f.write_str("creation time unknown"),
+            Self::ManagedTemplate(tag) => write!(f, "template managed by another service ({tag})"),
+            Self::Protected => f.write_str("template has the protect tag"),
+            Self::UnrecognizedPin(version) => {
+                write!(f, "pinned to unrecognized version {version:?}")
+            }
+        }
+    }
+}
+
+/// Planned launch template version deletions for one template.
+#[derive(Clone, Debug)]
+pub(crate) struct TemplatePrune {
+    pub(crate) template_id: String,
+    pub(crate) template_name: Option<String>,
+    pub(crate) delete_versions: Vec<i64>,
+}
+
+/// The launch template version part of a region plan (only with `--prune-launch-template-versions`).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LaunchTemplatePrunePlan {
+    pub(crate) templates: Vec<TemplatePrune>,
+    /// Kept versions per reason code.
+    pub(crate) kept_by_reason: BTreeMap<&'static str, usize>,
+    /// Owned AMIs that only the versions to delete reference: candidates for the *next* run,
+    /// where they still go through every AMI rule.
+    pub(crate) amis_freed: Vec<String>,
+}
+
+impl LaunchTemplatePrunePlan {
+    pub(crate) fn version_count(&self) -> usize {
+        self.templates.iter().map(|template| template.delete_versions.len()).sum()
+    }
 }
 
 /// Why an AMI or snapshot candidate is kept because other accounts may use it. AMIs built in one

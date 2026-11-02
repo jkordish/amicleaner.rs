@@ -11,7 +11,9 @@ use serde::Serialize;
 
 use crate::cli::Args;
 use crate::errors::AppResult;
-use crate::model::{ExecutionSummary, KeepReason, Kept, RegionPlan, SnapshotInfo};
+use crate::model::{
+    ExecutionSummary, KeepReason, Kept, LaunchTemplatePrunePlan, RegionPlan, SnapshotInfo,
+};
 
 const SAVINGS_NOTE: &str = "Upper bound. EBS bills only the blocks a snapshot doesn't share with \
 other snapshots of the same volume; this estimate uses each snapshot's full size (or its volume \
@@ -87,6 +89,8 @@ pub(crate) struct Settings {
     pub(crate) snapshot_price_per_gb_month: f64,
     pub(crate) archive_price_per_gb_month: f64,
     pub(crate) launch_template_cache: bool,
+    /// Newest versions kept per template when pruning; `None` when not pruning.
+    pub(crate) prune_launch_template_versions_keep: Option<u16>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -97,6 +101,7 @@ pub(crate) struct Totals {
     pub(crate) deregister_amis: usize,
     pub(crate) delete_snapshots: usize,
     pub(crate) delete_recovery_points: usize,
+    pub(crate) delete_launch_template_versions: usize,
     pub(crate) blocked_items: usize,
     pub(crate) estimated_monthly_savings_usd: f64,
     pub(crate) estimated_savings_gib: f64,
@@ -129,8 +134,53 @@ pub(crate) struct RegionReport {
     pub(crate) unresolved_references: Vec<String>,
     pub(crate) amis: Vec<Decision>,
     pub(crate) snapshots: Vec<Decision>,
+    /// Only with `--prune-launch-template-versions` (and when not blocked).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_template_versions: Option<LaunchTemplateVersionsReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) execution: Option<ExecutionReport>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LaunchTemplateVersionsReport {
+    pub(crate) delete_versions: usize,
+    pub(crate) kept_by_reason: BTreeMap<&'static str, usize>,
+    /// Owned AMIs only the deleted versions reference; considered (under every AMI rule) next run.
+    pub(crate) amis_freed_next_run: Vec<String>,
+    pub(crate) templates: Vec<TemplateVersionsDecision>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct TemplateVersionsDecision {
+    pub(crate) template_id: String,
+    pub(crate) template_name: Option<String>,
+    pub(crate) delete_versions: Vec<i64>,
+}
+
+impl From<&LaunchTemplatePrunePlan> for LaunchTemplateVersionsReport {
+    fn from(plan: &LaunchTemplatePrunePlan) -> Self {
+        let mut templates = plan
+            .templates
+            .iter()
+            .map(|template| TemplateVersionsDecision {
+                template_id: template.template_id.clone(),
+                template_name: template.template_name.clone(),
+                delete_versions: template.delete_versions.clone(),
+            })
+            .collect::<Vec<_>>();
+        templates.sort_by(|a, b| {
+            b.delete_versions
+                .len()
+                .cmp(&a.delete_versions.len())
+                .then(a.template_id.cmp(&b.template_id))
+        });
+        Self {
+            delete_versions: plan.version_count(),
+            kept_by_reason: plan.kept_by_reason.clone(),
+            amis_freed_next_run: plan.amis_freed.clone(),
+            templates,
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -199,6 +249,8 @@ pub(crate) struct ExecutionReport {
     pub(crate) skipped_snapshots: usize,
     pub(crate) deleted_recovery_points: usize,
     pub(crate) skipped_recovery_points: usize,
+    pub(crate) deleted_launch_template_versions: usize,
+    pub(crate) skipped_launch_template_versions: usize,
     pub(crate) blocked: Vec<String>,
     pub(crate) failures: Vec<String>,
 }
@@ -213,6 +265,8 @@ impl From<&ExecutionSummary> for ExecutionReport {
             skipped_snapshots: summary.skipped_snapshots,
             deleted_recovery_points: summary.deleted_backup_recovery_points,
             skipped_recovery_points: summary.skipped_backup_recovery_points,
+            deleted_launch_template_versions: summary.deleted_launch_template_versions,
+            skipped_launch_template_versions: summary.skipped_launch_template_versions,
             blocked: summary.blocked.clone(),
             failures: summary.failures.clone(),
         }
@@ -244,6 +298,9 @@ impl Settings {
             snapshot_price_per_gb_month: args.snapshot_price_per_gb_month,
             archive_price_per_gb_month: args.archive_price_per_gb_month,
             launch_template_cache: !args.no_cache,
+            prune_launch_template_versions_keep: args
+                .prune_launch_template_versions
+                .then_some(args.keep_launch_template_versions),
         }
     }
 }
@@ -272,6 +329,10 @@ impl Report {
             totals.deregister_amis += region.counts.deregister_amis;
             totals.delete_snapshots += region.counts.delete_snapshots;
             totals.delete_recovery_points += region.counts.delete_recovery_points;
+            totals.delete_launch_template_versions += region
+                .launch_template_versions
+                .as_ref()
+                .map_or(0, |versions| versions.delete_versions);
             totals.estimated_monthly_savings_usd += region.estimated_monthly_savings_usd;
             totals.estimated_savings_gib += region.estimated_savings_gib;
             totals.blocked_items += region
@@ -311,6 +372,7 @@ impl RegionReport {
             unresolved_references: Vec::new(),
             amis: Vec::new(),
             snapshots: Vec::new(),
+            launch_template_versions: None,
             execution: None,
         }
     }
@@ -466,6 +528,10 @@ impl RegionReport {
             unresolved_references: plan.unresolved_ami_references.clone(),
             amis,
             snapshots,
+            launch_template_versions: plan
+                .launch_template_prune
+                .as_ref()
+                .map(LaunchTemplateVersionsReport::from),
             execution,
         }
     }
@@ -690,6 +756,14 @@ fn write_settings_markdown(out: &mut String, settings: &Settings) {
         "| Launch template cache | {} |",
         if settings.launch_template_cache { "enabled" } else { "disabled (--no-cache)" }
     );
+    let _ = writeln!(
+        out,
+        "| Launch template version pruning | {} |",
+        settings.prune_launch_template_versions_keep.map_or_else(
+            || "off".to_string(),
+            |keep| format!("keep newest {keep} + latest + default")
+        )
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "</details>");
     let _ = writeln!(out);
@@ -794,6 +868,10 @@ fn write_region_markdown(out: &mut String, region: &RegionReport) {
     }
     let _ = writeln!(out);
 
+    if let Some(versions) = &region.launch_template_versions {
+        write_launch_template_versions_markdown(out, versions);
+    }
+
     write_details_table(out, "All AMIs", &region.amis);
     write_details_table(out, "All snapshots", &region.snapshots);
 
@@ -859,6 +937,55 @@ fn write_decision_row(out: &mut String, decision: &Decision, with_action: bool) 
     }
 }
 
+fn write_launch_template_versions_markdown(
+    out: &mut String,
+    versions: &LaunchTemplateVersionsReport,
+) {
+    let _ = writeln!(out, "### Launch template versions");
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "{} versions to delete in {} templates. {} owned AMIs are referenced only by those versions; the next run considers them under every AMI rule.",
+        versions.delete_versions,
+        versions.templates.len(),
+        versions.amis_freed_next_run.len()
+    );
+    let _ = writeln!(out);
+    if !versions.kept_by_reason.is_empty() {
+        let _ = writeln!(out, "| Kept because | Versions |");
+        let _ = writeln!(out, "|---|--:|");
+        let mut rows = versions.kept_by_reason.iter().collect::<Vec<_>>();
+        rows.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        for (code, count) in rows {
+            let _ = writeln!(out, "| {} | {count} |", code.replace('_', " "));
+        }
+        let _ = writeln!(out);
+    }
+    if !versions.templates.is_empty() {
+        let _ = writeln!(out, "<details><summary>Per template</summary>");
+        let _ = writeln!(out);
+        let _ = writeln!(out, "| Template | Name | Versions to delete | Range |");
+        let _ = writeln!(out, "|---|---|--:|---|");
+        for template in &versions.templates {
+            let range = match (template.delete_versions.first(), template.delete_versions.last()) {
+                (Some(first), Some(last)) if first != last => format!("v{first}–v{last}"),
+                (Some(first), _) => format!("v{first}"),
+                _ => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {range} |",
+                template.template_id,
+                cell(template.template_name.as_deref().unwrap_or("")),
+                template.delete_versions.len()
+            );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(out, "</details>");
+        let _ = writeln!(out);
+    }
+}
+
 fn write_execution_markdown(out: &mut String, execution: &ExecutionReport) {
     let _ = writeln!(
         out,
@@ -886,6 +1013,11 @@ fn write_execution_markdown(out: &mut String, execution: &ExecutionReport) {
         out,
         "| Recovery points deleted | {} | {} |",
         execution.deleted_recovery_points, execution.skipped_recovery_points
+    );
+    let _ = writeln!(
+        out,
+        "| Launch template versions deleted | {} | {} |",
+        execution.deleted_launch_template_versions, execution.skipped_launch_template_versions
     );
     let _ = writeln!(out);
     for (title, items) in
@@ -952,6 +1084,16 @@ pub(crate) fn render_region_text(region: &RegionReport) -> String {
         counts.kept_snapshots
     );
     write_reason_line(&mut out, &region.kept_snapshots_by_reason);
+    if let Some(versions) = &region.launch_template_versions {
+        let _ = writeln!(
+            out,
+            "  LT versions{:>6} to delete in {} templates · frees {} AMIs next run",
+            versions.delete_versions,
+            versions.templates.len(),
+            versions.amis_freed_next_run.len()
+        );
+        write_reason_line(&mut out, &versions.kept_by_reason);
+    }
     if region.estimated_monthly_savings_usd > 0.0 {
         let _ = writeln!(
             out,
@@ -1010,11 +1152,12 @@ pub(crate) fn render_region_text(region: &RegionReport) -> String {
     if let Some(execution) = &region.execution {
         let _ = writeln!(
             out,
-            "  {}  {} AMIs deregistered · {} snapshots deleted · {} recovery points deleted{}",
+            "  {}  {} AMIs deregistered · {} snapshots deleted · {} recovery points deleted · {} launch template versions deleted{}",
             console::style(if execution.dry_run { "dry run" } else { "executed" }).bold(),
             execution.deregistered_amis,
             execution.deleted_snapshots,
             execution.deleted_recovery_points,
+            execution.deleted_launch_template_versions,
             if execution.dry_run { " (requests that passed the AWS dry-run check)" } else { "" }
         );
         for reason in &execution.blocked {

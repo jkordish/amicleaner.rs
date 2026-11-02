@@ -51,8 +51,9 @@ Read, per reference source (drop the ones you pass to `--skip-reference-sources`
 | `cloudformation` | `cloudformation:DescribeStacks`, `cloudformation:GetTemplate` |
 | `batch` | `batch:DescribeComputeEnvironments` |
 | `emr` | `elasticmapreduce:ListClusters`, `elasticmapreduce:DescribeCluster`, `elasticmapreduce:ListInstanceGroups`, `elasticmapreduce:ListInstanceFleets` |
+| `eks` (only with `--prune-launch-template-versions`) | `eks:ListClusters`, `eks:ListNodegroups`, `eks:DescribeNodegroup` |
 
-Write (`--execute`): `ec2:DeregisterImage`, `ec2:DeleteSnapshot`, and `backup:DeleteRecoveryPoint` for `--execute-backup-recovery-point-deletes`.
+Write (`--execute`): `ec2:DeregisterImage`, `ec2:DeleteSnapshot`, `backup:DeleteRecoveryPoint` for `--execute-backup-recovery-point-deletes`, and `ec2:DeleteLaunchTemplateVersions` for `--prune-launch-template-versions`.
 
 A missing read permission fails closed: AMI deregistrations or snapshot deletions in that region are cancelled, not attempted blind.
 
@@ -86,6 +87,19 @@ The plan estimates the monthly snapshot storage that deleting would free, as **a
 Every AWS request attempt has a deadline (`--request-timeout-secs`, default 60). Proxies that drop connections without closing them would otherwise leave a request waiting forever. With the deadline, the SDK retries it instead.
 
 Read-heavy steps run up to `--max-concurrency` requests at a time (default 8): launch template versions (a build account can have tens of thousands), CloudFormation templates, and the AMI/snapshot sharing lookups. Lower it if the account gets throttled. Mutations (deregister, delete) always run one at a time. A launch template deleted while the scan runs is skipped, since it can no longer launch anything.
+
+### pruning launch template versions
+
+Launch templates are free, but every old version that names an AMI keeps that AMI and its snapshots "referenced" forever. A template also stops accepting new versions at 10,000. `--prune-launch-template-versions` deletes old versions as well (only with `--execute`; plan mode just reports them). A version is kept if any of these hold:
+
+- it's among the newest `--keep-launch-template-versions` (default 3), or it's the latest
+- it's the default version (`$Default`, and launches that name no version)
+- an Auto Scaling group (including mixed-instances overrides), EC2 Fleet, Spot Fleet, Batch compute environment or EKS managed node group launches from it by number. Terraform's `latest_version` pins a number, so this is common.
+- it's newer than `--min-age-days`, or its creation time is unknown
+
+Templates managed by EKS, Karpenter, Batch or CloudFormation (by tag), templates with the protect tag, and templates pinned to a version string amicleaner doesn't recognize are left alone. If any reference source failed or left unresolved references, or Batch or EKS is skipped, pruning is cancelled for the region (exit code 3). Execute re-reads everything and only deletes versions that both the plan and the re-check agree on, after the AMI and snapshot phases. AMIs that only the deleted versions referenced are reported as freed. They're considered on the *next* run, under every AMI rule. Needs `ec2:DeleteLaunchTemplateVersions`, plus the `eks` permissions above.
+
+Things amicleaner can't see, like scripts or pipelines that launch a specific version number by hand, aren't protected. Raise `--keep-launch-template-versions` if you have those.
 
 ### launch template cache
 
@@ -208,6 +222,7 @@ Options:
           - cloudformation: AMI ids (and SSM dynamic references to AMIs) in stack templates and parameters
           - batch:          Compute environment image ids and EC2 configuration overrides
           - emr:            Custom AMIs of active clusters, instance groups and instance fleets
+          - eks:            Launch template versions pinned by EKS managed node groups (only needed to prune versions)
 
       --report <FILE>
           Write the full report (every AMI and snapshot with its decision and reason) to a file. The format follows the extension: .md/.markdown or .json. Repeat for several files
@@ -226,6 +241,14 @@ Options:
           Seconds before a single AWS request attempt is abandoned and retried. Protects against connections that a proxy drops without closing
           
           [default: 60]
+
+      --prune-launch-template-versions
+          Also delete old launch template versions: those older than --min-age-days that aren't among the newest --keep-launch-template-versions, the default version, or launched by number from an Auto Scaling group, fleet, Batch environment or EKS node group. Templates managed by EKS, Karpenter, Batch or CloudFormation are left alone. Frees the AMIs only old versions referenced on the next run
+
+      --keep-launch-template-versions <COUNT>
+          Newest versions of each launch template kept by --prune-launch-template-versions, in addition to the latest and default versions
+          
+          [default: 3]
 
       --cache-dir <DIR>
           Directory for the launch template version cache. Defaults to XDG_CACHE_HOME/amicleaner, else ~/.cache/amicleaner

@@ -4,17 +4,18 @@
 pub(crate) mod lt_cache;
 pub(crate) mod services;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use aws_sdk_autoscaling as autoscaling;
 use aws_sdk_batch as batch;
 use aws_sdk_cloudformation as cloudformation;
 use aws_sdk_ec2 as ec2;
+use aws_sdk_eks as eks;
 use aws_sdk_emr as emr;
 use aws_sdk_imagebuilder as imagebuilder;
 use aws_sdk_ssm as ssm;
 use aws_types::SdkConfig;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::ValueEnum;
 use ec2::error::ProvideErrorMetadata;
 use futures_util::{StreamExt, stream};
@@ -23,7 +24,7 @@ use log::warn;
 use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
 use crate::inventory::is_ami_id;
 use crate::references::lt_cache::{
-    CachedTemplate, FetchPlan, LaunchTemplateCache, LtCacheConfig, fetch_plan,
+    CachedTemplate, CachedVersion, FetchPlan, LaunchTemplateCache, LtCacheConfig, fetch_plan,
 };
 use crate::ui::{Phase, thousands};
 
@@ -38,6 +39,8 @@ pub(crate) enum ReferenceSource {
     Batch,
     /// Custom AMIs of active clusters, instance groups and instance fleets.
     Emr,
+    /// Launch template versions pinned by EKS managed node groups (only needed to prune versions).
+    Eks,
 }
 
 /// Clients the AMI reference scan reads from. An optional client that is `None` is skipped.
@@ -49,6 +52,7 @@ pub(crate) struct ReferenceClients {
     pub(crate) cloudformation: Option<cloudformation::Client>,
     pub(crate) batch: Option<batch::Client>,
     pub(crate) emr: Option<emr::Client>,
+    pub(crate) eks: Option<eks::Client>,
     /// Maximum concurrent requests for the fan-out lookups (launch template versions,
     /// CloudFormation templates).
     pub(crate) concurrency: usize,
@@ -70,10 +74,26 @@ impl ReferenceClients {
                 .then(|| cloudformation::Client::new(config)),
             batch: enabled(ReferenceSource::Batch).then(|| batch::Client::new(config)),
             emr: enabled(ReferenceSource::Emr).then(|| emr::Client::new(config)),
+            // Node groups pin template versions but launch no AMI of their own that the launch
+            // template scan misses, so EKS is only read when pruning versions (`with_eks`).
+            eks: None,
             concurrency: concurrency.max(1),
             region: config.region().map(ToString::to_string).unwrap_or_default(),
             lt_cache: None,
         }
+    }
+
+    /// Reads EKS node groups too (needed before pruning launch template versions), unless the
+    /// source is skipped.
+    pub(crate) fn with_eks(
+        mut self,
+        config: &SdkConfig,
+        skip: &[ReferenceSource],
+        enabled: bool,
+    ) -> Self {
+        self.eks =
+            (enabled && !skip.contains(&ReferenceSource::Eks)).then(|| eks::Client::new(config));
+        self
     }
 
     pub(crate) fn with_lt_cache(mut self, lt_cache: Option<LtCacheConfig>) -> Self {
@@ -97,6 +117,24 @@ pub(crate) struct AmiReferenceScan {
     pub(crate) sources: HashMap<String, Vec<String>>,
     /// Every reference recorded (an AMI referenced twice counts twice), for progress output.
     pub(crate) references_seen: usize,
+    /// AMI id -> how many references were recorded for it, from every source.
+    pub(crate) reference_counts: HashMap<String, usize>,
+    /// Launch template id or name -> versions something launches from explicitly (`"12"`,
+    /// `"$Latest"`, `"$Default"`, or anything else a service accepted).
+    pub(crate) pinned_launch_template_versions: HashMap<String, HashSet<String>>,
+    /// Every launch template whose versions were all read, with those versions.
+    pub(crate) launch_templates: Vec<LaunchTemplateInventory>,
+}
+
+/// One launch template and all its versions, for version pruning.
+#[derive(Clone, Debug)]
+pub(crate) struct LaunchTemplateInventory {
+    pub(crate) id: String,
+    pub(crate) name: Option<String>,
+    pub(crate) latest_version: Option<i64>,
+    pub(crate) default_version: Option<i64>,
+    pub(crate) tags: HashMap<String, String>,
+    pub(crate) versions: BTreeMap<i64, CachedVersion>,
 }
 
 /// How many referencing sources are kept per AMI for reports.
@@ -108,8 +146,28 @@ impl AmiReferenceScan {
         if sources.len() < MAX_SOURCES_PER_AMI && !sources.iter().any(|known| known == source) {
             sources.push(source.to_string());
         }
+        *self.reference_counts.entry(ami_id.clone()).or_default() += 1;
         self.referenced_ami_ids.insert(ami_id);
         self.references_seen += 1;
+    }
+
+    /// Notes that something launches from `version` of a template (by id and/or name). No version
+    /// means the template's default version, which pruning always keeps.
+    pub(crate) fn pin_launch_template(
+        &mut self,
+        id: Option<&str>,
+        name: Option<&str>,
+        version: Option<&str>,
+    ) {
+        let Some(version) = version.map(str::trim).filter(|version| !version.is_empty()) else {
+            return;
+        };
+        for key in id.into_iter().chain(name) {
+            self.pinned_launch_template_versions
+                .entry(key.to_string())
+                .or_default()
+                .insert(version.to_string());
+        }
     }
 }
 
@@ -197,6 +255,9 @@ pub(crate) async fn collect_referenced_ami_ids(
         collector.collect_batch_compute_environments()
     );
     scan_source!(collector, "emr", clients.emr.is_some(), collector.collect_emr_clusters());
+    if clients.eks.is_some() {
+        scan_source!(collector, "eks node groups", true, collector.collect_eks_nodegroups());
+    }
 
     Ok(collector.scan)
 }
@@ -282,12 +343,22 @@ impl ReferenceCollector<'_> {
                 let id = launch_template.launch_template_id().map(ToString::to_string);
                 let name = launch_template.launch_template_name().map(ToString::to_string);
                 if id.is_some() || name.is_some() {
-                    let template = LaunchTemplateRef {
-                        launch_template_id: id,
-                        launch_template_name: name,
-                        version: None,
-                    };
-                    templates.push((template, launch_template.latest_version_number()));
+                    templates.push(ListedTemplate {
+                        reference: LaunchTemplateRef {
+                            launch_template_id: id,
+                            launch_template_name: name,
+                            version: None,
+                        },
+                        latest: launch_template.latest_version_number(),
+                        default: launch_template.default_version_number(),
+                        tags: launch_template
+                            .tags()
+                            .iter()
+                            .filter_map(|tag| {
+                                Some((tag.key()?.to_string(), tag.value()?.to_string()))
+                            })
+                            .collect(),
+                    });
                 }
             }
         }
@@ -302,10 +373,10 @@ impl ReferenceCollector<'_> {
         // Only templates with an id are cached; anything else is always read in full.
         let plans = templates
             .iter()
-            .map(|(template, latest)| {
-                match (&cache, &cache_config, template.launch_template_id.as_deref()) {
+            .map(|template| {
+                match (&cache, &cache_config, template.reference.launch_template_id.as_deref()) {
                     (Some(cache), Some(config), Some(id)) => {
-                        fetch_plan(cache.templates.get(id), *latest, now, config.max_age)
+                        fetch_plan(cache.templates.get(id), template.latest, now, config.max_age)
                     }
                     _ => FetchPlan::Full,
                 }
@@ -318,10 +389,10 @@ impl ReferenceCollector<'_> {
             .iter()
             .zip(&plans)
             .enumerate()
-            .flat_map(|(index, ((_, latest), plan))| {
+            .flat_map(|(index, (template, plan))| {
                 let ranges = match plan {
-                    FetchPlan::Full => version_ranges(1, *latest),
-                    FetchPlan::From(start) => version_ranges(*start, *latest),
+                    FetchPlan::Full => version_ranges(1, template.latest),
+                    FetchPlan::From(start) => version_ranges(*start, template.latest),
                     FetchPlan::UpToDate => Vec::new(),
                 };
                 ranges.into_iter().map(move |range| (index, range))
@@ -339,7 +410,7 @@ impl ReferenceCollector<'_> {
         }
         let results = stream::iter(&chunks)
             .map(|(index, range)| {
-                launch_template_image_references(ec2_client, &templates[*index].0, range)
+                launch_template_versions(ec2_client, &templates[*index].reference, range)
             })
             .buffered(self.clients.concurrency)
             .inspect(|_| {
@@ -365,62 +436,69 @@ impl ReferenceCollector<'_> {
             }
         }
 
-        for (((template, latest), plan), fetched) in templates.iter().zip(&plans).zip(per_template)
-        {
-            let label = template
+        for ((template, plan), fetched) in templates.iter().zip(&plans).zip(per_template) {
+            let reference = &template.reference;
+            let label = reference
                 .launch_template_id
                 .as_deref()
-                .or(template.launch_template_name.as_deref())
+                .or(reference.launch_template_name.as_deref())
                 .unwrap_or("<unknown>")
                 .to_string();
             let Some(fetched) = fetched else {
                 warn!("launch template {label} was deleted during the scan; ignoring it");
-                if let (Some(cache), Some(id)) = (&mut cache, &template.launch_template_id) {
+                if let (Some(cache), Some(id)) = (&mut cache, &reference.launch_template_id) {
                     cache.templates.remove(id);
                 }
                 continue;
             };
             self.scanned_launch_templates.extend(
-                template.launch_template_id.iter().chain(&template.launch_template_name).cloned(),
+                reference.launch_template_id.iter().chain(&reference.launch_template_name).cloned(),
             );
 
-            let scanned_through = latest.unwrap_or(0).max(fetched.max_version);
-            let entry = match (plan, &mut cache, template.launch_template_id.as_deref()) {
+            let scanned_through = template.latest.unwrap_or(0).max(fetched.max_version);
+            let versions = match (plan, &mut cache, reference.launch_template_id.as_deref()) {
                 (FetchPlan::Full, Some(cache), Some(id)) => {
                     let entry = CachedTemplate {
                         scanned_through,
                         full_scan_at: now,
                         versions: fetched.versions.into_iter().collect(),
                     };
+                    let versions = entry.versions.clone();
                     cache.templates.insert(id.to_string(), entry);
-                    cache.templates.get(id)
+                    versions
                 }
                 (FetchPlan::From(_) | FetchPlan::UpToDate, Some(cache), Some(id)) => {
                     let entry = cache.templates.get_mut(id).expect("planned from a cached entry");
                     entry.versions.extend(fetched.versions);
                     entry.scanned_through = entry.scanned_through.max(scanned_through);
-                    cache.templates.get(id)
+                    entry.versions.clone()
                 }
-                _ => {
-                    for (number, image_reference) in fetched.versions {
-                        let source = format!("launch template {label} v{number}");
-                        self.record(&image_reference, &source).await;
-                    }
-                    continue;
-                }
+                _ => fetched.versions.into_iter().collect(),
             };
+
             // Replay every version (cached and new) as a reference; the cache only adds.
-            let versions = entry.map(|entry| entry.versions.clone()).unwrap_or_default();
-            for (number, image_reference) in versions {
-                let source = format!("launch template {label} v{number}");
-                self.record(&image_reference, &source).await;
+            for (number, version) in &versions {
+                if let Some(image_reference) = &version.image {
+                    let source = format!("launch template {label} v{number}");
+                    self.record(image_reference, &source).await;
+                }
+            }
+            if let Some(id) = &reference.launch_template_id {
+                self.scan.launch_templates.push(LaunchTemplateInventory {
+                    id: id.clone(),
+                    name: reference.launch_template_name.clone(),
+                    latest_version: template.latest,
+                    default_version: template.default,
+                    tags: template.tags.clone(),
+                    versions,
+                });
             }
         }
 
         if let (Some(mut cache), Some(config)) = (cache, cache_config) {
             let listed = templates
                 .iter()
-                .filter_map(|(template, _)| template.launch_template_id.as_deref())
+                .filter_map(|template| template.reference.launch_template_id.as_deref())
                 .collect::<HashSet<&str>>();
             cache.prune(&listed);
             let path = config.path(&region);
@@ -472,6 +550,11 @@ impl ReferenceCollector<'_> {
                 }
 
                 for template_ref in &template_refs {
+                    self.scan.pin_launch_template(
+                        template_ref.launch_template_id.as_deref(),
+                        template_ref.launch_template_name.as_deref(),
+                        template_ref.version.as_deref(),
+                    );
                     let already_scanned = template_ref
                         .launch_template_id
                         .iter()
@@ -610,6 +693,13 @@ impl ReferenceCollector<'_> {
 
                 let source = format!("EC2 Fleet {}", fleet.fleet_id().unwrap_or("<unknown>"));
                 for config in fleet.launch_template_configs() {
+                    if let Some(spec) = config.launch_template_specification() {
+                        self.scan.pin_launch_template(
+                            spec.launch_template_id(),
+                            spec.launch_template_name(),
+                            spec.version(),
+                        );
+                    }
                     for override_spec in config.overrides() {
                         if let Some(image_reference) = override_spec.image_id() {
                             self.record(image_reference, &source).await;
@@ -653,6 +743,17 @@ impl ReferenceCollector<'_> {
                     if let Some(image_reference) = spec.image_id() {
                         self.record(image_reference, &source).await;
                     }
+                }
+                for spec in config
+                    .launch_template_configs()
+                    .iter()
+                    .filter_map(|template_config| template_config.launch_template_specification())
+                {
+                    self.scan.pin_launch_template(
+                        spec.launch_template_id(),
+                        spec.launch_template_name(),
+                        spec.version(),
+                    );
                 }
             }
         }
@@ -720,19 +821,26 @@ pub(crate) fn version_ranges(
     ranges
 }
 
+/// A template as `DescribeLaunchTemplates` listed it.
+struct ListedTemplate {
+    reference: LaunchTemplateRef,
+    latest: Option<i64>,
+    default: Option<i64>,
+    tags: HashMap<String, String>,
+}
+
 /// Versions read from one or more ranges of a template.
 #[derive(Debug, Default)]
 pub(crate) struct FetchedVersions {
-    /// `(version number, raw image reference)` for versions that set an image.
-    pub(crate) versions: Vec<(i64, String)>,
+    pub(crate) versions: Vec<(i64, CachedVersion)>,
     /// Highest version number seen, with or without an image.
     pub(crate) max_version: i64,
 }
 
-/// Image references in one version range of a launch template. `None` when the template was
+/// The versions in one range of a launch template. `None` when the template was
 /// deleted after it was listed: it can't launch anything any more, and build accounts churn
 /// templates constantly, so failing the whole scan over it would block AMI cleanup for no reason.
-async fn launch_template_image_references(
+async fn launch_template_versions(
     ec2_client: &ec2::Client,
     template: &LaunchTemplateRef,
     (min_version, max_version): &(Option<i64>, Option<i64>),
@@ -759,12 +867,28 @@ async fn launch_template_image_references(
             Err(error) => return Err(error).aws_context("DescribeLaunchTemplateVersions"),
         };
         for version in output.launch_template_versions() {
-            let number = version.version_number().unwrap_or_default();
+            // Versions are keyed by number; one without a number can't be tracked, and merging
+            // it into another would lose a reference, so the scan fails (closed) instead.
+            let Some(number) = version.version_number() else {
+                return Err(format!(
+                    "DescribeLaunchTemplateVersions returned a version of {} without a version number",
+                    template
+                        .launch_template_id
+                        .as_deref()
+                        .or(template.launch_template_name.as_deref())
+                        .unwrap_or("<unknown>")
+                )
+                .into());
+            };
             fetched.max_version = fetched.max_version.max(number);
-            if let Some(image_id) = version.launch_template_data().and_then(|data| data.image_id())
-            {
-                fetched.versions.push((number, image_id.to_string()));
-            }
+            let image = version
+                .launch_template_data()
+                .and_then(|data| data.image_id())
+                .map(ToString::to_string);
+            let created = version
+                .create_time()
+                .and_then(|time| DateTime::from_timestamp(time.secs(), time.subsec_nanos()));
+            fetched.versions.push((number, CachedVersion { image, created }));
         }
     }
     Ok(Some(fetched))

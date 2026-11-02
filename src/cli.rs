@@ -113,6 +113,20 @@ pub(crate) struct Args {
           value_parser = clap::value_parser!(u64).range(5..=600))]
     pub(crate) request_timeout_secs: u64,
 
+    /// Also delete old launch template versions: those older than --min-age-days that aren't
+    /// among the newest --keep-launch-template-versions, the default version, or launched by
+    /// number from an Auto Scaling group, fleet, Batch environment or EKS node group. Templates
+    /// managed by EKS, Karpenter, Batch or CloudFormation are left alone. Frees the AMIs only old
+    /// versions referenced on the next run.
+    #[arg(long)]
+    pub(crate) prune_launch_template_versions: bool,
+
+    /// Newest versions of each launch template kept by --prune-launch-template-versions, in
+    /// addition to the latest and default versions.
+    #[arg(long, value_name = "COUNT", default_value_t = 3,
+          value_parser = clap::value_parser!(u16).range(1..=1000))]
+    pub(crate) keep_launch_template_versions: u16,
+
     /// Directory for the launch template version cache. Defaults to XDG_CACHE_HOME/amicleaner,
     /// else ~/.cache/amicleaner.
     #[arg(long, value_name = "DIR")]

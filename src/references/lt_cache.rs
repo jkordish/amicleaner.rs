@@ -9,14 +9,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Duration, Utc};
 use log::warn;
 use serde::{Deserialize, Serialize};
 
-const SCHEMA_VERSION: u32 = 1;
+/// v2 stores every version (with its creation time), not only versions that set an image.
+const SCHEMA_VERSION: u32 = 2;
 
 /// Where the cache lives and how long a template's full scan stays trusted.
 #[derive(Clone, Debug)]
@@ -45,8 +46,18 @@ pub(crate) struct CachedTemplate {
     pub(crate) scanned_through: i64,
     /// When every version of the template was last read.
     pub(crate) full_scan_at: DateTime<Utc>,
-    /// Version number -> raw image reference, for versions that set an image.
-    pub(crate) versions: BTreeMap<i64, String>,
+    /// Every version read, by number.
+    pub(crate) versions: BTreeMap<i64, CachedVersion>,
+}
+
+/// What's kept about one launch template version.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CachedVersion {
+    /// Raw image reference (`ami-...` or `resolve:ssm:...`), if the version sets one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) created: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -55,6 +66,14 @@ pub(crate) struct LaunchTemplateCache {
     pub(crate) account_id: String,
     pub(crate) region: String,
     pub(crate) templates: BTreeMap<String, CachedTemplate>,
+}
+
+/// The fields checked before trusting a cache file (other fields are ignored when parsing this).
+#[derive(Deserialize)]
+struct CacheHeader {
+    schema_version: u32,
+    account_id: String,
+    region: String,
 }
 
 /// Which versions of a template need fetching.
@@ -116,26 +135,41 @@ impl LaunchTemplateCache {
                 return Self::empty(account_id, region);
             }
         };
-        match serde_json::from_reader::<_, Self>(BufReader::new(file)) {
-            Ok(cache)
-                if cache.schema_version == SCHEMA_VERSION
-                    && cache.account_id == account_id
-                    && cache.region == region =>
-            {
-                cache
+        let mut contents = String::new();
+        if let Err(error) = BufReader::new(file).read_to_string(&mut contents) {
+            warn!("ignoring launch template cache {}: {error}", path.display());
+            return Self::empty(account_id, region);
+        }
+        // The header is checked first so an older format is reported as such, not as a parse error.
+        match serde_json::from_str::<CacheHeader>(&contents) {
+            Ok(header)
+                if header.schema_version == SCHEMA_VERSION
+                    && header.account_id == account_id
+                    && header.region == region => {}
+            Ok(header) if header.schema_version != SCHEMA_VERSION => {
+                warn!(
+                    "launch template cache {} is from an older version (format {}); rebuilding it",
+                    path.display(),
+                    header.schema_version
+                );
+                return Self::empty(account_id, region);
             }
             Ok(_) => {
                 warn!(
-                    "ignoring launch template cache {}: written for another account, region or version",
+                    "ignoring launch template cache {}: written for another account or region",
                     path.display()
                 );
-                Self::empty(account_id, region)
+                return Self::empty(account_id, region);
             }
             Err(error) => {
                 warn!("ignoring launch template cache {}: {error}", path.display());
-                Self::empty(account_id, region)
+                return Self::empty(account_id, region);
             }
         }
+        serde_json::from_str::<Self>(&contents).unwrap_or_else(|error| {
+            warn!("ignoring launch template cache {}: {error}", path.display());
+            Self::empty(account_id, region)
+        })
     }
 
     /// Writes to a temporary file and renames it into place, so a crash never leaves a torn cache.
@@ -155,6 +189,15 @@ impl LaunchTemplateCache {
             let _ = fs::remove_file(&tmp);
         }
         result
+    }
+
+    /// Forgets versions this run deleted, so they stop protecting their AMIs right away.
+    pub(crate) fn remove_versions(&mut self, template_id: &str, versions: &[i64]) {
+        if let Some(template) = self.templates.get_mut(template_id) {
+            for version in versions {
+                template.versions.remove(version);
+            }
+        }
     }
 
     /// Drops templates that weren't listed this run (deleted templates can't launch anything).
