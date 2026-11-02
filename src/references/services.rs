@@ -25,7 +25,13 @@ impl ReferenceCollector<'_> {
             let output = page.aws_context("ListImageRecipes")?;
             for recipe in output.image_recipe_summary_list() {
                 if let Some(parent) = recipe.parent_image() {
-                    parents.push((parent.to_string(), recipe.owner().map(ToString::to_string)));
+                    let source =
+                        format!("Image Builder recipe {}", recipe.name().unwrap_or("<unnamed>"));
+                    parents.push((
+                        parent.to_string(),
+                        recipe.owner().map(ToString::to_string),
+                        source,
+                    ));
                 }
             }
         }
@@ -48,18 +54,27 @@ impl ReferenceCollector<'_> {
                     .and_then(|recipe| recipe.instance_configuration())
                     .and_then(|instance| instance.image())
                 {
-                    parents.push((image.to_string(), summary.owner().map(ToString::to_string)));
+                    let source = format!(
+                        "Image Builder container recipe {}",
+                        summary.name().unwrap_or("<unnamed>")
+                    );
+                    parents.push((
+                        image.to_string(),
+                        summary.owner().map(ToString::to_string),
+                        source,
+                    ));
                 }
             }
         }
 
-        for (parent, owner) in parents {
+        for (parent, owner, source) in parents {
             match classify_parent_image(&parent, owner.as_deref()) {
-                ParentImage::Reference(reference) => self.record(&reference).await,
+                ParentImage::Reference(reference) => self.record(&reference, &source).await,
                 ParentImage::NotOwned => {}
                 ParentImage::OwnImage(image) => {
                     for ami_id in own_image_builder_amis(&client, &image).await? {
-                        self.record(&ami_id).await;
+                        let via = format!("{source} (parent image {parent})");
+                        self.record(&ami_id, &via).await;
                     }
                 }
                 ParentImage::Unresolved(reason) => {
@@ -87,12 +102,16 @@ impl ReferenceCollector<'_> {
                 let Some(stack_id) = stack.stack_id() else {
                     return Err("DescribeStacks returned a stack without an id".into());
                 };
+                let source =
+                    format!("CloudFormation stack {}", stack.stack_name().unwrap_or(stack_id));
                 for parameter in stack.parameters() {
                     for value in [parameter.parameter_value(), parameter.resolved_value()]
                         .into_iter()
                         .flatten()
                     {
-                        self.scan.referenced_ami_ids.extend(find_ami_ids(value));
+                        for ami_id in find_ami_ids(value) {
+                            self.scan.add_reference(ami_id, &source);
+                        }
                     }
                 }
                 stack_ids.push(stack_id.to_string());
@@ -111,7 +130,10 @@ impl ReferenceCollector<'_> {
 
         for (stack_id, template) in stack_ids.iter().zip(templates) {
             if let Some(body) = template?.template_body() {
-                self.scan.referenced_ami_ids.extend(find_ami_ids(body));
+                let source = format!("CloudFormation stack {stack_id} template");
+                for ami_id in find_ami_ids(body) {
+                    self.scan.add_reference(ami_id, &source);
+                }
                 for parameter in find_ssm_dynamic_references(body) {
                     self.record_ssm_parameter_amis(&parameter, stack_id).await;
                 }
@@ -148,8 +170,12 @@ impl ReferenceCollector<'_> {
                     .chain(overrides)
                     .map(ToString::to_string)
                     .collect::<Vec<String>>();
+                let source = format!(
+                    "Batch compute environment {}",
+                    environment.compute_environment_name().unwrap_or("<unnamed>")
+                );
                 for image_reference in image_references {
-                    self.record(&image_reference).await;
+                    self.record(&image_reference, &source).await;
                 }
             }
         }
@@ -188,7 +214,9 @@ impl ReferenceCollector<'_> {
                 let Some(cluster) = described.cluster() else {
                     return Err(format!("DescribeCluster({cluster_id}) returned no cluster").into());
                 };
-                image_references.extend(cluster.custom_ami_id().map(ToString::to_string));
+                let source = format!("EMR cluster {cluster_id}");
+                image_references
+                    .extend(cluster.custom_ami_id().map(|ami| (ami.to_string(), source.clone())));
 
                 if cluster.instance_collection_type()
                     == Some(&emr::types::InstanceCollectionType::InstanceFleet)
@@ -207,7 +235,7 @@ impl ReferenceCollector<'_> {
                                 .iter()
                                 .flat_map(emr::types::InstanceFleet::instance_type_specifications)
                                 .filter_map(|specification| specification.custom_ami_id())
-                                .map(ToString::to_string),
+                                .map(|ami| (ami.to_string(), source.clone())),
                         );
                     }
                 } else {
@@ -224,15 +252,15 @@ impl ReferenceCollector<'_> {
                                 .instance_groups()
                                 .iter()
                                 .filter_map(|group| group.custom_ami_id())
-                                .map(ToString::to_string),
+                                .map(|ami| (ami.to_string(), source.clone())),
                         );
                     }
                 }
             }
         }
 
-        for image_reference in image_references {
-            self.record(&image_reference).await;
+        for (image_reference, source) in image_references {
+            self.record(&image_reference, &source).await;
         }
 
         Ok(())
@@ -244,7 +272,11 @@ impl ReferenceCollector<'_> {
         match self.clients.ssm.get_parameter().name(parameter).send().await {
             Ok(output) => {
                 if let Some(value) = output.parameter().and_then(|parameter| parameter.value()) {
-                    self.scan.referenced_ami_ids.extend(find_ami_ids(value));
+                    let source =
+                        format!("CloudFormation stack {stack_id} via SSM parameter {parameter}");
+                    for ami_id in find_ami_ids(value) {
+                        self.scan.add_reference(ami_id, &source);
+                    }
                 }
             }
             Err(error) => {

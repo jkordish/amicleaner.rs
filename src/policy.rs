@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 
 use crate::cli::Args;
-use crate::model::{AmiInfo, Cutoffs, LastLaunched, SnapshotInfo};
+use crate::model::{AmiInfo, Cutoffs, KeepReason, LastLaunched, SnapshotInfo};
 
 /// Tag that groups AMIs for `--keep-latest-per-family`.
 const FAMILY_TAG: &str = "ImageFamily";
@@ -21,42 +21,47 @@ pub(crate) fn should_deregister_ami(
     cutoffs: Cutoffs,
     args: &Args,
 ) -> bool {
+    ami_keep_reason(ami, referenced_ami_ids, keep_latest_ami_ids, cutoffs, args).is_none()
+}
+
+/// The first rule that keeps an AMI, or `None` when it may be deregistered (subject to the
+/// sharing and unresolved-reference checks done by the planner).
+pub(crate) fn ami_keep_reason(
+    ami: &AmiInfo,
+    referenced_ami_ids: &HashSet<String>,
+    keep_latest_ami_ids: &HashSet<String>,
+    cutoffs: Cutoffs,
+    args: &Args,
+) -> Option<KeepReason> {
     let Some(creation_date) = ami.creation_date else {
-        return false;
+        return Some(KeepReason::NoCreationDate);
     };
-
     if creation_date >= cutoffs.min_age {
-        return false;
+        return Some(KeepReason::TooNew);
     }
-
     if referenced_ami_ids.contains(&ami.ami_id) {
-        return false;
+        return Some(KeepReason::Referenced);
     }
-
     if keep_latest_ami_ids.contains(&ami.ami_id) {
-        return false;
+        return Some(KeepReason::LatestInFamily);
     }
-
     if args.keep_latest_per_family > 0 && ami_family(ami).is_none() {
-        return false;
+        return Some(KeepReason::NoFamilyTag);
     }
-
     if is_protected(&ami.tags, args) {
-        return false;
+        return Some(KeepReason::Protected);
     }
-
     if looks_backup_created(&ami.tags, ami.description.as_deref()) {
-        return false;
+        return Some(KeepReason::BackupCreated);
     }
-
     if !deletion_tag_allows(&ami.tags, args) {
-        return false;
+        return Some(KeepReason::NoDeleteTag);
     }
-
     match ami.last_launched {
-        LastLaunched::Never => true,
-        LastLaunched::At(last_launched) => last_launched < cutoffs.recent_launch,
-        LastLaunched::Unknown => false,
+        LastLaunched::Never => None,
+        LastLaunched::At(last_launched) if last_launched < cutoffs.recent_launch => None,
+        LastLaunched::At(_) => Some(KeepReason::RecentlyLaunched),
+        LastLaunched::Unknown => Some(KeepReason::LaunchTimeUnknown),
     }
 }
 
@@ -67,10 +72,38 @@ pub(crate) fn snapshot_is_deletable(
     min_age_cutoff: DateTime<Utc>,
     args: &Args,
 ) -> bool {
-    snapshot.start_time < min_age_cutoff
-        && !referenced_snapshot_ids.contains(&snapshot.snapshot_id)
-        && !is_protected(&snapshot.tags, args)
-        && snapshot_deletion_authorized(&snapshot.tags, released_by_deregistered_ami, args)
+    snapshot_keep_reason(
+        snapshot,
+        released_by_deregistered_ami,
+        referenced_snapshot_ids,
+        min_age_cutoff,
+        args,
+    )
+    .is_none()
+}
+
+/// The first rule that keeps a snapshot, or `None` when it may be deleted (subject to the
+/// sharing and AWS Backup checks done by the planner).
+pub(crate) fn snapshot_keep_reason(
+    snapshot: &SnapshotInfo,
+    released_by_deregistered_ami: bool,
+    referenced_snapshot_ids: &HashSet<String>,
+    min_age_cutoff: DateTime<Utc>,
+    args: &Args,
+) -> Option<KeepReason> {
+    if snapshot.start_time >= min_age_cutoff {
+        return Some(KeepReason::TooNew);
+    }
+    if referenced_snapshot_ids.contains(&snapshot.snapshot_id) {
+        return Some(KeepReason::UsedByRemainingAmi);
+    }
+    if is_protected(&snapshot.tags, args) {
+        return Some(KeepReason::Protected);
+    }
+    if !snapshot_deletion_authorized(&snapshot.tags, released_by_deregistered_ami, args) {
+        return Some(KeepReason::NoDeleteTag);
+    }
+    None
 }
 
 /// Whether a snapshot is authorized for deletion on delete-tag grounds. Age, references and the

@@ -1,8 +1,11 @@
 //! Command-line arguments and their value parsers.
 
+use std::path::PathBuf;
+
 use clap::{ArgAction, Parser};
 
 use crate::references::ReferenceSource;
+use crate::report::parse_report_path;
 
 /// Upper bound for day-count flags; keeps chrono date arithmetic far away from overflow.
 const MAX_DAYS: i64 = 36_500;
@@ -90,6 +93,26 @@ pub(crate) struct Args {
     #[arg(long, value_enum, value_delimiter = ',')]
     pub(crate) skip_reference_sources: Vec<ReferenceSource>,
 
+    /// Write the full report (every AMI and snapshot with its decision and reason) to a file.
+    /// The format follows the extension: .md/.markdown or .json. Repeat for several files.
+    #[arg(long, value_name = "FILE", value_parser = parse_report_path)]
+    pub(crate) report: Vec<PathBuf>,
+
+    /// Snapshot storage price in USD per GB-month, for the savings estimate (EBS Snapshots
+    /// standard tier; check your region's price).
+    #[arg(long, value_name = "USD", default_value_t = 0.05, value_parser = parse_price)]
+    pub(crate) snapshot_price_per_gb_month: f64,
+
+    /// EBS Snapshots Archive tier price in USD per GB-month, for the savings estimate.
+    #[arg(long, value_name = "USD", default_value_t = 0.0125, value_parser = parse_price)]
+    pub(crate) archive_price_per_gb_month: f64,
+
+    /// Seconds before a single AWS request attempt is abandoned and retried. Protects against
+    /// connections that a proxy drops without closing.
+    #[arg(long, value_name = "SECONDS", default_value_t = 60,
+          value_parser = clap::value_parser!(u64).range(5..=600))]
+    pub(crate) request_timeout_secs: u64,
+
     /// Maximum concurrent read requests per region (launch template versions, CloudFormation
     /// templates, permission lookups). Lower it if AWS throttles the account.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
@@ -110,6 +133,13 @@ fn parse_tag_key(raw: &str) -> Result<String, String> {
         return Err("tag key must not be empty".to_string());
     }
     Ok(key.to_string())
+}
+
+fn parse_price(raw: &str) -> Result<f64, String> {
+    match raw.trim().parse::<f64>() {
+        Ok(price) if price.is_finite() && price >= 0.0 => Ok(price),
+        _ => Err(format!("'{raw}' is not a non-negative price")),
+    }
 }
 
 pub(crate) fn parse_region(raw: &str) -> Result<String, String> {

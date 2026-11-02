@@ -30,11 +30,13 @@ use crate::execute::{
 use crate::inventory::{
     ami_has_external_launch_permissions, is_ami_id, list_owned_amis, lookup_snapshot_external_use,
 };
+use crate::model::Cutoffs;
 use crate::model::{
-    AmiInfo, EXIT_BLOCKED, ExecutionSummary, ExternalUse, LastLaunched, RecoveryPointRecord,
-    RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
+    AmiInfo, EXIT_BLOCKED, ExecutionSummary, ExternalUse, KeepReason, LastLaunched,
+    RecoveryPointRecord, RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
 };
 use crate::plan::{apply_snapshot_external_use, plan_region};
+use crate::policy::{ami_keep_reason, snapshot_keep_reason};
 use crate::policy::{
     backup_recovery_point_deletion_tag_allows, has_expected_tag, is_protected,
     looks_backup_created, optional_expected_value, select_latest_ami_ids_by_family,
@@ -48,6 +50,11 @@ use crate::references::{
     ReferenceCollector, ReferenceSource, collect_referenced_ami_ids, extract_ssm_parameter_name,
     resolve_image_reference,
 };
+use crate::report::{
+    Action, Pricing, RegionReport, RegionStatus, Report, parse_report_path, render_json,
+    render_markdown, render_region_text,
+};
+use crate::ui::{parse_log_level, thousands};
 
 const AMI_A: &str = "ami-0123456789abcdef0";
 const AMI_B: &str = "ami-0123456789abcdef1";
@@ -94,6 +101,8 @@ fn make_snapshot(
 ) -> SnapshotInfo {
     SnapshotInfo {
         snapshot_id: snapshot_id.to_string(),
+        size_bytes: Some(8 << 30),
+        archived: false,
         start_time,
         description: None,
         tags: tags(tag_pairs),
@@ -104,6 +113,11 @@ fn scan(referenced: &[&str], unresolved: &[&str]) -> AmiReferenceScan {
     AmiReferenceScan {
         referenced_ami_ids: referenced.iter().map(|entry| (*entry).to_string()).collect(),
         unresolved_references: unresolved.iter().map(|entry| (*entry).to_string()).collect(),
+        sources: referenced
+            .iter()
+            .map(|entry| ((*entry).to_string(), vec!["test reference".to_string()]))
+            .collect(),
+        references_seen: referenced.len(),
     }
 }
 
@@ -420,8 +434,12 @@ fn shared_amis_are_kept_and_failed_lookups_block() {
     let plan = plan_region(&args, "us-east-1", Utc::now(), &amis, &[], &scan(&[], &[]), &external);
 
     assert!(plan.deregister_amis.is_empty());
-    assert_eq!(plan.skipped_amis, 2);
-    assert_eq!(plan.kept_shared_amis, 1, "the failed lookup is blocked, not counted as shared");
+    assert_eq!(plan.skipped_amis(), 2);
+    assert_eq!(
+        plan.kept_shared_amis(),
+        1,
+        "the failed lookup is blocked, not counted as shared"
+    );
     assert_eq!(plan.blocked.len(), 1, "only the failed lookup is uncertain");
     assert!(plan.blocked[0].contains(AMI_B));
 }
@@ -476,7 +494,8 @@ fn keep_latest_per_family_keeps_untagged_amis_explicitly() {
         vec!["ami-0123456789abcdef2"],
         "only the older tagged family member goes"
     );
-    assert_eq!(plan.kept_untagged_family_amis, 1);
+    let untagged = plan.kept_amis.iter().filter(|kept| kept.reason == KeepReason::NoFamilyTag);
+    assert_eq!(untagged.count(), 1);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -542,7 +561,7 @@ fn backup_delete_tag_is_read_from_the_snapshot() {
 
     let classification = classify_backup_snapshots(&candidates, &[ebs_record(SNAP_A)], &args);
 
-    assert_eq!(classification.tag_filtered, 1);
+    assert_eq!(classification.tag_filtered.len(), 1);
     assert!(classification.recovery_points_to_delete.is_empty());
     assert!(
         classification.direct_delete.is_empty(),
@@ -815,6 +834,7 @@ fn reference_clients(asg: autoscaling::Client, ssm: ssm::Client) -> ReferenceCli
         batch: None,
         emr: None,
         concurrency: 4,
+        region: "us-east-1".to_string(),
     }
 }
 
@@ -828,6 +848,7 @@ fn collector<'a>(
         ssm_cache: HashMap::new(),
         scanned_launch_templates: HashSet::new(),
         scan: AmiReferenceScan::default(),
+        phase: None,
     }
 }
 
@@ -1419,13 +1440,13 @@ async fn create_volume_permissions_mark_a_snapshot_as_shared() {
     let private = not_shared_snapshot_rule();
     let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&shared, &private], no_sdk_retries);
 
-    let external_use = lookup_snapshot_external_use(&client, &[SNAP_A, SNAP_B], 4).await;
+    let external_use = lookup_snapshot_external_use(&client, &[SNAP_A, SNAP_B], 4, None).await;
 
     assert_eq!(external_use, HashMap::from([(SNAP_A.to_string(), ExternalUse::Shared)]));
 
     let failing = snapshot_permission_error_rule();
     let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&failing], no_sdk_retries);
-    let external_use = lookup_snapshot_external_use(&client, &[SNAP_A], 4).await;
+    let external_use = lookup_snapshot_external_use(&client, &[SNAP_A], 4, None).await;
     assert!(
         matches!(external_use.get(SNAP_A), Some(ExternalUse::Unknown(reason)) if reason.contains("UnauthorizedOperation"))
     );
@@ -1447,7 +1468,7 @@ fn shared_snapshots_are_kept_and_failed_lookups_block() {
     );
     assert_eq!(plan.delete_snapshots.len(), 3);
     assert!(plan.snapshots_released_by_ami.contains_key(SNAP_A));
-    let skipped_before = plan.skipped_snapshots;
+    let skipped_before = plan.skipped_snapshots();
 
     apply_snapshot_external_use(
         &mut plan,
@@ -1459,8 +1480,8 @@ fn shared_snapshots_are_kept_and_failed_lookups_block() {
 
     let planned = plan.delete_snapshots.iter().map(|s| s.snapshot_id.as_str()).collect::<Vec<_>>();
     assert_eq!(planned, vec![SNAP_C]);
-    assert_eq!(plan.skipped_snapshots, skipped_before + 2);
-    assert_eq!(plan.kept_shared_snapshots, 1);
+    assert_eq!(plan.skipped_snapshots(), skipped_before + 2);
+    assert_eq!(plan.kept_shared_snapshots(), 1);
     assert_eq!(plan.blocked.len(), 1, "only the failed lookup is a safety block");
     assert!(plan.blocked[0].contains(SNAP_B));
     assert!(plan.snapshots_released_by_ami.is_empty(), "pruned with the shared snapshot");
@@ -2346,4 +2367,209 @@ async fn ami_shared_after_planning_is_not_deregistered() {
     assert_eq!(deregister.num_calls(), 0);
     assert_eq!(summary.skipped_amis, 1);
     assert!(summary.failures.is_empty() && summary.blocked.is_empty());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Decisions, reasons and reports
+// ---------------------------------------------------------------------------------------------
+
+const PRICING: Pricing = Pricing { standard_per_gb_month: 0.05, archive_per_gb_month: 0.0125 };
+
+#[test]
+fn keep_reasons_report_the_first_rule_that_applies() {
+    let args = test_args();
+    let now = Utc::now();
+    let cutoffs = Cutoffs::new(&args, now);
+    let old = now - Duration::days(365);
+    let reason = |ami: &AmiInfo, referenced: &[&str]| {
+        let referenced = referenced.iter().map(ToString::to_string).collect::<HashSet<_>>();
+        ami_keep_reason(ami, &referenced, &HashSet::new(), cutoffs, &args)
+    };
+
+    let tagged = make_ami(AMI_A, old, &[("cleanup", "true")], &[]);
+    assert_eq!(reason(&tagged, &[]), None);
+    assert_eq!(reason(&tagged, &[AMI_A]), Some(KeepReason::Referenced));
+    assert_eq!(
+        reason(&make_ami(AMI_A, now, &[("cleanup", "true")], &[]), &[AMI_A]),
+        Some(KeepReason::TooNew),
+        "age is checked first"
+    );
+    assert_eq!(reason(&make_ami(AMI_A, old, &[], &[]), &[]), Some(KeepReason::NoDeleteTag));
+    assert_eq!(
+        reason(&make_ami(AMI_A, old, &[("cleanup", "true"), ("DoNotDelete", "")], &[]), &[]),
+        Some(KeepReason::Protected)
+    );
+    let mut recent = tagged.clone();
+    recent.last_launched = LastLaunched::At(now);
+    assert_eq!(reason(&recent, &[]), Some(KeepReason::RecentlyLaunched));
+    let mut undated = tagged;
+    undated.creation_date = None;
+    assert_eq!(reason(&undated, &[]), Some(KeepReason::NoCreationDate));
+
+    let snapshot = |tags: &[(&str, &str)], start| make_snapshot(SNAP_A, start, tags);
+    let refs = HashSet::from([SNAP_A.to_string()]);
+    let none = HashSet::new();
+    assert_eq!(
+        snapshot_keep_reason(&snapshot(&[], now), false, &none, cutoffs.min_age, &args),
+        Some(KeepReason::TooNew)
+    );
+    assert_eq!(
+        snapshot_keep_reason(&snapshot(&[], old), false, &refs, cutoffs.min_age, &args),
+        Some(KeepReason::UsedByRemainingAmi)
+    );
+    assert_eq!(
+        snapshot_keep_reason(&snapshot(&[], old), false, &none, cutoffs.min_age, &args),
+        Some(KeepReason::NoDeleteTag)
+    );
+    assert_eq!(
+        snapshot_keep_reason(&snapshot(&[], old), true, &none, cutoffs.min_age, &args),
+        None,
+        "inherits the AMI's tag"
+    );
+    assert!(KeepReason::SharingUnknown("x".into()).uncertain() && !KeepReason::Shared.uncertain());
+}
+
+#[tokio::test]
+async fn references_remember_what_referenced_each_ami() {
+    let templates = launch_templates_rule(&["lt-0123456789abcdef0"]);
+    let versions = template_versions_rule("lt-0123456789abcdef0", AMI_A);
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &versions], no_sdk_retries);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    let sources = &collector.scan.sources[AMI_A];
+    assert_eq!(sources.len(), 1);
+    assert!(sources[0].starts_with("launch template lt-0123456789abcdef0 v"), "{sources:?}");
+
+    let mut scan = AmiReferenceScan::default();
+    for index in 0..10 {
+        scan.add_reference(AMI_B.to_string(), &format!("instance i-{index}"));
+    }
+    assert_eq!(scan.sources[AMI_B].len(), 3, "only the first few sources are kept");
+    assert_eq!(scan.references_seen, 10);
+}
+
+/// A plan with one of everything: a deregistration that frees a snapshot, a referenced AMI, a
+/// shared snapshot, an archived snapshot to delete, and a failed sharing lookup.
+fn mixed_plan(args: &Args) -> RegionPlan {
+    let old = Utc::now() - Duration::days(365);
+    let mut archived = make_snapshot(SNAP_C, old, &[("cleanup", "true")]);
+    archived.archived = true;
+    let mut plan = plan(
+        args,
+        vec![
+            make_ami(AMI_A, old, &[("cleanup", "true")], &[SNAP_A]),
+            make_ami(AMI_B, old, &[("cleanup", "true")], &[]),
+        ],
+        vec![
+            make_snapshot(SNAP_A, old, &[]),
+            make_snapshot(SNAP_B, old, &[("cleanup", "true")]),
+            archived,
+            make_snapshot("snap-0123456789abcdef3", old, &[("cleanup", "true")]),
+        ],
+        &scan(&[AMI_B], &[]),
+    );
+    apply_snapshot_external_use(
+        &mut plan,
+        &HashMap::from([
+            (SNAP_B.to_string(), ExternalUse::Shared),
+            (
+                "snap-0123456789abcdef3".to_string(),
+                ExternalUse::Unknown("AccessDenied | x".to_string()),
+            ),
+        ]),
+    );
+    plan
+}
+
+#[test]
+fn region_report_has_a_decision_and_reason_for_every_resource() {
+    let args = test_args();
+    let report = RegionReport::from_plan(&mixed_plan(&args), None, PRICING);
+
+    assert_eq!(report.amis.len() + report.snapshots.len(), 6, "every owned AMI and snapshot");
+    let decision =
+        |id: &str| report.amis.iter().chain(&report.snapshots).find(|d| d.id == id).unwrap();
+    assert_eq!(decision(AMI_A).action, Action::Deregister);
+    assert_eq!(decision(AMI_B).reason_code, "referenced");
+    assert_eq!(decision(AMI_B).details, vec!["test reference".to_string()]);
+    assert_eq!(decision(SNAP_A).action, Action::Delete);
+    assert_eq!(decision(SNAP_A).details, vec![format!("freed by deregistering {AMI_A}")]);
+    assert_eq!(decision(SNAP_B).reason_code, "shared");
+    assert_eq!(decision("snap-0123456789abcdef3").action, Action::Blocked);
+    assert_eq!(report.status, RegionStatus::Blocked, "a failed lookup is a safety block");
+
+    // 8 GiB each: standard $0.40, archived $0.10.
+    assert_eq!(decision(SNAP_A).monthly_cost_usd, Some(0.4));
+    assert_eq!(decision(SNAP_C).monthly_cost_usd, Some(0.1));
+    assert_eq!(report.estimated_monthly_savings_usd, 0.5);
+    assert_eq!(report.estimated_savings_gib, 16.0);
+    assert_eq!(report.kept_snapshots_by_reason.get("shared"), Some(&1));
+}
+
+#[test]
+fn reports_render_as_markdown_json_and_text() {
+    let args = test_args();
+    let region = RegionReport::from_plan(&mixed_plan(&args), None, PRICING);
+    let failed = RegionReport::failed(
+        "eu-west-1",
+        "DescribeImages failed: UnauthorizedOperation".to_string(),
+    );
+    let text = render_region_text(&region);
+    let report = Report::new(&args, Utc::now(), vec![region, failed]);
+    assert_eq!(report.totals.failed_regions, 1);
+    assert_eq!(report.totals.estimated_monthly_savings_usd, 0.5);
+
+    let markdown = render_markdown(&report);
+    for expected in [
+        "# amicleaner plan",
+        "| us-east-1 | ⚠️ blocked |",
+        "### AMIs to deregister (1)",
+        "### Snapshots to delete (2)",
+        "### Blocked (1)",
+        "up to $0.50/month",
+        "<details><summary>All snapshots (4)</summary>",
+        "AccessDenied \\| x",
+        "## eu-west-1 — ❌ failed",
+    ] {
+        assert!(markdown.contains(expected), "missing {expected:?} in:\n{markdown}");
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&render_json(&report).unwrap()).unwrap();
+    assert_eq!(json["schema_version"], 1);
+    assert_eq!(json["mode"], "plan");
+    assert_eq!(json["regions"][0]["amis"][0]["action"], "deregister");
+    assert_eq!(json["regions"][0]["status"], "blocked");
+    assert_eq!(json["regions"][1]["error"], "DescribeImages failed: UnauthorizedOperation");
+    assert!(json["savings_note"].as_str().unwrap().starts_with("Upper bound"));
+
+    let plain = console::strip_ansi_codes(&text);
+    assert!(plain.contains("AMIs") && plain.contains("1 to deregister"), "{plain}");
+    assert!(plain.contains("up to $0.50/month"), "{plain}");
+}
+
+#[test]
+fn report_flags_and_formatting_helpers() {
+    assert!(parse_report_path("plan.md").is_ok());
+    assert!(parse_report_path("out/PLAN.JSON").is_ok());
+    assert!(parse_report_path("plan.txt").is_err());
+    assert!(parse_report_path("plan").is_err());
+
+    let args =
+        Args::try_parse_from(["amicleaner", "--report", "a.md", "--report", "b.json"]).unwrap();
+    assert_eq!(args.report.len(), 2);
+    assert!(Args::try_parse_from(["amicleaner", "--snapshot-price-per-gb-month", "-1"]).is_err());
+    assert!(Args::try_parse_from(["amicleaner", "--request-timeout-secs", "1"]).is_err());
+    assert_eq!(test_args().request_timeout_secs, 60);
+
+    assert_eq!(thousands(0), "0");
+    assert_eq!(thousands(999), "999");
+    assert_eq!(thousands(86_849), "86,849");
+    assert_eq!(thousands(1_234_567), "1,234,567");
+    assert_eq!(parse_log_level(Some("debug")), log::LevelFilter::Debug);
+    assert_eq!(parse_log_level(Some("nonsense")), log::LevelFilter::Info);
+    assert_eq!(parse_log_level(None), log::LevelFilter::Info);
 }

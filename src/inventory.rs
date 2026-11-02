@@ -10,6 +10,7 @@ use log::warn;
 
 use crate::errors::{AppResult, AwsResultExt, error_chain};
 use crate::model::{AmiInfo, ExternalUse, LastLaunched, SnapshotInfo};
+use crate::ui::Phase;
 
 pub(crate) async fn list_owned_amis(ec2_client: &ec2::Client) -> AppResult<Vec<AmiInfo>> {
     let mut amis = Vec::new();
@@ -92,8 +93,19 @@ pub(crate) async fn list_owned_snapshots(ec2_client: &ec2::Client) -> AppResult<
                 continue;
             };
 
+            let size_bytes = snapshot
+                .full_snapshot_size_in_bytes()
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .or_else(|| {
+                    snapshot
+                        .volume_size()
+                        .and_then(|gib| u64::try_from(gib).ok())
+                        .map(|gib| gib << 30)
+                });
             snapshots.push(SnapshotInfo {
                 snapshot_id: snapshot_id.to_string(),
+                size_bytes,
+                archived: snapshot.storage_tier() == Some(&ec2::types::StorageTier::Archive),
                 start_time,
                 description: snapshot.description().map(ToString::to_string),
                 tags: tags_to_map(snapshot.tags()),
@@ -169,8 +181,9 @@ pub(crate) async fn lookup_ami_external_use(
     ec2_client: &ec2::Client,
     ami_ids: &[&str],
     concurrency: usize,
+    phase: Option<&Phase>,
 ) -> HashMap<String, ExternalUse> {
-    lookup_external_use(ami_ids, concurrency, |ami_id| {
+    lookup_external_use(ami_ids, concurrency, phase, |ami_id| {
         ami_has_external_launch_permissions(ec2_client, ami_id)
     })
     .await
@@ -182,8 +195,9 @@ pub(crate) async fn lookup_snapshot_external_use(
     ec2_client: &ec2::Client,
     snapshot_ids: &[&str],
     concurrency: usize,
+    phase: Option<&Phase>,
 ) -> HashMap<String, ExternalUse> {
-    lookup_external_use(snapshot_ids, concurrency, |snapshot_id| {
+    lookup_external_use(snapshot_ids, concurrency, phase, |snapshot_id| {
         snapshot_has_external_create_volume_permissions(ec2_client, snapshot_id)
     })
     .await
@@ -192,6 +206,7 @@ pub(crate) async fn lookup_snapshot_external_use(
 async fn lookup_external_use<'a, F, Fut>(
     ids: &[&'a str],
     concurrency: usize,
+    phase: Option<&Phase>,
     is_shared: F,
 ) -> HashMap<String, ExternalUse>
 where
@@ -204,6 +219,11 @@ where
             async move { (id, lookup.await) }
         })
         .buffered(concurrency.max(1))
+        .inspect(|_| {
+            if let Some(phase) = phase {
+                phase.inc();
+            }
+        })
         .filter_map(|(id, result)| async move {
             match result {
                 Ok(false) => None,

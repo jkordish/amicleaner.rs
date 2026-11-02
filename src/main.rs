@@ -12,28 +12,33 @@ mod model;
 mod plan;
 mod policy;
 mod references;
+mod report;
+mod ui;
 
 use std::process::ExitCode;
 
+use std::time::Duration;
+
 use aws_config::BehaviorVersion;
+use aws_config::timeout::TimeoutConfig;
 use aws_sdk_backup as backup;
 use aws_sdk_ec2 as ec2;
 use aws_types::region::Region;
+use chrono::Utc;
 use clap::{Parser, ValueEnum};
-use log::{error, info, warn};
+use log::{error, warn};
 
 use crate::cli::Args;
 use crate::errors::{AppResult, AwsResultExt, error_chain};
-use crate::execute::{execute_region_plan, print_execution_summary};
+use crate::execute::execute_region_plan;
 use crate::model::RunOutcome;
-use crate::plan::{build_region_plan, print_region_plan};
+use crate::plan::build_region_plan;
 use crate::references::{ReferenceClients, ReferenceSource};
+use crate::report::{Pricing, RegionReport, Report};
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    if let Err(error) =
-        simple_logger::SimpleLogger::new().with_level(log::LevelFilter::Info).env().init()
-    {
+    if let Err(error) = ui::init_logging() {
         eprintln!("failed to initialize logging: {error}");
         return ExitCode::FAILURE;
     }
@@ -57,7 +62,8 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
         warn!("{warning}");
     }
 
-    let shared_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
+    let started_at = Utc::now();
+    let shared_config = aws_config_loader(args).load().await;
     let home_ec2 = ec2::Client::new(&shared_config);
 
     let regions = resolve_regions(args, &home_ec2).await?;
@@ -65,22 +71,22 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
         return Err("No AWS regions resolved".into());
     }
 
-    info!(
-        "mode={} dry_run={} regions={}",
-        if args.execute { "execute" } else { "plan" },
-        args.dry_run,
-        regions.join(",")
-    );
+    let mode = report::run_mode(args);
+    ui::print_stdout(&format!(
+        "{} {} · {}{} · {}\n",
+        console::style("amicleaner").bold(),
+        env!("CARGO_PKG_VERSION"),
+        mode,
+        if mode == "plan" { " (read-only)" } else { "" },
+        regions.join(", ")
+    ));
 
     let mut outcome = RunOutcome::default();
+    let mut region_reports = Vec::new();
 
     for region in regions {
-        info!("scanning region={region}");
-
-        let region_config = aws_config::defaults(BehaviorVersion::latest())
-            .region(Region::new(region.clone()))
-            .load()
-            .await;
+        let region_config =
+            aws_config_loader(args).region(Region::new(region.clone())).load().await;
 
         let ec2_client = ec2::Client::new(&region_config);
         let backup_client = backup::Client::new(&region_config);
@@ -90,50 +96,63 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
             usize::from(args.max_concurrency),
         );
 
-        match build_region_plan(args, &region, &ec2_client, &backup_client, &reference_clients)
-            .await
-        {
-            Ok(plan) => {
-                print_region_plan(&plan);
-                if !plan.blocked.is_empty() {
-                    outcome.blocked_regions.push(region.clone());
-                }
-                if args.execute {
-                    let summary = execute_region_plan(
-                        &ec2_client,
-                        &backup_client,
-                        &reference_clients,
-                        &plan,
-                        args,
-                    )
-                    .await;
-                    print_execution_summary(&region, &summary);
-                    if !summary.failures.is_empty() {
-                        outcome.failed_regions.push(region.clone());
-                    }
-                    if !summary.blocked.is_empty() && !outcome.blocked_regions.contains(&region) {
+        let region_report =
+            match build_region_plan(args, &region, &ec2_client, &backup_client, &reference_clients)
+                .await
+            {
+                Ok(plan) => {
+                    if !plan.blocked.is_empty() {
                         outcome.blocked_regions.push(region.clone());
                     }
+                    let execution = if args.execute {
+                        let summary = execute_region_plan(
+                            &ec2_client,
+                            &backup_client,
+                            &reference_clients,
+                            &plan,
+                            args,
+                        )
+                        .await;
+                        if !summary.failures.is_empty() {
+                            outcome.failed_regions.push(region.clone());
+                        }
+                        if !summary.blocked.is_empty() && !outcome.blocked_regions.contains(&region)
+                        {
+                            outcome.blocked_regions.push(region.clone());
+                        }
+                        Some(summary)
+                    } else {
+                        None
+                    };
+                    RegionReport::from_plan(&plan, execution.as_ref(), Pricing::from_args(args))
                 }
-            }
-            Err(error) => {
-                outcome.failed_regions.push(region.clone());
-                eprintln!("region={region} failed: {}", error_chain(error.as_ref()));
-            }
-        }
+                Err(error) => {
+                    outcome.failed_regions.push(region.clone());
+                    RegionReport::failed(&region, error_chain(error.as_ref()))
+                }
+            };
+        ui::print_stdout(&report::render_region_text(&region_report));
+        region_reports.push(region_report);
     }
 
-    if !outcome.failed_regions.is_empty() {
-        error!("regions with failures: {}", outcome.failed_regions.join(","));
+    let report = Report::new(args, started_at, region_reports);
+    for path in &args.report {
+        report::write_report(&report, path)?;
     }
-    if !outcome.blocked_regions.is_empty() {
-        warn!(
-            "safety checks cancelled planned deletions in regions: {}",
-            outcome.blocked_regions.join(",")
-        );
-    }
+    ui::print_stdout(&report::render_footer(&report, &args.report));
 
     Ok(outcome)
+}
+
+/// SDK config with a deadline per request attempt. Without one, a request whose connection is
+/// dropped silently (e.g. by a TLS-inspecting proxy) waits forever instead of being retried by the
+/// SDK's standard retry strategy; a delta0 plan run sat idle for 20 minutes that way.
+fn aws_config_loader(args: &Args) -> aws_config::ConfigLoader {
+    let timeouts = TimeoutConfig::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .operation_attempt_timeout(Duration::from_secs(args.request_timeout_secs))
+        .build();
+    aws_config::defaults(BehaviorVersion::latest()).timeout_config(timeouts)
 }
 
 fn inert_flag_warnings(args: &Args) -> Vec<&'static str> {

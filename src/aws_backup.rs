@@ -8,8 +8,8 @@ use crate::cli::Args;
 use crate::errors::{AppResult, AwsResultExt};
 use crate::inventory::is_resource_id;
 use crate::model::{
-    BackupClassification, BackupRecoveryPoint, BlockedSnapshot, RecoveryPointRecord, RegionPlan,
-    SnapshotInfo,
+    BackupClassification, BackupRecoveryPoint, BlockedSnapshot, KeepReason, Kept,
+    RecoveryPointRecord, RegionPlan, SnapshotInfo,
 };
 use crate::policy::{backup_recovery_point_deletion_tag_allows, looks_backup_created};
 
@@ -129,7 +129,7 @@ pub(crate) fn classify_backup_snapshots(
         }
 
         if !backup_recovery_point_deletion_tag_allows(&snapshot.tags, args) {
-            classification.tag_filtered += 1;
+            classification.tag_filtered.push(snapshot.clone());
             continue;
         }
 
@@ -204,7 +204,12 @@ pub(crate) fn apply_backup_classification(
     plan.delete_snapshots = classification.direct_delete;
     plan.backup_managed_snapshots = classification.backup_managed;
     plan.delete_backup_recovery_points = classification.recovery_points_to_delete;
-    plan.tag_filtered_backup_recovery_points = classification.tag_filtered;
+    plan.kept_snapshots.extend(
+        classification
+            .tag_filtered
+            .into_iter()
+            .map(|snapshot| Kept { item: snapshot, reason: KeepReason::BackupDeleteTagMissing }),
+    );
     plan.blocked_backup_snapshots = classification.blocked;
     prune_released_snapshots(plan);
 }
@@ -222,7 +227,6 @@ pub(crate) fn block_all_snapshot_deletions(plan: &mut RegionPlan, reason: &str) 
         .collect();
     plan.backup_managed_snapshots.clear();
     plan.delete_backup_recovery_points.clear();
-    plan.tag_filtered_backup_recovery_points = 0;
     prune_released_snapshots(plan);
 }
 

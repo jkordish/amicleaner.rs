@@ -25,6 +25,7 @@ use crate::policy::{
     select_latest_ami_ids_by_family, should_deregister_ami, snapshot_is_deletable,
 };
 use crate::references::{ReferenceClients, collect_referenced_ami_ids};
+use crate::ui::Phase;
 
 /// EC2 returns this error code when a `DryRun=true` request would have succeeded.
 const DRY_RUN_OPERATION: &str = "DryRunOperation";
@@ -170,9 +171,13 @@ async fn execute_ami_deregistrations(
     // Prefetched right before the deregistration loop, concurrently; the mutations stay sequential.
     let eligible_ids = eligible.iter().map(|ami| ami.ami_id.as_str()).collect::<Vec<&str>>();
     let external_use =
-        lookup_ami_external_use(ec2_client, &eligible_ids, usize::from(args.max_concurrency)).await;
+        lookup_ami_external_use(ec2_client, &eligible_ids, usize::from(args.max_concurrency), None)
+            .await;
 
+    let verb = if args.dry_run { "dry-run deregister" } else { "deregister" };
+    let phase = Phase::with_total(format!("{} · {verb} AMIs", plan.region), eligible.len());
     for ami in eligible {
+        phase.inc();
         match external_use.get(&ami.ami_id) {
             None => {}
             Some(ExternalUse::Shared) => {
@@ -205,6 +210,12 @@ async fn execute_ami_deregistrations(
         }
     }
 
+    finish_execution_phase(
+        phase,
+        summary.deregistered_amis,
+        "deregistered",
+        summary.failures.len(),
+    );
     released_amis
 }
 
@@ -312,11 +323,22 @@ async fn execute_snapshot_deletions(
         .map(|snapshot| snapshot.snapshot_id.as_str())
         .chain(recovery_point_deletes.iter().map(|point| point.snapshot_id.as_str()))
         .collect::<Vec<&str>>();
-    let external_use =
-        lookup_snapshot_external_use(ec2_client, &snapshot_ids, usize::from(args.max_concurrency))
-            .await;
+    let external_use = lookup_snapshot_external_use(
+        ec2_client,
+        &snapshot_ids,
+        usize::from(args.max_concurrency),
+        None,
+    )
+    .await;
 
+    let failures_before = summary.failures.len();
+    let verb = if args.dry_run { "dry-run delete" } else { "delete" };
+    let phase = Phase::with_total(
+        format!("{} · {verb} snapshots", plan.region),
+        direct_deletes.len() + recovery_point_deletes.len(),
+    );
     for snapshot in direct_deletes {
+        phase.inc();
         if !snapshot_unshared(&external_use, &snapshot.snapshot_id, summary) {
             summary.skipped_snapshots += 1;
             continue;
@@ -340,6 +362,7 @@ async fn execute_snapshot_deletions(
     }
 
     for recovery_point in recovery_point_deletes {
+        phase.inc();
         // AWS Backup has no dry-run mode, so dry runs stop after the checks.
         if !snapshot_unshared(&external_use, &recovery_point.snapshot_id, summary) || args.dry_run {
             summary.skipped_backup_recovery_points += 1;
@@ -362,6 +385,20 @@ async fn execute_snapshot_deletions(
                 recovery_point.recovery_point_arn, recovery_point.backup_vault_name, error
             )),
         }
+    }
+    finish_execution_phase(
+        phase,
+        summary.deleted_snapshots + summary.deleted_backup_recovery_points,
+        "deleted",
+        summary.failures.len() - failures_before,
+    );
+}
+
+fn finish_execution_phase(phase: Phase, done: usize, verb: &str, failures: usize) {
+    if failures > 0 {
+        phase.fail(format!("{done} {verb}, {failures} failed"));
+    } else {
+        phase.finish(format!("{done} {verb}"));
     }
 }
 
@@ -433,39 +470,4 @@ pub(crate) fn retry_delay_for_attempt(base_delay_ms: u64, attempt: u32) -> StdDu
     let capped_attempt = u64::from(attempt.saturating_sub(1)).min(10);
     let multiplier = 1u64 << capped_attempt;
     StdDuration::from_millis(base_delay_ms.saturating_mul(multiplier))
-}
-
-pub(crate) fn print_execution_summary(region: &str, summary: &ExecutionSummary) {
-    println!(
-        "execution region={} mode={} deregistered_amis={} skipped_amis={} deleted_snapshots={} skipped_snapshots={} deleted_backup_recovery_points={} skipped_backup_recovery_points={} blocked={} failures={}",
-        region,
-        if summary.dry_run { "dry-run" } else { "execute" },
-        summary.deregistered_amis,
-        summary.skipped_amis,
-        summary.deleted_snapshots,
-        summary.skipped_snapshots,
-        summary.deleted_backup_recovery_points,
-        summary.skipped_backup_recovery_points,
-        summary.blocked.len(),
-        summary.failures.len(),
-    );
-    if summary.dry_run {
-        println!(
-            "  (dry-run: deregistered/deleted counts are requests that passed the AWS dry-run check)"
-        );
-    }
-
-    if !summary.blocked.is_empty() {
-        println!("execution_blocked:");
-        for reason in &summary.blocked {
-            println!("  {reason}");
-        }
-    }
-
-    if !summary.failures.is_empty() {
-        println!("execution_failures:");
-        for failure in &summary.failures {
-            println!("  {failure}");
-        }
-    }
 }

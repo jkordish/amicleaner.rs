@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Toolchain is pinned to Rust 1.99.1 (edition 2024) via `rust-toolchain.toml` (`profile = "minimal"` so a rustup on the `complete` profile doesn't fail on unpublished components). Don't go back to 1.93.x: its rustc overflowed its stack and segfaulted intermittently on the generated AWS SDK code.
+Toolchain is pinned to Rust 1.99.1 (edition 2024) via `rust-toolchain.toml` (`profile = "minimal"` so a rustup on the `complete` profile doesn't fail on unpublished components). If rustc segfaults (`SIGSEGV`) on the AWS SDK crates, run `cargo clean`: a corrupted `target/` caused repeated crashes on both 1.93.1 and 1.99.1.
 
 ```shell
 cargo build                      # debug build
@@ -37,6 +37,8 @@ Source layout (everything is `pub(crate)` at most; tests live in `src/tests.rs`,
 | `references/mod.rs` | `ReferenceCollector` + EC2/ASG/SSM sources, `ReferenceClients`, `resolve_image_reference` |
 | `references/services.rs` | Image Builder, CloudFormation, Batch, EMR sources and their parsers |
 | `execute.rs` | execute phase, `send_with_retries`, retry classification |
+| `report.rs` | `Report` model built from `RegionPlan` (a decision + reason for every resource, savings estimate); renders the stdout summary, Markdown and JSON |
+| `ui.rs` | per-phase progress spinners (`Phase`, stderr, terminal only) and the logger, which prints above the spinners |
 
 It is a conservative mark-and-sweep cleaner for **account-owned** AMIs, EBS snapshots, and AWS Backup EBS recovery points. Regions are processed sequentially. Within a region, fan-out reads (launch template versions, CloudFormation templates, sharing lookups) use `futures_util` `buffered(--max-concurrency)`, which keeps results in input order without spawning tasks; mutations are always sequential. Execute prefetches sharing for the still-eligible items right before its mutation loop.
 
@@ -56,6 +58,7 @@ Per region, two phases:
 
 - **Unknown blocks only the deletion it affects.** Unresolved references cancel AMI deregistrations, not snapshot cleanup. A failed or unmappable Backup inventory cancels snapshot deletions. A failed launch- or create-volume-permission lookup keeps that one AMI or snapshot. Never let "couldn't determine" fall through to the "not referenced / not backed up" path. Uncertain blocks go into `RegionPlan::blocked` at plan time and `ExecutionSummary::blocked` at execute time (both mean exit code 3). API and inventory errors go into `failures` (exit code 1).
 - **Execute re-checks with the same functions plan used** (`should_deregister_ami`, `snapshot_is_deletable`, `backup_recovery_point_deletion_tag_allows`). Add new eligibility rules to those functions rather than to one phase only.
+- **Every keep has a reason.** The policy rules return the first `KeepReason` that applies (`ami_keep_reason`, `snapshot_keep_reason`); `should_deregister_ami`/`snapshot_is_deletable` are thin wrappers so execute uses the same rules. Anything removed from a plan goes into `kept_amis`/`kept_snapshots` with a reason, so reports account for every owned resource.
 - **Read error codes, never `Display`.** `SdkError`'s `Display` is just "service error". Use `error.code()` to classify and `describe_sdk_error()` / `.aws_context("Op")` / `error_chain()` to build messages.
 - New reference sources belong in `ReferenceCollector`, must use SDK paginators (`into_paginator()`), and need a mock test plus a README IAM-permission entry, since a missing permission fails closed.
 

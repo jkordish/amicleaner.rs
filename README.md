@@ -55,7 +55,34 @@ Write (`--execute`): `ec2:DeregisterImage`, `ec2:DeleteSnapshot`, and `backup:De
 
 A missing read permission fails closed: AMI deregistrations or snapshot deletions in that region are cancelled, not attempted blind.
 
-Set `RUST_LOG=debug|info|warn|error` to change log verbosity.
+## output and reports
+
+While it runs, each phase gets a live progress line on stderr that turns into a summary when it's done:
+
+```text
+✓ us-west-2 · inventory  330 AMIs · 767 snapshots · 2.1s
+✓ us-west-2 · launch templates  86,849 references · 1m04s
+– us-west-2 · emr  skipped (--skip-reference-sources)
+✓ us-west-2 · snapshot create-volume permissions  3 shared · 4.0s
+```
+
+Progress lines are only drawn on a terminal. In CI or when piped, each finished phase is logged as a plain line instead. Logs go to stderr too (`RUST_LOG=error|warn|info|debug|trace`, default `info`), so stdout carries only the summary: per region, what would be deregistered or deleted, why everything else is kept (`kept: 312 referenced · 18 no delete tag`), anything blocked, and the estimated savings.
+
+For the full picture, write a report. The format follows the extension, and the flag can be repeated:
+
+```shell
+amicleaner --regions us-west-2 --report plan.md --report plan.json
+```
+
+Both formats list every AMI and snapshot with its decision (`deregister`, `delete`, `delete_recovery_point`, `blocked`, `keep`), a stable `reason_code` (`referenced`, `shared`, `no_delete_tag`, `too_new`, …), a readable reason, and supporting details such as which instance or launch template version references an AMI. The Markdown version is for people: a summary table, then per-region actions, blocks and a kept-by-reason table, with the full lists in collapsible sections. The JSON version is for tooling and carries a `schema_version`.
+
+### estimated savings
+
+The plan estimates the monthly snapshot storage that deleting would free, as **an upper bound**. EBS only bills the blocks a snapshot doesn't share with other snapshots of the same volume, and AWS doesn't expose that per snapshot. So the estimate uses each snapshot's full size (falling back to its volume size) times `--snapshot-price-per-gb-month` (default `0.05`) or, for archived snapshots, `--archive-price-per-gb-month` (default `0.0125`). Set both to your region's prices. AMIs themselves cost nothing beyond their snapshots.
+
+### timeouts and concurrency
+
+Every AWS request attempt has a deadline (`--request-timeout-secs`, default 60). Proxies that drop connections without closing them would otherwise leave a request waiting forever. With the deadline, the SDK retries it instead.
 
 Read-heavy steps run up to `--max-concurrency` requests at a time (default 8): launch template versions (a build account can have tens of thousands), CloudFormation templates, and the AMI/snapshot sharing lookups. Lower it if the account gets throttled. Mutations (deregister, delete) always run one at a time. A launch template deleted while the scan runs is skipped, since it can no longer launch anything.
 
@@ -168,6 +195,24 @@ Options:
           - cloudformation: AMI ids (and SSM dynamic references to AMIs) in stack templates and parameters
           - batch:          Compute environment image ids and EC2 configuration overrides
           - emr:            Custom AMIs of active clusters, instance groups and instance fleets
+
+      --report <FILE>
+          Write the full report (every AMI and snapshot with its decision and reason) to a file. The format follows the extension: .md/.markdown or .json. Repeat for several files
+
+      --snapshot-price-per-gb-month <USD>
+          Snapshot storage price in USD per GB-month, for the savings estimate (EBS Snapshots standard tier; check your region's price)
+          
+          [default: 0.05]
+
+      --archive-price-per-gb-month <USD>
+          EBS Snapshots Archive tier price in USD per GB-month, for the savings estimate
+          
+          [default: 0.0125]
+
+      --request-timeout-secs <SECONDS>
+          Seconds before a single AWS request attempt is abandoned and retried. Protects against connections that a proxy drops without closing
+          
+          [default: 60]
 
       --max-concurrency <MAX_CONCURRENCY>
           Maximum concurrent read requests per region (launch template versions, CloudFormation templates, permission lookups). Lower it if AWS throttles the account

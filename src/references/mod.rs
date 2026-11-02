@@ -16,10 +16,11 @@ use aws_types::SdkConfig;
 use clap::ValueEnum;
 use ec2::error::ProvideErrorMetadata;
 use futures_util::{StreamExt, stream};
-use log::{info, warn};
+use log::warn;
 
 use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
 use crate::inventory::is_ami_id;
+use crate::ui::{Phase, thousands};
 
 /// Services beyond EC2 and Auto Scaling that can launch an AMI and are scanned for references.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -46,6 +47,8 @@ pub(crate) struct ReferenceClients {
     /// Maximum concurrent requests for the fan-out lookups (launch template versions,
     /// CloudFormation templates).
     pub(crate) concurrency: usize,
+    /// Region name, for progress labels.
+    pub(crate) region: String,
 }
 
 impl ReferenceClients {
@@ -61,6 +64,7 @@ impl ReferenceClients {
             batch: enabled(ReferenceSource::Batch).then(|| batch::Client::new(config)),
             emr: enabled(ReferenceSource::Emr).then(|| emr::Client::new(config)),
             concurrency: concurrency.max(1),
+            region: config.region().map(ToString::to_string).unwrap_or_default(),
         }
     }
 }
@@ -76,12 +80,63 @@ pub(crate) struct LaunchTemplateRef {
 pub(crate) struct AmiReferenceScan {
     pub(crate) referenced_ami_ids: HashSet<String>,
     pub(crate) unresolved_references: HashSet<String>,
+    /// AMI id -> the first few things found referencing it, for reports.
+    pub(crate) sources: HashMap<String, Vec<String>>,
+    /// Every reference recorded (an AMI referenced twice counts twice), for progress output.
+    pub(crate) references_seen: usize,
+}
+
+/// How many referencing sources are kept per AMI for reports.
+const MAX_SOURCES_PER_AMI: usize = 3;
+
+impl AmiReferenceScan {
+    pub(crate) fn add_reference(&mut self, ami_id: String, source: &str) {
+        let sources = self.sources.entry(ami_id.clone()).or_default();
+        if sources.len() < MAX_SOURCES_PER_AMI && !sources.iter().any(|known| known == source) {
+            sources.push(source.to_string());
+        }
+        self.referenced_ami_ids.insert(ami_id);
+        self.references_seen += 1;
+    }
 }
 
 #[derive(Debug)]
 pub(crate) enum ImageReferenceResolution {
     Ami(String),
     Unresolved(String),
+}
+
+/// Runs one reference source under its own progress line, finishing it with what it found. A
+/// skipped source still gets a line so the output shows it wasn't scanned.
+macro_rules! scan_source {
+    ($collector:ident, $name:expr, $enabled:expr, $call:expr) => {{
+        let phase = Phase::start(format!("{} · {}", $collector.clients.region, $name));
+        if $enabled {
+            let seen = $collector.scan.references_seen;
+            let unresolved = $collector.scan.unresolved_references.len();
+            $collector.phase = Some(phase);
+            let result = $call.await;
+            let phase = $collector.phase.take().expect("phase set above");
+            match result {
+                Ok(()) => {
+                    let found = $collector.scan.references_seen - seen;
+                    let unresolved = $collector.scan.unresolved_references.len() - unresolved;
+                    let summary = format!("{} references", thousands(found));
+                    if unresolved > 0 {
+                        phase.warn(format!("{summary}, {unresolved} unresolved"));
+                    } else {
+                        phase.finish(summary);
+                    }
+                }
+                Err(error) => {
+                    phase.fail("failed");
+                    return Err(error);
+                }
+            }
+        } else {
+            phase.skip("skipped (--skip-reference-sources)");
+        }
+    }};
 }
 
 pub(crate) async fn collect_referenced_ami_ids(
@@ -94,19 +149,41 @@ pub(crate) async fn collect_referenced_ami_ids(
         ssm_cache: HashMap::new(),
         scanned_launch_templates: HashSet::new(),
         scan: AmiReferenceScan::default(),
+        phase: None,
     };
 
-    collector.collect_instances().await?;
-    collector.collect_launch_templates().await?;
-    collector.collect_auto_scaling_groups().await?;
-    collector.collect_launch_configurations().await?;
-    collector.collect_ec2_fleets().await?;
-    collector.collect_spot_fleets().await?;
-    collector.collect_spot_instance_requests().await?;
-    collector.collect_image_builder_recipes().await?;
-    collector.collect_cloudformation_stacks().await?;
-    collector.collect_batch_compute_environments().await?;
-    collector.collect_emr_clusters().await?;
+    let clients = reference_clients;
+    scan_source!(collector, "instances", true, collector.collect_instances());
+    scan_source!(collector, "launch templates", true, collector.collect_launch_templates());
+    scan_source!(collector, "auto scaling groups", true, collector.collect_auto_scaling_groups());
+    scan_source!(
+        collector,
+        "launch configurations",
+        true,
+        collector.collect_launch_configurations()
+    );
+    scan_source!(collector, "EC2 fleets", true, collector.collect_ec2_fleets());
+    scan_source!(collector, "spot fleets", true, collector.collect_spot_fleets());
+    scan_source!(collector, "spot requests", true, collector.collect_spot_instance_requests());
+    scan_source!(
+        collector,
+        "image builder",
+        clients.image_builder.is_some(),
+        collector.collect_image_builder_recipes()
+    );
+    scan_source!(
+        collector,
+        "cloudformation",
+        clients.cloudformation.is_some(),
+        collector.collect_cloudformation_stacks()
+    );
+    scan_source!(
+        collector,
+        "batch",
+        clients.batch.is_some(),
+        collector.collect_batch_compute_environments()
+    );
+    scan_source!(collector, "emr", clients.emr.is_some(), collector.collect_emr_clusters());
 
     Ok(collector.scan)
 }
@@ -120,14 +197,22 @@ pub(crate) struct ReferenceCollector<'a> {
     /// Ids and names of launch templates whose versions were all recorded.
     pub(crate) scanned_launch_templates: HashSet<String>,
     pub(crate) scan: AmiReferenceScan,
+    /// Progress line of the source being scanned, if any.
+    pub(crate) phase: Option<Phase>,
 }
 
 impl ReferenceCollector<'_> {
-    pub(crate) async fn record(&mut self, image_reference: &str) {
+    /// Records the AMI an image reference resolves to, noting `source` (what referenced it).
+    pub(crate) async fn record(&mut self, image_reference: &str, source: &str) {
         match resolve_image_reference(image_reference, &self.clients.ssm, &mut self.ssm_cache).await
         {
             ImageReferenceResolution::Ami(ami_id) => {
-                self.scan.referenced_ami_ids.insert(ami_id);
+                if image_reference.starts_with(['r', '{']) {
+                    let via = format!("{source} via {image_reference}");
+                    self.scan.add_reference(ami_id, &via);
+                } else {
+                    self.scan.add_reference(ami_id, source);
+                }
             }
             ImageReferenceResolution::Unresolved(reason) => {
                 self.scan.unresolved_references.insert(reason);
@@ -158,7 +243,9 @@ impl ReferenceCollector<'_> {
             for reservation in output.reservations() {
                 for instance in reservation.instances() {
                     if let Some(image_id) = instance.image_id() {
-                        self.record(image_id).await;
+                        let source =
+                            format!("instance {}", instance.instance_id().unwrap_or("<unknown>"));
+                        self.record(image_id, &source).await;
                     }
                 }
             }
@@ -190,11 +277,19 @@ impl ReferenceCollector<'_> {
             }
         }
 
-        info!("scanning every version of {} launch templates", templates.len());
         let ec2_client = self.ec2;
+        let phase = self.phase.as_ref();
+        if let Some(phase) = phase {
+            phase.set_total(templates.len());
+        }
         let results = stream::iter(&templates)
             .map(|template| launch_template_image_references(ec2_client, template))
             .buffered(self.clients.concurrency)
+            .inspect(|_| {
+                if let Some(phase) = phase {
+                    phase.inc();
+                }
+            })
             .collect::<Vec<_>>()
             .await;
 
@@ -205,8 +300,8 @@ impl ReferenceCollector<'_> {
             self.scanned_launch_templates.extend(
                 template.launch_template_id.iter().chain(&template.launch_template_name).cloned(),
             );
-            for image_reference in image_references {
-                self.record(&image_reference).await;
+            for (image_reference, source) in image_references {
+                self.record(&image_reference, &source).await;
             }
         }
 
@@ -333,8 +428,12 @@ impl ReferenceCollector<'_> {
             }
         }
 
+        let source = format!(
+            "Auto Scaling group {} (launch template {label})",
+            group_name.unwrap_or("<unnamed>")
+        );
         for image_reference in image_references {
-            self.record(&image_reference).await;
+            self.record(&image_reference, &source).await;
         }
     }
 
@@ -351,7 +450,11 @@ impl ReferenceCollector<'_> {
             let output = page.aws_context("DescribeLaunchConfigurations")?;
             for launch_configuration in output.launch_configurations() {
                 if let Some(image_id) = launch_configuration.image_id() {
-                    self.record(image_id).await;
+                    let source = format!(
+                        "launch configuration {}",
+                        launch_configuration.launch_configuration_name().unwrap_or("<unnamed>")
+                    );
+                    self.record(image_id, &source).await;
                 }
             }
         }
@@ -378,10 +481,11 @@ impl ReferenceCollector<'_> {
                     continue;
                 }
 
+                let source = format!("EC2 Fleet {}", fleet.fleet_id().unwrap_or("<unknown>"));
                 for config in fleet.launch_template_configs() {
                     for override_spec in config.overrides() {
                         if let Some(image_reference) = override_spec.image_id() {
-                            self.record(image_reference).await;
+                            self.record(image_reference, &source).await;
                         }
                     }
                 }
@@ -414,9 +518,13 @@ impl ReferenceCollector<'_> {
                 let Some(config) = request.spot_fleet_request_config() else {
                     continue;
                 };
+                let source = format!(
+                    "Spot Fleet {}",
+                    request.spot_fleet_request_id().unwrap_or("<unknown>")
+                );
                 for spec in config.launch_specifications() {
                     if let Some(image_reference) = spec.image_id() {
-                        self.record(image_reference).await;
+                        self.record(image_reference, &source).await;
                     }
                 }
             }
@@ -448,7 +556,11 @@ impl ReferenceCollector<'_> {
                 if let Some(image_reference) =
                     request.launch_specification().and_then(|spec| spec.image_id())
                 {
-                    self.record(image_reference).await;
+                    let source = format!(
+                        "Spot request {}",
+                        request.spot_instance_request_id().unwrap_or("<unknown>")
+                    );
+                    self.record(image_reference, &source).await;
                 }
             }
         }
@@ -463,7 +575,7 @@ impl ReferenceCollector<'_> {
 async fn launch_template_image_references(
     ec2_client: &ec2::Client,
     template: &LaunchTemplateRef,
-) -> AppResult<Option<Vec<String>>> {
+) -> AppResult<Option<Vec<(String, String)>>> {
     let mut request = ec2_client.describe_launch_template_versions();
     if let Some(id) = &template.launch_template_id {
         request = request.launch_template_id(id);
@@ -489,15 +601,19 @@ async fn launch_template_image_references(
             }
             Err(error) => return Err(error).aws_context("DescribeLaunchTemplateVersions"),
         };
-        image_references.extend(
-            output
-                .launch_template_versions()
-                .iter()
-                .filter_map(|version| {
-                    version.launch_template_data().and_then(|data| data.image_id())
-                })
-                .map(ToString::to_string),
-        );
+        image_references.extend(output.launch_template_versions().iter().filter_map(|version| {
+            let image_id = version.launch_template_data().and_then(|data| data.image_id())?;
+            let source = format!(
+                "launch template {} v{}",
+                version
+                    .launch_template_id()
+                    .or(template.launch_template_id.as_deref())
+                    .or(template.launch_template_name.as_deref())
+                    .unwrap_or("<unknown>"),
+                version.version_number().unwrap_or_default()
+            );
+            Some((image_id.to_string(), source))
+        }));
     }
     Ok(Some(image_references))
 }

@@ -4,15 +4,10 @@ version = "2.0.0"
 authors = ["Joseph Kordish <joe@unicornclouds.com>"]
 edition = "2024"
 rust-version = "1.99.1"
+description = "Conservative mark-and-sweep cleanup of AWS AMIs, EBS snapshots and AWS Backup recovery points"
+repository = "https://github.com/jkordish/amicleaner.rs"
 readme = "README.md"
 license = "MIT"
-autobins = false
-
-[[bin]]
-name = "amicleaner"
-path = "./src/main.rs"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 aws-config = { version = "1.13.0", features = ["behavior-version-latest"] }
@@ -25,12 +20,27 @@ aws-sdk-emr = { version = "1.132.0" }
 aws-sdk-imagebuilder = { version = "1.137.0" }
 aws-sdk-ssm = { version = "1.133.0" }
 aws-types = { version = "1.7.0" }
-chrono = { version = "0.4.45" }
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
+console = { version = "0.16.6" }
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+indicatif = { version = "0.18.6" }
 log = { version = "0.4.35" }
-simple_logger = { version = "5.2.0", default-features = false }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154" }
 tokio = { version = "1.54.1", default-features = false, features = ["full"] }
+
+[dev-dependencies]
+# test-util enables the mock_client! macro from aws-smithy-mocks.
+aws-sdk-autoscaling = { version = "1.140.0", features = ["test-util"] }
+aws-sdk-backup = { version = "1.132.0", features = ["test-util"] }
+aws-sdk-batch = { version = "1.138.0", features = ["test-util"] }
+aws-sdk-cloudformation = { version = "1.136.0", features = ["test-util"] }
+aws-sdk-ec2 = { version = "1.274.0", features = ["test-util"] }
+aws-sdk-emr = { version = "1.132.0", features = ["test-util"] }
+aws-sdk-imagebuilder = { version = "1.137.0", features = ["test-util"] }
+aws-sdk-ssm = { version = "1.133.0", features = ["test-util"] }
+aws-smithy-mocks = { version = "0.3.0" }
 
 [profile.release]
 codegen-units = 1
@@ -43,15 +53,3 @@ strip = "symbols"
 codegen-units = 1
 incremental = false
 opt-level = 3
-
-[dev-dependencies]
-# test-util enables the mock_client! macro from aws-smithy-mocks.
-aws-sdk-autoscaling = { version = "1.140.0", features = ["test-util"] }
-aws-sdk-backup = { version = "1.132.0", features = ["test-util"] }
-aws-sdk-batch = { version = "1.138.0", features = ["test-util"] }
-aws-sdk-cloudformation = { version = "1.136.0", features = ["test-util"] }
-aws-sdk-ec2 = { version = "1.274.0", features = ["test-util"] }
-aws-sdk-emr = { version = "1.132.0", features = ["test-util"] }
-aws-sdk-imagebuilder = { version = "1.137.0", features = ["test-util"] }
-aws-sdk-ssm = { version = "1.133.0", features = ["test-util"] }
-aws-smithy-mocks = "0.3.0"
