@@ -24,16 +24,18 @@ use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_backup as backup;
 use aws_sdk_ec2 as ec2;
+use aws_sdk_sts as sts;
 use aws_types::region::Region;
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use log::{error, warn};
 
 use crate::cli::Args;
-use crate::errors::{AppResult, AwsResultExt, error_chain};
+use crate::errors::{AppResult, AwsResultExt, describe_sdk_error, error_chain};
 use crate::execute::execute_region_plan;
 use crate::model::RunOutcome;
 use crate::plan::build_region_plan;
+use crate::references::lt_cache::{LtCacheConfig, default_cache_dir};
 use crate::references::{ReferenceClients, ReferenceSource};
 use crate::report::{Pricing, RegionReport, Report};
 
@@ -84,6 +86,7 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
 
     let mut outcome = RunOutcome::default();
     let mut region_reports = Vec::new();
+    let mut account_id = None;
 
     for region in regions {
         let region_config =
@@ -95,7 +98,8 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
             &region_config,
             &args.skip_reference_sources,
             usize::from(args.max_concurrency),
-        );
+        )
+        .with_lt_cache(lt_cache_config(args, &region_config, &mut account_id).await);
 
         let region_report =
             match build_region_plan(args, &region, &ec2_client, &backup_client, &reference_clients)
@@ -160,6 +164,47 @@ fn aws_config_loader(args: &Args) -> aws_config::ConfigLoader {
     // failed a whole delta0 reference scan with the default 3 attempts).
     let retries = RetryConfig::adaptive().with_max_attempts(SDK_MAX_ATTEMPTS);
     aws_config::defaults(BehaviorVersion::latest()).timeout_config(timeouts).retry_config(retries)
+}
+
+/// Launch template cache settings, or `None` (with a warning) when the cache can't be used. The
+/// cache is keyed by account, so the account id is looked up once (STS) and reused.
+async fn lt_cache_config(
+    args: &Args,
+    region_config: &aws_types::SdkConfig,
+    account_id: &mut Option<String>,
+) -> Option<LtCacheConfig> {
+    if args.no_cache {
+        return None;
+    }
+    let dir = args.cache_dir.clone().or_else(|| {
+        default_cache_dir(
+            std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    });
+    let Some(dir) = dir else {
+        warn!(
+            "no cache directory (set --cache-dir or HOME); reading every launch template version"
+        );
+        return None;
+    };
+    if account_id.is_none() {
+        match sts::Client::new(region_config).get_caller_identity().send().await {
+            Ok(identity) => *account_id = identity.account().map(ToString::to_string),
+            Err(error) => {
+                warn!(
+                    "launch template cache disabled: GetCallerIdentity failed: {}",
+                    describe_sdk_error(&error)
+                );
+                return None;
+            }
+        }
+    }
+    Some(LtCacheConfig {
+        dir,
+        account_id: account_id.clone()?,
+        max_age: chrono::Duration::days(i64::from(args.cache_max_age_days)),
+    })
 }
 
 fn inert_flag_warnings(args: &Args) -> Vec<&'static str> {

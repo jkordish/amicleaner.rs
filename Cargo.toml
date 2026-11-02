@@ -19,6 +19,7 @@ aws-sdk-ec2 = { version = "1.274.0" }
 aws-sdk-emr = { version = "1.132.0" }
 aws-sdk-imagebuilder = { version = "1.137.0" }
 aws-sdk-ssm = { version = "1.133.0" }
+aws-sdk-sts = { version = "1.124.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws-types = { version = "1.7.0" }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
@@ -28,7 +29,7 @@ indicatif = { version = "0.18.6" }
 log = { version = "0.4.35" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154" }
-tokio = { version = "1.54.1", default-features = false, features = ["full"] }
+tokio = { version = "1.54.1", default-features = false, features = ["macros", "rt-multi-thread", "time"] }
 
 [dev-dependencies]
 # test-util enables the mock_client! macro from aws-smithy-mocks.

@@ -113,6 +113,22 @@ pub(crate) struct Args {
           value_parser = clap::value_parser!(u64).range(5..=600))]
     pub(crate) request_timeout_secs: u64,
 
+    /// Directory for the launch template version cache. Defaults to XDG_CACHE_HOME/amicleaner,
+    /// else ~/.cache/amicleaner.
+    #[arg(long, value_name = "DIR")]
+    pub(crate) cache_dir: Option<PathBuf>,
+
+    /// Read every launch template version instead of only those newer than the local cache, and
+    /// don't read or write the cache.
+    #[arg(long)]
+    pub(crate) no_cache: bool,
+
+    /// Days a cached launch template stays trusted before all its versions are read again, which
+    /// also forgets versions deleted since. 0 reads everything on every run.
+    #[arg(long, value_name = "DAYS", default_value_t = 7,
+          value_parser = clap::value_parser!(u16).range(0..=90))]
+    pub(crate) cache_max_age_days: u16,
+
     /// Maximum concurrent read requests per region (launch template versions, CloudFormation
     /// templates, permission lookups). Lower it if AWS throttles the account.
     #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]

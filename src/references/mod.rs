@@ -1,6 +1,7 @@
 //! The "mark" phase: finds every AMI something in the region could launch. Anything that can't
 //! be resolved to a concrete AMI id is recorded as unresolved, which blocks AMI deregistration.
 
+pub(crate) mod lt_cache;
 pub(crate) mod services;
 
 use std::collections::{HashMap, HashSet};
@@ -13,6 +14,7 @@ use aws_sdk_emr as emr;
 use aws_sdk_imagebuilder as imagebuilder;
 use aws_sdk_ssm as ssm;
 use aws_types::SdkConfig;
+use chrono::Utc;
 use clap::ValueEnum;
 use ec2::error::ProvideErrorMetadata;
 use futures_util::{StreamExt, stream};
@@ -20,6 +22,9 @@ use log::warn;
 
 use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
 use crate::inventory::is_ami_id;
+use crate::references::lt_cache::{
+    CachedTemplate, FetchPlan, LaunchTemplateCache, LtCacheConfig, fetch_plan,
+};
 use crate::ui::{Phase, thousands};
 
 /// Services beyond EC2 and Auto Scaling that can launch an AMI and are scanned for references.
@@ -49,6 +54,8 @@ pub(crate) struct ReferenceClients {
     pub(crate) concurrency: usize,
     /// Region name, for progress labels.
     pub(crate) region: String,
+    /// Launch template version cache; `None` reads every version every run.
+    pub(crate) lt_cache: Option<LtCacheConfig>,
 }
 
 impl ReferenceClients {
@@ -65,7 +72,13 @@ impl ReferenceClients {
             emr: enabled(ReferenceSource::Emr).then(|| emr::Client::new(config)),
             concurrency: concurrency.max(1),
             region: config.region().map(ToString::to_string).unwrap_or_default(),
+            lt_cache: None,
         }
+    }
+
+    pub(crate) fn with_lt_cache(mut self, lt_cache: Option<LtCacheConfig>) -> Self {
+        self.lt_cache = lt_cache;
+        self
     }
 }
 
@@ -256,8 +269,9 @@ impl ReferenceCollector<'_> {
 
     /// Every version of every launch template, since any version can be launched by number.
     /// Versions are fetched `concurrency` templates at a time (build accounts can have tens of
-    /// thousands of versions). Templates scanned here are remembered so the Auto Scaling pass
-    /// doesn't fetch them again.
+    /// thousands of versions); with the cache on, only versions newer than the cache are fetched
+    /// (see `lt_cache`). Templates scanned here are remembered so the Auto Scaling pass doesn't
+    /// fetch them again.
     pub(crate) async fn collect_launch_templates(&mut self) -> AppResult<()> {
         let mut templates = Vec::new();
         let mut template_pages =
@@ -278,13 +292,39 @@ impl ReferenceCollector<'_> {
             }
         }
 
+        let now = Utc::now();
+        let region = self.clients.region.clone();
+        let cache_config = self.clients.lt_cache.clone();
+        let mut cache = cache_config.as_ref().map(|config| {
+            LaunchTemplateCache::load(&config.path(&region), &config.account_id, &region)
+        });
+
+        // Only templates with an id are cached; anything else is always read in full.
+        let plans = templates
+            .iter()
+            .map(|(template, latest)| {
+                match (&cache, &cache_config, template.launch_template_id.as_deref()) {
+                    (Some(cache), Some(config), Some(id)) => {
+                        fetch_plan(cache.templates.get(id), *latest, now, config.max_age)
+                    }
+                    _ => FetchPlan::Full,
+                }
+            })
+            .collect::<Vec<_>>();
+
         // A few templates hold most versions (6,500+ in a build account), so each template is
         // split into version ranges that are fetched concurrently with everything else.
         let chunks = templates
             .iter()
+            .zip(&plans)
             .enumerate()
-            .flat_map(|(index, (_, latest))| {
-                version_ranges(*latest).into_iter().map(move |range| (index, range))
+            .flat_map(|(index, ((_, latest), plan))| {
+                let ranges = match plan {
+                    FetchPlan::Full => version_ranges(1, *latest),
+                    FetchPlan::From(start) => version_ranges(*start, *latest),
+                    FetchPlan::UpToDate => Vec::new(),
+                };
+                ranges.into_iter().map(move |range| (index, range))
             })
             .collect::<Vec<_>>();
 
@@ -292,6 +332,10 @@ impl ReferenceCollector<'_> {
         let phase = self.phase.as_ref();
         if let Some(phase) = phase {
             phase.set_total(chunks.len());
+            if cache.is_some() {
+                let cached = plans.iter().filter(|plan| **plan != FetchPlan::Full).count();
+                phase.message(format!("{cached} of {} templates cached", templates.len()));
+            }
         }
         let results = stream::iter(&chunks)
             .map(|(index, range)| {
@@ -307,36 +351,81 @@ impl ReferenceCollector<'_> {
             .await;
 
         // Regroup per template: a template is only "scanned" if every range came back.
-        let mut per_template: Vec<Option<Vec<(String, String)>>> =
-            templates.iter().map(|_| Some(Vec::new())).collect();
+        let mut per_template: Vec<Option<FetchedVersions>> =
+            templates.iter().map(|_| Some(FetchedVersions::default())).collect();
         for ((index, _), result) in chunks.iter().zip(results) {
             match result? {
-                Some(references) => {
+                Some(fetched) => {
                     if let Some(collected) = &mut per_template[*index] {
-                        collected.extend(references);
+                        collected.versions.extend(fetched.versions);
+                        collected.max_version = collected.max_version.max(fetched.max_version);
                     }
                 }
                 None => per_template[*index] = None,
             }
         }
 
-        for ((template, _), references) in templates.iter().zip(per_template) {
-            let Some(references) = references else {
-                warn!(
-                    "launch template {} was deleted during the scan; ignoring it",
-                    template
-                        .launch_template_id
-                        .as_deref()
-                        .or(template.launch_template_name.as_deref())
-                        .unwrap_or("<unknown>")
-                );
+        for (((template, latest), plan), fetched) in templates.iter().zip(&plans).zip(per_template)
+        {
+            let label = template
+                .launch_template_id
+                .as_deref()
+                .or(template.launch_template_name.as_deref())
+                .unwrap_or("<unknown>")
+                .to_string();
+            let Some(fetched) = fetched else {
+                warn!("launch template {label} was deleted during the scan; ignoring it");
+                if let (Some(cache), Some(id)) = (&mut cache, &template.launch_template_id) {
+                    cache.templates.remove(id);
+                }
                 continue;
             };
             self.scanned_launch_templates.extend(
                 template.launch_template_id.iter().chain(&template.launch_template_name).cloned(),
             );
-            for (image_reference, source) in references {
+
+            let scanned_through = latest.unwrap_or(0).max(fetched.max_version);
+            let entry = match (plan, &mut cache, template.launch_template_id.as_deref()) {
+                (FetchPlan::Full, Some(cache), Some(id)) => {
+                    let entry = CachedTemplate {
+                        scanned_through,
+                        full_scan_at: now,
+                        versions: fetched.versions.into_iter().collect(),
+                    };
+                    cache.templates.insert(id.to_string(), entry);
+                    cache.templates.get(id)
+                }
+                (FetchPlan::From(_) | FetchPlan::UpToDate, Some(cache), Some(id)) => {
+                    let entry = cache.templates.get_mut(id).expect("planned from a cached entry");
+                    entry.versions.extend(fetched.versions);
+                    entry.scanned_through = entry.scanned_through.max(scanned_through);
+                    cache.templates.get(id)
+                }
+                _ => {
+                    for (number, image_reference) in fetched.versions {
+                        let source = format!("launch template {label} v{number}");
+                        self.record(&image_reference, &source).await;
+                    }
+                    continue;
+                }
+            };
+            // Replay every version (cached and new) as a reference; the cache only adds.
+            let versions = entry.map(|entry| entry.versions.clone()).unwrap_or_default();
+            for (number, image_reference) in versions {
+                let source = format!("launch template {label} v{number}");
                 self.record(&image_reference, &source).await;
+            }
+        }
+
+        if let (Some(mut cache), Some(config)) = (cache, cache_config) {
+            let listed = templates
+                .iter()
+                .filter_map(|(template, _)| template.launch_template_id.as_deref())
+                .collect::<HashSet<&str>>();
+            cache.prune(&listed);
+            let path = config.path(&region);
+            if let Err(error) = cache.save(&path) {
+                warn!("couldn't write launch template cache {}: {error}", path.display());
             }
         }
 
@@ -610,21 +699,34 @@ impl ReferenceCollector<'_> {
 /// Versions per range when splitting a launch template; matches the API's maximum page size.
 const VERSION_RANGE: i64 = 200;
 
-/// `(min_version, max_version)` ranges covering every version of a template. The last range is
-/// open-ended so versions created during the scan are still read; templates with no more than one
-/// range's worth of versions (or an unknown latest version) are fetched in one paginated call.
-pub(crate) fn version_ranges(latest_version: Option<i64>) -> Vec<(Option<i64>, Option<i64>)> {
-    let Some(latest) = latest_version.filter(|latest| *latest > VERSION_RANGE) else {
-        return vec![(None, None)];
+/// `(min_version, max_version)` ranges covering every version from `start` on. The last range is
+/// open-ended so versions created during the scan are still read; when there's no more than one
+/// range's worth of versions (or the latest version is unknown) it's one paginated call.
+pub(crate) fn version_ranges(
+    start: i64,
+    latest_version: Option<i64>,
+) -> Vec<(Option<i64>, Option<i64>)> {
+    let min_version = (start > 1).then_some(start);
+    let Some(latest) = latest_version.filter(|latest| latest - start + 1 > VERSION_RANGE) else {
+        return vec![(min_version, None)];
     };
     let mut ranges = Vec::new();
-    let mut start = 1;
+    let mut start = start;
     while start + VERSION_RANGE <= latest {
         ranges.push((Some(start), Some(start + VERSION_RANGE - 1)));
         start += VERSION_RANGE;
     }
     ranges.push((Some(start), None));
     ranges
+}
+
+/// Versions read from one or more ranges of a template.
+#[derive(Debug, Default)]
+pub(crate) struct FetchedVersions {
+    /// `(version number, raw image reference)` for versions that set an image.
+    pub(crate) versions: Vec<(i64, String)>,
+    /// Highest version number seen, with or without an image.
+    pub(crate) max_version: i64,
 }
 
 /// Image references in one version range of a launch template. `None` when the template was
@@ -634,7 +736,7 @@ async fn launch_template_image_references(
     ec2_client: &ec2::Client,
     template: &LaunchTemplateRef,
     (min_version, max_version): &(Option<i64>, Option<i64>),
-) -> AppResult<Option<Vec<(String, String)>>> {
+) -> AppResult<Option<FetchedVersions>> {
     let mut request = ec2_client.describe_launch_template_versions();
     if let Some(id) = &template.launch_template_id {
         request = request.launch_template_id(id);
@@ -648,7 +750,7 @@ async fn launch_template_image_references(
         request = request.max_version(max_version.to_string());
     }
 
-    let mut image_references = Vec::new();
+    let mut fetched = FetchedVersions::default();
     let mut pages = request.into_paginator().page_size(200).send();
     while let Some(page) = pages.next().await {
         let output = match page {
@@ -656,21 +758,16 @@ async fn launch_template_image_references(
             Err(error) if is_launch_template_not_found(error.code()) => return Ok(None),
             Err(error) => return Err(error).aws_context("DescribeLaunchTemplateVersions"),
         };
-        image_references.extend(output.launch_template_versions().iter().filter_map(|version| {
-            let image_id = version.launch_template_data().and_then(|data| data.image_id())?;
-            let source = format!(
-                "launch template {} v{}",
-                version
-                    .launch_template_id()
-                    .or(template.launch_template_id.as_deref())
-                    .or(template.launch_template_name.as_deref())
-                    .unwrap_or("<unknown>"),
-                version.version_number().unwrap_or_default()
-            );
-            Some((image_id.to_string(), source))
-        }));
+        for version in output.launch_template_versions() {
+            let number = version.version_number().unwrap_or_default();
+            fetched.max_version = fetched.max_version.max(number);
+            if let Some(image_id) = version.launch_template_data().and_then(|data| data.image_id())
+            {
+                fetched.versions.push((number, image_id.to_string()));
+            }
+        }
     }
-    Ok(Some(image_references))
+    Ok(Some(fetched))
 }
 
 fn is_launch_template_not_found(code: Option<&str>) -> bool {

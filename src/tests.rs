@@ -41,6 +41,9 @@ use crate::policy::{
     backup_recovery_point_deletion_tag_allows, has_expected_tag, is_protected,
     looks_backup_created, optional_expected_value, select_latest_ami_ids_by_family,
 };
+use crate::references::lt_cache::{
+    CachedTemplate, FetchPlan, LaunchTemplateCache, LtCacheConfig, default_cache_dir, fetch_plan,
+};
 use crate::references::services::{
     OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids,
     find_ssm_dynamic_references, image_version_matches,
@@ -836,6 +839,7 @@ fn reference_clients(asg: autoscaling::Client, ssm: ssm::Client) -> ReferenceCli
         emr: None,
         concurrency: 4,
         region: "us-east-1".to_string(),
+        lt_cache: None,
     }
 }
 
@@ -2577,15 +2581,19 @@ fn report_flags_and_formatting_helpers() {
 
 #[test]
 fn launch_templates_are_split_into_version_ranges() {
-    assert_eq!(version_ranges(None), vec![(None, None)]);
-    assert_eq!(version_ranges(Some(200)), vec![(None, None)]);
+    assert_eq!(version_ranges(1, None), vec![(None, None)]);
+    assert_eq!(version_ranges(1, Some(200)), vec![(None, None)]);
     assert_eq!(
-        version_ranges(Some(450)),
+        version_ranges(1, Some(450)),
         vec![(Some(1), Some(200)), (Some(201), Some(400)), (Some(401), None)],
         "the last range is open-ended so versions created mid-scan are read"
     );
-    assert_eq!(version_ranges(Some(400)), vec![(Some(1), Some(200)), (Some(201), None)]);
-    assert_eq!(version_ranges(Some(6551)).len(), 33);
+    assert_eq!(version_ranges(1, Some(400)), vec![(Some(1), Some(200)), (Some(201), None)]);
+    assert_eq!(version_ranges(1, Some(6551)).len(), 33);
+    // Incremental fetches start after the cached versions.
+    assert_eq!(version_ranges(6500, Some(6551)), vec![(Some(6500), None)]);
+    assert_eq!(version_ranges(6500, None), vec![(Some(6500), None)]);
+    assert_eq!(version_ranges(101, Some(500)), vec![(Some(101), Some(300)), (Some(301), None)]);
 }
 
 fn big_template_rule(id: &'static str, latest: i64) -> aws_smithy_mocks::Rule {
@@ -2735,4 +2743,300 @@ fn referenced_count_only_includes_owned_amis() {
         &scan(&[AMI_A, AMI_B], &[]),
     );
     assert_eq!(plan.referenced_ami_count, 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Launch template version cache
+// ---------------------------------------------------------------------------------------------
+
+const CACHE_ACCOUNT: &str = "123456789012";
+const CACHED_LT: &str = "lt-0123456789abcdef0";
+
+fn cached_template(
+    scanned_through: i64,
+    age_days: i64,
+    versions: &[(i64, &str)],
+) -> CachedTemplate {
+    CachedTemplate {
+        scanned_through,
+        full_scan_at: Utc::now() - Duration::days(age_days),
+        versions: versions.iter().map(|(number, image)| (*number, (*image).to_string())).collect(),
+    }
+}
+
+/// A fresh, empty cache directory under the system temp dir.
+fn temp_cache_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("amicleaner-test-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+fn cache_config(dir: &std::path::Path) -> LtCacheConfig {
+    LtCacheConfig {
+        dir: dir.to_path_buf(),
+        account_id: CACHE_ACCOUNT.to_string(),
+        max_age: Duration::days(7),
+    }
+}
+
+/// Writes a cache holding `templates` for the test region and returns clients that use it.
+fn clients_with_cache(
+    dir: &std::path::Path,
+    templates: Vec<(&str, CachedTemplate)>,
+    ssm_client: ssm::Client,
+) -> ReferenceClients {
+    let mut clients = reference_clients(empty_asg_client(), ssm_client);
+    let config = cache_config(dir);
+    let mut cache = LaunchTemplateCache::empty(CACHE_ACCOUNT, &clients.region);
+    for (id, template) in templates {
+        cache.templates.insert(id.to_string(), template);
+    }
+    cache.save(&config.path(&clients.region)).unwrap();
+    clients.lt_cache = Some(config);
+    clients
+}
+
+fn saved_cache(clients: &ReferenceClients) -> LaunchTemplateCache {
+    let config = clients.lt_cache.as_ref().unwrap();
+    LaunchTemplateCache::load(&config.path(&clients.region), CACHE_ACCOUNT, &clients.region)
+}
+
+fn versions_rule(
+    min: Option<&'static str>,
+    versions: &'static [(i64, &'static str)],
+) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_launch_template_versions)
+        .match_requests(move |request| request.min_version() == min)
+        .then_output(move || {
+            let mut output = ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder();
+            for (number, image_id) in versions {
+                output = output.launch_template_versions(
+                    ec2::types::LaunchTemplateVersion::builder()
+                        .launch_template_id(CACHED_LT)
+                        .version_number(*number)
+                        .launch_template_data(
+                            ec2::types::ResponseLaunchTemplateData::builder().image_id(*image_id).build(),
+                        )
+                        .build(),
+                );
+            }
+            output.build()
+        })
+}
+
+fn any_versions_rule() -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_launch_template_versions).then_output(|| {
+        ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder().build()
+    })
+}
+
+#[test]
+fn fetch_plan_trusts_only_fresh_entries_that_match_the_template() {
+    let now = Utc::now();
+    let week = Duration::days(7);
+    let fresh = cached_template(450, 1, &[]);
+    assert_eq!(fetch_plan(None, Some(450), now, week), FetchPlan::Full);
+    assert_eq!(fetch_plan(Some(&fresh), None, now, week), FetchPlan::Full);
+    assert_eq!(fetch_plan(Some(&fresh), Some(450), now, week), FetchPlan::UpToDate);
+    assert_eq!(fetch_plan(Some(&fresh), Some(460), now, week), FetchPlan::From(451));
+    assert_eq!(
+        fetch_plan(Some(&fresh), Some(440), now, week),
+        FetchPlan::Full,
+        "a latest version below the cache means the cache doesn't describe this template"
+    );
+    let mut expired = cached_template(450, 0, &[]);
+    expired.full_scan_at = now - week;
+    assert_eq!(
+        fetch_plan(Some(&expired), Some(450), now, week),
+        FetchPlan::Full,
+        "exactly max age"
+    );
+    assert_eq!(fetch_plan(Some(&fresh), Some(450), now, Duration::zero()), FetchPlan::Full);
+    let future = cached_template(450, -1, &[]);
+    assert_eq!(fetch_plan(Some(&future), Some(450), now, week), FetchPlan::Full);
+}
+
+#[test]
+fn cache_dir_defaults_to_xdg_then_home() {
+    let expected = |path: &str| Some(std::path::PathBuf::from(path));
+    assert_eq!(default_cache_dir(Some("/x"), Some("/h")), expected("/x/amicleaner"));
+    assert_eq!(default_cache_dir(Some(" "), Some("/h")), expected("/h/.cache/amicleaner"));
+    assert_eq!(default_cache_dir(None, Some("/h")), expected("/h/.cache/amicleaner"));
+    assert_eq!(default_cache_dir(None, None), None);
+}
+
+#[test]
+fn unusable_cache_files_are_ignored() {
+    let dir = temp_cache_dir("unusable");
+    let config = cache_config(&dir);
+    let path = config.path("us-east-1");
+    let empty = LaunchTemplateCache::empty(CACHE_ACCOUNT, "us-east-1");
+
+    assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty, "missing");
+
+    let mut other_account = LaunchTemplateCache::empty("999999999999", "us-east-1");
+    other_account.templates.insert(CACHED_LT.to_string(), cached_template(5, 0, &[(1, AMI_A)]));
+    other_account.save(&path).unwrap();
+    assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty);
+    assert_eq!(LaunchTemplateCache::load(&path, "999999999999", "us-west-2").templates.len(), 0);
+
+    std::fs::write(&path, "{ not json").unwrap();
+    assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty, "corrupt");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn up_to_date_cache_skips_the_api_and_still_protects_cached_amis() {
+    let dir = temp_cache_dir("up-to-date");
+    let templates = big_template_rule(CACHED_LT, 450);
+    let versions = any_versions_rule();
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &versions], no_sdk_retries);
+    let clients = clients_with_cache(
+        &dir,
+        vec![(CACHED_LT, cached_template(450, 1, &[(12, AMI_A), (300, AMI_B)]))],
+        no_ssm_client(),
+    );
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert_eq!(versions.num_calls(), 0);
+    assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B]));
+    assert!(collector.scanned_launch_templates.contains(CACHED_LT));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cache_fetches_only_newer_versions_and_merges_them() {
+    static NEW: [(i64, &str); 1] = [(455, AMI_B)];
+    let dir = temp_cache_dir("incremental");
+    let templates = big_template_rule(CACHED_LT, 460);
+    let newer = versions_rule(Some("451"), &NEW);
+    let anything_else = any_versions_rule();
+    let ec2_client = mock_client!(
+        aws_sdk_ec2,
+        RuleMode::MatchAny,
+        [&templates, &newer, &anything_else],
+        no_sdk_retries
+    );
+    let clients = clients_with_cache(
+        &dir,
+        vec![(CACHED_LT, cached_template(450, 1, &[(12, AMI_A)]))],
+        no_ssm_client(),
+    );
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert_eq!((newer.num_calls(), anything_else.num_calls()), (1, 0));
+    assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B]));
+    let entry = saved_cache(&clients).templates[CACHED_LT].clone();
+    assert_eq!(entry.scanned_through, 460);
+    assert_eq!(entry.versions.keys().copied().collect::<Vec<_>>(), vec![12, 455]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn expired_cache_entry_is_rebuilt_from_a_full_scan() {
+    static ALL: [(i64, &str); 1] = [(3, AMI_C)];
+    let dir = temp_cache_dir("expired");
+    let templates = big_template_rule(CACHED_LT, 150);
+    let full = versions_rule(None, &ALL);
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &full], no_sdk_retries);
+    // Version 12 was deleted since the entry was built; the full rescan forgets it.
+    let clients = clients_with_cache(
+        &dir,
+        vec![(CACHED_LT, cached_template(150, 30, &[(12, AMI_A)]))],
+        no_ssm_client(),
+    );
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert_eq!(full.num_calls(), 1);
+    assert_eq!(referenced(&collector), ids(&[AMI_C]));
+    let entry = saved_cache(&clients).templates[CACHED_LT].clone();
+    assert_eq!(entry.versions.keys().copied().collect::<Vec<_>>(), vec![3]);
+    assert!(Utc::now() - entry.full_scan_at < Duration::minutes(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn templates_that_no_longer_exist_are_pruned_from_the_cache() {
+    let dir = temp_cache_dir("prune");
+    let templates = big_template_rule(CACHED_LT, 5);
+    let versions = any_versions_rule();
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &versions], no_sdk_retries);
+    let clients = clients_with_cache(
+        &dir,
+        vec![
+            (CACHED_LT, cached_template(5, 1, &[(1, AMI_A)])),
+            ("lt-0fffffffffffffff0", cached_template(9, 1, &[(1, AMI_B)])),
+        ],
+        no_ssm_client(),
+    );
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert_eq!(
+        referenced(&collector),
+        ids(&[AMI_A]),
+        "a deleted template can't launch anything"
+    );
+    let saved = saved_cache(&clients);
+    assert_eq!(saved.templates.keys().map(String::as_str).collect::<Vec<_>>(), vec![CACHED_LT]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cached_ssm_references_are_resolved_on_every_run() {
+    let dir = temp_cache_dir("ssm");
+    let templates = big_template_rule(CACHED_LT, 7);
+    let versions = any_versions_rule();
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &versions], no_sdk_retries);
+    let parameter = ssm_parameter_rule("/golden/ami", AMI_B);
+    let ssm_client = mock_client!(aws_sdk_ssm, RuleMode::MatchAny, [&parameter]);
+    let clients = clients_with_cache(
+        &dir,
+        vec![(CACHED_LT, cached_template(7, 1, &[(7, "resolve:ssm:/golden/ami")]))],
+        ssm_client,
+    );
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert_eq!(parameter.num_calls(), 1);
+    assert_eq!(referenced(&collector), ids(&[AMI_B]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cached_template_deleted_mid_scan_is_dropped_from_the_cache() {
+    let dir = temp_cache_dir("deleted");
+    let templates = big_template_rule(CACHED_LT, 20);
+    let gone = mock!(ec2::Client::describe_launch_template_versions).then_error(|| {
+        ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsError::generic(ec2_error(
+            "InvalidLaunchTemplateId.NotFound",
+            "gone",
+        ))
+    });
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &gone], no_sdk_retries);
+    let clients = clients_with_cache(
+        &dir,
+        vec![(CACHED_LT, cached_template(10, 1, &[(1, AMI_A)]))],
+        no_ssm_client(),
+    );
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert!(!collector.scanned_launch_templates.contains(CACHED_LT));
+    assert!(saved_cache(&clients).templates.is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
 }

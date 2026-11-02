@@ -35,6 +35,7 @@ Source layout (everything is `pub(crate)` at most; tests live in `src/tests.rs`,
 | `plan.rs` | `build_region_plan` (I/O) → `plan_region` (pure), `apply_snapshot_external_use`, `print_region_plan` |
 | `aws_backup.rs` | recovery-point listing and `classify_backup_snapshots` (named so it doesn't clash with the `backup` SDK alias) |
 | `references/mod.rs` | `ReferenceCollector` + EC2/ASG/SSM sources, `ReferenceClients`, `resolve_image_reference` |
+| `references/lt_cache.rs` | launch template version cache: `fetch_plan` (full / from version n / up to date), atomic load/save, pruning |
 | `references/services.rs` | Image Builder, CloudFormation, Batch, EMR sources and their parsers |
 | `execute.rs` | execute phase, `send_with_retries`, retry classification |
 | `report.rs` | `Report` model built from `RegionPlan` (a decision + reason for every resource, savings estimate); renders the stdout summary, Markdown and JSON |
@@ -60,6 +61,7 @@ Per region, two phases:
 - **Execute re-checks with the same functions plan used** (`should_deregister_ami`, `snapshot_is_deletable`, `backup_recovery_point_deletion_tag_allows`). Add new eligibility rules to those functions rather than to one phase only.
 - **Every keep has a reason.** The policy rules return the first `KeepReason` that applies (`ami_keep_reason`, `snapshot_keep_reason`); `should_deregister_ami`/`snapshot_is_deletable` are thin wrappers so execute uses the same rules. Anything removed from a plan goes into `kept_amis`/`kept_snapshots` with a reason, so reports account for every owned resource.
 - **Read error codes, never `Display`.** `SdkError`'s `Display` is just "service error". Use `error.code()` to classify and `describe_sdk_error()` / `.aws_context("Op")` / `error_chain()` to build messages.
+- **The launch template cache only adds references.** Every cached version is replayed through `record()`; it stores raw image references (SSM resolved per run); `fetch_plan` falls back to `Full` on anything surprising; expiry (`--cache-max-age-days`) is what forgets deleted versions. Never let a cache entry suppress a fetched reference.
 - New reference sources belong in `ReferenceCollector`, must use SDK paginators (`into_paginator()`), and need a mock test plus a README IAM-permission entry, since a missing permission fails closed.
 
 ### Testing pattern

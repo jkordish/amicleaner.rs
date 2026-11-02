@@ -86,6 +86,7 @@ pub(crate) struct Settings {
     pub(crate) skipped_reference_sources: Vec<String>,
     pub(crate) snapshot_price_per_gb_month: f64,
     pub(crate) archive_price_per_gb_month: f64,
+    pub(crate) launch_template_cache: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -242,6 +243,7 @@ impl Settings {
             skipped_reference_sources: skipped,
             snapshot_price_per_gb_month: args.snapshot_price_per_gb_month,
             archive_price_per_gb_month: args.archive_price_per_gb_month,
+            launch_template_cache: !args.no_cache,
         }
     }
 }
@@ -683,6 +685,11 @@ fn write_settings_markdown(out: &mut String, settings: &Settings) {
         if settings.backup_recovery_point_deletes { "enabled" } else { "disabled" }
     );
     let _ = writeln!(out, "| Skipped reference sources | {} |", cell(&skipped));
+    let _ = writeln!(
+        out,
+        "| Launch template cache | {} |",
+        if settings.launch_template_cache { "enabled" } else { "disabled (--no-cache)" }
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "</details>");
     let _ = writeln!(out);

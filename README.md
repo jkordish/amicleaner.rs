@@ -40,7 +40,7 @@ Tags:
 
 ### IAM permissions
 
-Read (plan mode): `ec2:DescribeRegions`, `ec2:DescribeImages`, `ec2:DescribeImageAttribute`, `ec2:DescribeSnapshots`, `ec2:DescribeSnapshotAttribute`, `ec2:DescribeInstances`, `ec2:DescribeLaunchTemplates`, `ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeFleets`, `ec2:DescribeSpotFleetRequests`, `ec2:DescribeSpotInstanceRequests`, `autoscaling:DescribeAutoScalingGroups`, `autoscaling:DescribeLaunchConfigurations`, `ssm:GetParameter`, `backup:ListBackupVaults`, `backup:ListRecoveryPointsByBackupVault`.
+Read (plan mode): `ec2:DescribeRegions`, `ec2:DescribeImages`, `ec2:DescribeImageAttribute`, `ec2:DescribeSnapshots`, `ec2:DescribeSnapshotAttribute`, `ec2:DescribeInstances`, `ec2:DescribeLaunchTemplates`, `ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeFleets`, `ec2:DescribeSpotFleetRequests`, `ec2:DescribeSpotInstanceRequests`, `autoscaling:DescribeAutoScalingGroups`, `autoscaling:DescribeLaunchConfigurations`, `ssm:GetParameter`, `sts:GetCallerIdentity` (names the launch template cache; without it the cache is off), `backup:ListBackupVaults`, `backup:ListRecoveryPointsByBackupVault`.
 
 Read, per reference source (drop the ones you pass to `--skip-reference-sources`):
 
@@ -86,6 +86,19 @@ Every AWS request attempt has a deadline (`--request-timeout-secs`, default 60).
 
 Read-heavy steps run up to `--max-concurrency` requests at a time (default 8): launch template versions (a build account can have tens of thousands), CloudFormation templates, and the AMI/snapshot sharing lookups. Lower it if the account gets throttled. Mutations (deregister, delete) always run one at a time. A launch template deleted while the scan runs is skipped, since it can no longer launch anything.
 
+### launch template cache
+
+Reading every launch template version is usually the slowest step: a build account can have tens of thousands of versions, and EC2 can't filter them by image. A version never changes once it's created and version numbers are never reused, so amicleaner caches each version's image reference in `~/.cache/amicleaner/launch-templates-<account>-<region>.json` (or under `$XDG_CACHE_HOME`, or `--cache-dir`). Later runs fetch only versions newer than the cache, so after the first run this step takes seconds instead of minutes.
+
+The cache can only protect more AMIs, never fewer:
+
+- Every cached version still counts as a reference. Nothing in the cache removes one.
+- The raw image reference is stored, so `resolve:ssm:` parameters are resolved fresh on every run.
+- A version deleted since it was cached keeps its AMI until that template's next full rescan. That happens after `--cache-max-age-days` (default 7; 0 rescans every run).
+- Templates that no longer exist are dropped. A missing, corrupt or mismatched cache file only means a full scan, and a cache that can't be written is a warning.
+
+`--no-cache` reads everything and doesn't touch the cache.
+
 ## building
 
 This project targets:
@@ -118,10 +131,9 @@ Must have Docker installed and running. Checkout the [build.sh](build.sh) for wh
 ### help
 
 ```shell
-$ amicleaner --help
 Conservative EC2 AMI + EBS snapshot mark-and-sweep cleanup
 
-Usage: amicleaner [OPTIONS]
+Usage: amicleaner-plan [OPTIONS]
 
 Options:
       --execute
@@ -213,6 +225,17 @@ Options:
           Seconds before a single AWS request attempt is abandoned and retried. Protects against connections that a proxy drops without closing
           
           [default: 60]
+
+      --cache-dir <DIR>
+          Directory for the launch template version cache. Defaults to XDG_CACHE_HOME/amicleaner, else ~/.cache/amicleaner
+
+      --no-cache
+          Read every launch template version instead of only those newer than the local cache, and don't read or write the cache
+
+      --cache-max-age-days <DAYS>
+          Days a cached launch template stays trusted before all its versions are read again, which also forgets versions deleted since. 0 reads everything on every run
+          
+          [default: 7]
 
       --max-concurrency <MAX_CONCURRENCY>
           Maximum concurrent read requests per region (launch template versions, CloudFormation templates, permission lookups). Lower it if AWS throttles the account
