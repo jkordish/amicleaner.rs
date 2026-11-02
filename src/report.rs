@@ -51,6 +51,9 @@ fn round2(value: f64) -> f64 {
 /// Bumped when the JSON shape changes incompatibly.
 const SCHEMA_VERSION: u32 = 1;
 
+/// How many unresolved references the stdout summary lists.
+const UNRESOLVED_LIST_LIMIT: usize = 5;
+
 /// How many actions per kind the stdout summary lists before pointing at the report.
 const TEXT_LIST_LIMIT: usize = 10;
 
@@ -608,7 +611,7 @@ pub(crate) fn render_markdown(report: &Report) -> String {
             out,
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             region.region,
-            status_label(region.status),
+            region_status_label(region),
             region.counts.deregister_amis,
             region.counts.kept_amis,
             region.counts.delete_snapshots,
@@ -631,6 +634,14 @@ fn mode_title(mode: &str) -> &'static str {
         "plan" => "plan",
         "dry-run" => "dry run",
         _ => "execution report",
+    }
+}
+
+fn region_status_label(region: &RegionReport) -> &'static str {
+    if region.status == RegionStatus::Ok && !region.unresolved_references.is_empty() {
+        "⚠️ ok, references incomplete"
+    } else {
+        status_label(region.status)
     }
 }
 
@@ -686,7 +697,7 @@ fn tag_label(key: &str, value: &str) -> String {
 }
 
 fn write_region_markdown(out: &mut String, region: &RegionReport) {
-    let _ = writeln!(out, "## {} — {}", region.region, status_label(region.status));
+    let _ = writeln!(out, "## {} — {}", region.region, region_status_label(region));
     let _ = writeln!(out);
 
     if let Some(error) = &region.error {
@@ -905,6 +916,9 @@ fn cell(text: &str) -> String {
 pub(crate) fn render_region_text(region: &RegionReport) -> String {
     let mut out = String::new();
     let status = match region.status {
+        RegionStatus::Ok if !region.unresolved_references.is_empty() => {
+            console::style("ok (references incomplete)").yellow()
+        }
         RegionStatus::Ok => console::style("ok").green(),
         RegionStatus::Blocked => console::style("blocked").yellow(),
         RegionStatus::Failed => console::style("failed").red(),
@@ -942,6 +956,23 @@ pub(crate) fn render_region_text(region: &RegionReport) -> String {
 
     for reason in &region.blocked {
         let _ = writeln!(out, "  {} {reason}", console::style("blocked:").yellow());
+    }
+    if !region.unresolved_references.is_empty() {
+        let _ = writeln!(
+            out,
+            "  {} AMI references incomplete, so no AMI can be deregistered in this region:",
+            console::style("warning:").yellow()
+        );
+        for reference in region.unresolved_references.iter().take(UNRESOLVED_LIST_LIMIT) {
+            let _ = writeln!(out, "    {reference}");
+        }
+        if region.unresolved_references.len() > UNRESOLVED_LIST_LIMIT {
+            let _ = writeln!(
+                out,
+                "    … {} more (see --report)",
+                region.unresolved_references.len() - UNRESOLVED_LIST_LIMIT
+            );
+        }
     }
 
     for (title, action, decisions) in [

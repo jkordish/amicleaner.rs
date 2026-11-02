@@ -45,6 +45,7 @@ use crate::references::services::{
     OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids,
     find_ssm_dynamic_references, image_version_matches,
 };
+use crate::references::version_ranges;
 use crate::references::{
     AmiReferenceScan, ImageReferenceResolution, LaunchTemplateRef, ReferenceClients,
     ReferenceCollector, ReferenceSource, collect_referenced_ami_ids, extract_ssm_parameter_name,
@@ -2572,4 +2573,117 @@ fn report_flags_and_formatting_helpers() {
     assert_eq!(parse_log_level(Some("debug")), log::LevelFilter::Debug);
     assert_eq!(parse_log_level(Some("nonsense")), log::LevelFilter::Info);
     assert_eq!(parse_log_level(None), log::LevelFilter::Info);
+}
+
+#[test]
+fn launch_templates_are_split_into_version_ranges() {
+    assert_eq!(version_ranges(None), vec![(None, None)]);
+    assert_eq!(version_ranges(Some(200)), vec![(None, None)]);
+    assert_eq!(
+        version_ranges(Some(450)),
+        vec![(Some(1), Some(200)), (Some(201), Some(400)), (Some(401), None)],
+        "the last range is open-ended so versions created mid-scan are read"
+    );
+    assert_eq!(version_ranges(Some(400)), vec![(Some(1), Some(200)), (Some(201), None)]);
+    assert_eq!(version_ranges(Some(6551)).len(), 33);
+}
+
+fn big_template_rule(id: &'static str, latest: i64) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_launch_templates).then_output(move || {
+        ec2::operation::describe_launch_templates::DescribeLaunchTemplatesOutput::builder()
+            .launch_templates(
+                ec2::types::LaunchTemplate::builder()
+                    .launch_template_id(id)
+                    .latest_version_number(latest)
+                    .build(),
+            )
+            .build()
+    })
+}
+
+fn range_rule(min: &'static str, image_id: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_launch_template_versions)
+        .match_requests(move |request| request.min_version() == Some(min))
+        .then_output(move || {
+            ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder()
+                .launch_template_versions(
+                    ec2::types::LaunchTemplateVersion::builder()
+                        .launch_template_data(ec2::types::ResponseLaunchTemplateData::builder().image_id(image_id).build())
+                        .build(),
+                )
+                .build()
+        })
+}
+
+#[tokio::test]
+async fn every_version_range_of_a_big_template_is_read() {
+    let templates = big_template_rule("lt-0123456789abcdef0", 450);
+    let (first, second, last) =
+        (range_rule("1", AMI_A), range_rule("201", AMI_B), range_rule("401", AMI_C));
+    let ec2_client = mock_client!(
+        aws_sdk_ec2,
+        RuleMode::MatchAny,
+        [&templates, &first, &second, &last],
+        no_sdk_retries
+    );
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B, AMI_C]));
+    assert_eq!((first.num_calls(), second.num_calls(), last.num_calls()), (1, 1, 1));
+    assert!(collector.scanned_launch_templates.contains("lt-0123456789abcdef0"));
+}
+
+#[tokio::test]
+async fn template_deleted_in_any_range_is_not_marked_scanned() {
+    let templates = big_template_rule("lt-0123456789abcdef0", 450);
+    let first = range_rule("1", AMI_A);
+    let gone = mock!(ec2::Client::describe_launch_template_versions)
+        .match_requests(|request| request.min_version() != Some("1"))
+        .then_error(|| {
+            ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsError::generic(ec2_error(
+                "InvalidLaunchTemplateId.NotFound",
+                "gone",
+            ))
+        });
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &first, &gone], no_sdk_retries);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert!(
+        collector.scan.referenced_ami_ids.is_empty(),
+        "a deleted template can't launch anything"
+    );
+    assert!(collector.scan.unresolved_references.is_empty());
+    assert!(!collector.scanned_launch_templates.contains("lt-0123456789abcdef0"));
+}
+
+#[test]
+fn incomplete_references_are_called_out_even_when_nothing_was_cancelled() {
+    let args = test_args();
+    let old = Utc::now() - Duration::days(365);
+    // No delete tags, so nothing is cancelled and the region status stays ok.
+    let plan = plan(
+        &args,
+        vec![make_ami(AMI_A, old, &[], &[])],
+        Vec::new(),
+        &scan(
+            &[],
+            &["AMI reference scan failed: GetTemplate(x) failed: Throttling: Rate exceeded"],
+        ),
+    );
+    let region = RegionReport::from_plan(&plan, None, PRICING);
+    assert_eq!(region.status, RegionStatus::Ok);
+
+    let text = console::strip_ansi_codes(&render_region_text(&region)).to_string();
+    assert!(text.contains("ok (references incomplete)"), "{text}");
+    assert!(text.contains("Throttling: Rate exceeded"), "{text}");
+
+    let markdown = render_markdown(&Report::new(&args, Utc::now(), vec![region]));
+    assert!(markdown.contains("| us-east-1 | ⚠️ ok, references incomplete |"), "{markdown}");
 }

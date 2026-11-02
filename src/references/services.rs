@@ -10,6 +10,9 @@ use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
 use crate::inventory::is_ami_id;
 use crate::references::ReferenceCollector;
 
+/// Concurrent `GetTemplate` calls; CloudFormation throttles well below EC2's limits.
+const CLOUDFORMATION_CONCURRENCY: usize = 2;
+
 impl ReferenceCollector<'_> {
     /// Image Builder can launch an AMI as a recipe's parent image or as a container recipe's
     /// build instance.
@@ -118,13 +121,14 @@ impl ReferenceCollector<'_> {
             }
         }
 
-        // One GetTemplate per stack, `concurrency` at a time.
+        // One GetTemplate per stack. CloudFormation's API rate limits are far lower than EC2's
+        // (8 at a time got throttled in delta0), so it gets its own small cap.
         let templates = stream::iter(&stack_ids)
             .map(|stack_id| {
                 let request = client.get_template().stack_name(stack_id).send();
                 async move { request.await.aws_context(&format!("GetTemplate({stack_id})")) }
             })
-            .buffered(self.clients.concurrency)
+            .buffered(self.clients.concurrency.min(CLOUDFORMATION_CONCURRENCY))
             .collect::<Vec<_>>()
             .await;
 

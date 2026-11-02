@@ -268,22 +268,35 @@ impl ReferenceCollector<'_> {
                 let id = launch_template.launch_template_id().map(ToString::to_string);
                 let name = launch_template.launch_template_name().map(ToString::to_string);
                 if id.is_some() || name.is_some() {
-                    templates.push(LaunchTemplateRef {
+                    let template = LaunchTemplateRef {
                         launch_template_id: id,
                         launch_template_name: name,
                         version: None,
-                    });
+                    };
+                    templates.push((template, launch_template.latest_version_number()));
                 }
             }
         }
 
+        // A few templates hold most versions (6,500+ in a build account), so each template is
+        // split into version ranges that are fetched concurrently with everything else.
+        let chunks = templates
+            .iter()
+            .enumerate()
+            .flat_map(|(index, (_, latest))| {
+                version_ranges(*latest).into_iter().map(move |range| (index, range))
+            })
+            .collect::<Vec<_>>();
+
         let ec2_client = self.ec2;
         let phase = self.phase.as_ref();
         if let Some(phase) = phase {
-            phase.set_total(templates.len());
+            phase.set_total(chunks.len());
         }
-        let results = stream::iter(&templates)
-            .map(|template| launch_template_image_references(ec2_client, template))
+        let results = stream::iter(&chunks)
+            .map(|(index, range)| {
+                launch_template_image_references(ec2_client, &templates[*index].0, range)
+            })
             .buffered(self.clients.concurrency)
             .inspect(|_| {
                 if let Some(phase) = phase {
@@ -293,14 +306,36 @@ impl ReferenceCollector<'_> {
             .collect::<Vec<_>>()
             .await;
 
-        for (template, result) in templates.iter().zip(results) {
-            let Some(image_references) = result? else {
+        // Regroup per template: a template is only "scanned" if every range came back.
+        let mut per_template: Vec<Option<Vec<(String, String)>>> =
+            templates.iter().map(|_| Some(Vec::new())).collect();
+        for ((index, _), result) in chunks.iter().zip(results) {
+            match result? {
+                Some(references) => {
+                    if let Some(collected) = &mut per_template[*index] {
+                        collected.extend(references);
+                    }
+                }
+                None => per_template[*index] = None,
+            }
+        }
+
+        for ((template, _), references) in templates.iter().zip(per_template) {
+            let Some(references) = references else {
+                warn!(
+                    "launch template {} was deleted during the scan; ignoring it",
+                    template
+                        .launch_template_id
+                        .as_deref()
+                        .or(template.launch_template_name.as_deref())
+                        .unwrap_or("<unknown>")
+                );
                 continue;
             };
             self.scanned_launch_templates.extend(
                 template.launch_template_id.iter().chain(&template.launch_template_name).cloned(),
             );
-            for (image_reference, source) in image_references {
+            for (image_reference, source) in references {
                 self.record(&image_reference, &source).await;
             }
         }
@@ -569,12 +604,33 @@ impl ReferenceCollector<'_> {
     }
 }
 
-/// Image references in every version of one launch template. `None` when the template was deleted
-/// after it was listed: it can't launch anything any more, and build accounts churn templates
-/// constantly, so failing the whole scan over it would block AMI cleanup for no reason.
+/// Versions per range when splitting a launch template; matches the API's maximum page size.
+const VERSION_RANGE: i64 = 200;
+
+/// `(min_version, max_version)` ranges covering every version of a template. The last range is
+/// open-ended so versions created during the scan are still read; templates with no more than one
+/// range's worth of versions (or an unknown latest version) are fetched in one paginated call.
+pub(crate) fn version_ranges(latest_version: Option<i64>) -> Vec<(Option<i64>, Option<i64>)> {
+    let Some(latest) = latest_version.filter(|latest| *latest > VERSION_RANGE) else {
+        return vec![(None, None)];
+    };
+    let mut ranges = Vec::new();
+    let mut start = 1;
+    while start + VERSION_RANGE <= latest {
+        ranges.push((Some(start), Some(start + VERSION_RANGE - 1)));
+        start += VERSION_RANGE;
+    }
+    ranges.push((Some(start), None));
+    ranges
+}
+
+/// Image references in one version range of a launch template. `None` when the template was
+/// deleted after it was listed: it can't launch anything any more, and build accounts churn
+/// templates constantly, so failing the whole scan over it would block AMI cleanup for no reason.
 async fn launch_template_image_references(
     ec2_client: &ec2::Client,
     template: &LaunchTemplateRef,
+    (min_version, max_version): &(Option<i64>, Option<i64>),
 ) -> AppResult<Option<Vec<(String, String)>>> {
     let mut request = ec2_client.describe_launch_template_versions();
     if let Some(id) = &template.launch_template_id {
@@ -582,23 +638,19 @@ async fn launch_template_image_references(
     } else if let Some(name) = &template.launch_template_name {
         request = request.launch_template_name(name);
     }
+    if let Some(min_version) = min_version {
+        request = request.min_version(min_version.to_string());
+    }
+    if let Some(max_version) = max_version {
+        request = request.max_version(max_version.to_string());
+    }
 
     let mut image_references = Vec::new();
     let mut pages = request.into_paginator().page_size(200).send();
     while let Some(page) = pages.next().await {
         let output = match page {
             Ok(output) => output,
-            Err(error) if is_launch_template_not_found(error.code()) => {
-                warn!(
-                    "launch template {} was deleted during the scan; ignoring it",
-                    template
-                        .launch_template_id
-                        .as_deref()
-                        .or(template.launch_template_name.as_deref())
-                        .unwrap_or("<unknown>")
-                );
-                return Ok(None);
-            }
+            Err(error) if is_launch_template_not_found(error.code()) => return Ok(None),
             Err(error) => return Err(error).aws_context("DescribeLaunchTemplateVersions"),
         };
         image_references.extend(output.launch_template_versions().iter().filter_map(|version| {

@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use aws_config::BehaviorVersion;
+use aws_config::retry::RetryConfig;
 use aws_config::timeout::TimeoutConfig;
 use aws_sdk_backup as backup;
 use aws_sdk_ec2 as ec2;
@@ -144,6 +145,9 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
     Ok(outcome)
 }
 
+/// Attempts per AWS request (first try included) in the SDK's own retry layer.
+const SDK_MAX_ATTEMPTS: u32 = 6;
+
 /// SDK config with a deadline per request attempt. Without one, a request whose connection is
 /// dropped silently (e.g. by a TLS-inspecting proxy) waits forever instead of being retried by the
 /// SDK's standard retry strategy; a delta0 plan run sat idle for 20 minutes that way.
@@ -152,7 +156,10 @@ fn aws_config_loader(args: &Args) -> aws_config::ConfigLoader {
         .connect_timeout(Duration::from_secs(10))
         .operation_attempt_timeout(Duration::from_secs(args.request_timeout_secs))
         .build();
-    aws_config::defaults(BehaviorVersion::latest()).timeout_config(timeouts)
+    // Adaptive retry backs off client-side when AWS throttles (a throttled CloudFormation read
+    // failed a whole delta0 reference scan with the default 3 attempts).
+    let retries = RetryConfig::adaptive().with_max_attempts(SDK_MAX_ATTEMPTS);
+    aws_config::defaults(BehaviorVersion::latest()).timeout_config(timeouts).retry_config(retries)
 }
 
 fn inert_flag_warnings(args: &Args) -> Vec<&'static str> {
