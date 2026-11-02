@@ -863,8 +863,9 @@ async fn list_owned_amis(ec2_client: &ec2::Client) -> AppResult<Vec<AmiInfo>> {
     while let Some(page) = pages.next().await {
         let output = page.aws_context("DescribeImages")?;
         for image in output.images() {
+            // Skipping it would drop its snapshot references and make them look deletable.
             let Some(ami_id) = image.image_id() else {
-                continue;
+                return Err("DescribeImages returned an AMI without an image id".into());
             };
 
             let creation_date = image.creation_date().and_then(parse_aws_timestamp);

@@ -728,6 +728,29 @@ async fn inventory_errors_name_the_operation_and_code() {
     );
 }
 
+#[tokio::test]
+async fn ami_without_an_id_fails_the_inventory_instead_of_dropping_its_snapshot_refs() {
+    // Skipping it would leave its snapshots looking unreferenced, i.e. deletable.
+    let nameless = ec2::types::Image::builder()
+        .creation_date(old_timestamp())
+        .block_device_mappings(
+            ec2::types::BlockDeviceMapping::builder()
+                .ebs(
+                    ec2::types::EbsBlockDevice::builder()
+                        .snapshot_id("snap-0123456789abcdef0")
+                        .build(),
+                )
+                .build(),
+        )
+        .build();
+    let rule = images_rule(vec![nameless]);
+    let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&rule], no_sdk_retries);
+
+    let error = list_owned_amis(&client).await.unwrap_err();
+
+    assert!(error_chain(error.as_ref()).contains("without an image id"));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Reference collection (#9, #13, #15, #19)
 // ---------------------------------------------------------------------------------------------
