@@ -89,6 +89,7 @@ pub(crate) struct RegionPlan {
     pub(crate) region: String,
     pub(crate) owned_ami_count: usize,
     pub(crate) owned_snapshot_count: usize,
+    /// Owned AMIs that something references.
     pub(crate) referenced_ami_count: usize,
     pub(crate) unresolved_ami_references: Vec<String>,
     pub(crate) deregister_amis: Vec<AmiInfo>,

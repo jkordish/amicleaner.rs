@@ -2722,3 +2722,17 @@ async fn pinned_asg_template_version_is_fetched_without_a_page_size() {
         collector.scan.unresolved_references
     );
 }
+
+#[test]
+fn referenced_count_only_includes_owned_amis() {
+    let args = test_args();
+    let old = Utc::now() - Duration::days(365);
+    // AMI_B is referenced but owned by someone else (e.g. an AWS public AMI).
+    let plan = plan(
+        &args,
+        vec![make_ami(AMI_A, old, &[], &[])],
+        Vec::new(),
+        &scan(&[AMI_A, AMI_B], &[]),
+    );
+    assert_eq!(plan.referenced_ami_count, 1);
+}

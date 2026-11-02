@@ -254,7 +254,11 @@ pub(crate) fn plan_region(
         region: region.to_string(),
         owned_ami_count: owned_amis.len(),
         owned_snapshot_count: owned_snapshots.len(),
-        referenced_ami_count: referenced_ami_ids.len(),
+        // Owned AMIs only: the scan also sees AWS-owned and other accounts' AMIs.
+        referenced_ami_count: owned_amis
+            .iter()
+            .filter(|ami| referenced_ami_ids.contains(&ami.ami_id))
+            .count(),
         unresolved_ami_references,
         deregister_amis,
         snapshots_released_by_ami,
