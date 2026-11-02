@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Toolchain is pinned to Rust 1.93.1 (edition 2024) via `rust-toolchain.toml`.
+Toolchain is pinned to Rust 1.93.1 (edition 2024) via `rust-toolchain.toml`. `.cargo/config.toml` raises `RUST_MIN_STACK` because rustc overflows its stack on the generated AWS SDK code. rustc 1.93.1 also segfaults intermittently on this codebase; re-run the build, and `rm -rf target/debug/incremental` if it keeps happening.
 
 ```shell
 cargo build                      # debug build
@@ -28,7 +28,7 @@ Per region, two phases:
 
 1. **Plan**: `build_region_plan()` does the I/O, and `plan_region()` makes every decision as a pure function:
    - **Inventory:** `list_owned_amis()` / `list_owned_snapshots()`.
-   - **Mark:** `collect_referenced_ami_ids()` drives `ReferenceCollector`. It covers instances, launch-template versions, ASGs (including mixed-instances overrides), launch configurations, EC2 Fleets, Spot Fleets and Spot requests. Every image reference goes through `ReferenceCollector::record` → `resolve_image_reference`, which accepts only strict `ami-` ids or `resolve:ssm:` parameters that resolve to one. Anything else becomes "unresolved".
+   - **Mark:** `collect_referenced_ami_ids()` drives `ReferenceCollector`. It covers instances, launch-template versions, ASGs (including mixed-instances overrides), launch configurations, EC2 Fleets, Spot Fleets and Spot requests. It also covers four optional sources, all on by default and turned off with `--skip-reference-sources`: Image Builder (`classify_parent_image`; an own-account parent image ARN expands to every matching build's AMIs via `own_image_builder_amis`), CloudFormation (`find_ami_ids` and `find_ssm_dynamic_references` over templates and parameters), Batch, and EMR. Their clients live in `ReferenceClients` (`None` = skipped). Every image reference goes through `ReferenceCollector::record` → `resolve_image_reference`, which accepts only strict `ami-` ids or `resolve:ssm:` parameters that resolve to one. Anything else becomes "unresolved".
    - **Sweep:** `should_deregister_ami()` and `snapshot_is_deletable()` hold the eligibility rules. Sharing (`ExternalUse`) is looked up per candidate: launch permissions for AMIs (passed into `plan_region`) and create-volume permissions for snapshots (`apply_snapshot_external_use`, before the Backup classification). Shared resources are always kept, because AMIs are built in one account and shared to the accounts that run them. Deregistration does **not** delete snapshots; an AMI's snapshots are planned through the normal snapshot rules and recorded in `snapshots_released_by_ami`, so they inherit the AMI's delete authorization via `snapshot_deletion_authorized()`.
    - **Backup:** `list_ebs_recovery_points()` lists recovery points (I/O), then `classify_backup_snapshots()` decides (pure). It splits candidates into direct EC2 deletes, recovery-point deletes, and blocked snapshots. For EBS, the snapshot is the `RecoveryPointArn` (`ResourceArn` is the volume) and recovery-point tags are the snapshot's own EC2 tags, so there are no `ListTags` calls.
 2. **Execute**: `execute_region_plan()` runs only with `--execute`:

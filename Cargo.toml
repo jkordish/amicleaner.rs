@@ -18,7 +18,11 @@ path = "./src/main.rs"
 aws-config = { version = "1.8.18", features = ["behavior-version-latest"] }
 aws-sdk-autoscaling = { version = "1.121.0" }
 aws-sdk-backup = { version = "1.114.0" }
+aws-sdk-batch = { version = "1.118.0" }
+aws-sdk-cloudformation = { version = "1.117.0" }
 aws-sdk-ec2 = { version = "1.237.0" }
+aws-sdk-emr = { version = "1.114.0" }
+aws-sdk-imagebuilder = { version = "1.117.0" }
 aws-sdk-ssm = { version = "1.114.0" }
 aws-types = { version = "1.3.16" }
 chrono = { version = "0.4.45" }
@@ -43,6 +47,10 @@ opt-level = 3
 # test-util enables the mock_client! macro from aws-smithy-mocks.
 aws-sdk-autoscaling = { version = "1.121.0", features = ["test-util"] }
 aws-sdk-backup = { version = "1.114.0", features = ["test-util"] }
+aws-sdk-batch = { version = "1.118.0", features = ["test-util"] }
+aws-sdk-cloudformation = { version = "1.117.0", features = ["test-util"] }
 aws-sdk-ec2 = { version = "1.237.0", features = ["test-util"] }
+aws-sdk-emr = { version = "1.114.0", features = ["test-util"] }
+aws-sdk-imagebuilder = { version = "1.117.0", features = ["test-util"] }
 aws-sdk-ssm = { version = "1.114.0", features = ["test-util"] }
 aws-smithy-mocks = "0.2.6"

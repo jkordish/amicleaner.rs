@@ -5,6 +5,9 @@ use ec2::error::ErrorMetadata;
 
 const AMI_A: &str = "ami-0123456789abcdef0";
 const AMI_B: &str = "ami-0123456789abcdef1";
+const AMI_C: &str = "ami-0123456789abcdef2";
+const AMI_D: &str = "ami-0123456789abcdef3";
+const ACCOUNT: &str = "123456789012";
 const SNAP_A: &str = "snap-0123456789abcdef0";
 const SNAP_B: &str = "snap-0123456789abcdef1";
 const SNAP_C: &str = "snap-0123456789abcdef2";
@@ -756,15 +759,20 @@ async fn ami_without_an_id_fails_the_inventory_instead_of_dropping_its_snapshot_
 // Reference collection (#9, #13, #15, #19)
 // ---------------------------------------------------------------------------------------------
 
+/// Reference clients with only the always-on sources; the optional ones are skipped.
+fn reference_clients(asg: autoscaling::Client, ssm: ssm::Client) -> ReferenceClients {
+    ReferenceClients { asg, ssm, image_builder: None, cloudformation: None, batch: None, emr: None }
+}
+
 fn collector<'a>(
     ec2_client: &'a ec2::Client,
-    asg_client: &'a autoscaling::Client,
-    ssm_client: &'a ssm::Client,
+    clients: &'a ReferenceClients,
 ) -> ReferenceCollector<'a> {
     ReferenceCollector {
         ec2: ec2_client,
-        asg: asg_client,
-        ssm: ssm_client,
+        asg: &clients.asg,
+        ssm: &clients.ssm,
+        clients,
         ssm_cache: HashMap::new(),
         scan: AmiReferenceScan::default(),
     }
@@ -858,7 +866,8 @@ async fn missing_launch_template_is_ignored_but_other_errors_are_unresolved() {
     );
     let ssm_client =
         mock_client!(aws_sdk_ssm, RuleMode::MatchAny, Vec::<&aws_smithy_mocks::Rule>::new());
-    let mut collector = collector(&ec2_client, &asg_client, &ssm_client);
+    let clients = reference_clients(asg_client, ssm_client);
+    let mut collector = collector(&ec2_client, &clients);
 
     let template = |id: &str| LaunchTemplateRef {
         launch_template_id: Some(id.to_string()),
@@ -951,7 +960,8 @@ async fn fleets_and_spot_requests_reference_their_amis() {
     );
     let ssm_client =
         mock_client!(aws_sdk_ssm, RuleMode::MatchAny, Vec::<&aws_smithy_mocks::Rule>::new());
-    let mut collector = collector(&ec2_client, &asg_client, &ssm_client);
+    let clients = reference_clients(asg_client, ssm_client);
+    let mut collector = collector(&ec2_client, &clients);
 
     collector.collect_ec2_fleets().await.unwrap();
     collector.collect_spot_fleets().await.unwrap();
@@ -1168,9 +1178,8 @@ async fn dry_run_execution_deregisters_ami_then_frees_its_snapshot() {
 
     let summary = execute_region_plan(
         &ec2_client,
-        &empty_asg_client(),
         &no_backup_client(),
-        &no_ssm_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
         &plan,
         &args,
     )
@@ -1208,9 +1217,8 @@ async fn execution_recomputes_keep_latest_from_live_inventory() {
 
     let summary = execute_region_plan(
         &ec2_client,
-        &empty_asg_client(),
         &no_backup_client(),
-        &no_ssm_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
         &plan,
         &args,
     )
@@ -1240,9 +1248,8 @@ async fn every_planned_item_is_counted_when_live_inventory_is_empty() {
 
     let summary = execute_region_plan(
         &ec2_client,
-        &empty_asg_client(),
         &no_backup_client(),
-        &no_ssm_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
         &plan,
         &args,
     )
@@ -1274,9 +1281,8 @@ async fn failed_inventory_refresh_blocks_and_reports_the_error_code() {
 
     let summary = execute_region_plan(
         &ec2_client,
-        &empty_asg_client(),
         &no_backup_client(),
-        &no_ssm_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
         &plan,
         &args,
     )
@@ -1315,9 +1321,8 @@ async fn execute_recovery_point_plan(
 
     let summary = execute_region_plan(
         &ec2_client,
-        &empty_asg_client(),
         &backup_client,
-        &no_ssm_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
         &plan,
         &args,
     )
@@ -1436,9 +1441,8 @@ async fn execute_single_snapshot_delete(
 
     let summary = execute_region_plan(
         &ec2_client,
-        &empty_asg_client(),
         &no_backup_client(),
-        &no_ssm_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
         &plan,
         &args,
     )
@@ -1489,9 +1493,8 @@ async fn recovery_point_for_a_shared_snapshot_is_not_deleted() {
 
     let summary = execute_region_plan(
         &ec2_client,
-        &empty_asg_client(),
         &backup_client,
-        &no_ssm_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
         &plan,
         &args,
     )
@@ -1542,9 +1545,8 @@ async fn execution_time_safety_blocks_are_blocks_not_failures() {
 
     let summary = execute_region_plan(
         &ec2_client,
-        &empty_asg_client(),
         &no_backup_client(),
-        &no_ssm_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
         &plan,
         &args,
     )
@@ -1570,4 +1572,504 @@ fn exit_codes_distinguish_failures_from_safety_blocks() {
 
     outcome.failed_regions.push("us-east-1".to_string());
     assert_eq!(outcome.exit_code(), ExitCode::FAILURE);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Extra reference sources: Image Builder, CloudFormation, Batch, EMR (#19)
+// ---------------------------------------------------------------------------------------------
+
+fn referenced(collector: &ReferenceCollector<'_>) -> Vec<String> {
+    let mut ids = collector.scan.referenced_ami_ids.iter().cloned().collect::<Vec<String>>();
+    ids.sort_unstable();
+    ids
+}
+
+fn ids(values: &[&str]) -> Vec<String> {
+    values.iter().map(ToString::to_string).collect()
+}
+
+fn empty_ec2() -> ec2::Client {
+    mock_client!(
+        aws_sdk_ec2,
+        RuleMode::MatchAny,
+        Vec::<&aws_smithy_mocks::Rule>::new(),
+        no_sdk_retries
+    )
+}
+
+#[test]
+fn reference_sources_are_on_by_default_and_can_be_skipped() {
+    let config = SdkConfig::builder().behavior_version(BehaviorVersion::latest()).build();
+
+    let all = ReferenceClients::new(&config, &test_args().skip_reference_sources);
+    assert!(all.image_builder.is_some() && all.cloudformation.is_some());
+    assert!(all.batch.is_some() && all.emr.is_some());
+
+    let args =
+        Args::try_parse_from(["amicleaner", "--skip-reference-sources", "image-builder,emr"])
+            .unwrap();
+    let some = ReferenceClients::new(&config, &args.skip_reference_sources);
+    assert!(some.image_builder.is_none() && some.emr.is_none());
+    assert!(some.cloudformation.is_some() && some.batch.is_some());
+
+    assert!(Args::try_parse_from(["amicleaner", "--skip-reference-sources", "ec2"]).is_err());
+}
+
+#[test]
+fn image_builder_parent_images_are_classified() {
+    let own = |version: &str, build: Option<&str>| {
+        ParentImage::OwnImage(OwnImageBuilderImage {
+            name: "base".to_string(),
+            version: version.to_string(),
+            build: build.map(ToString::to_string),
+        })
+    };
+    let arn =
+        |owner: &str, rest: &str| format!("arn:aws:imagebuilder:us-east-1:{owner}:image/{rest}");
+
+    assert_eq!(
+        classify_parent_image(AMI_A, Some(ACCOUNT)),
+        ParentImage::Reference(AMI_A.to_string())
+    );
+    assert_eq!(
+        classify_parent_image("ssm:/golden/ami", Some(ACCOUNT)),
+        ParentImage::Reference("resolve:ssm:/golden/ami".to_string())
+    );
+    assert_eq!(classify_parent_image("prod-abc123", Some(ACCOUNT)), ParentImage::NotOwned);
+    assert_eq!(
+        classify_parent_image(&arn("aws", "amazon-linux-2023-x86/x.x.x"), Some(ACCOUNT)),
+        ParentImage::NotOwned
+    );
+    assert_eq!(
+        classify_parent_image(&arn("210987654321", "base/1.0.0"), Some(ACCOUNT)),
+        ParentImage::NotOwned
+    );
+    assert_eq!(
+        classify_parent_image(&arn(ACCOUNT, "base/x.x.x"), Some(ACCOUNT)),
+        own("x.x.x", None)
+    );
+    assert_eq!(
+        classify_parent_image(&arn(ACCOUNT, "base/1.2.3/4"), Some(ACCOUNT)),
+        own("1.2.3", Some("4"))
+    );
+    // Unknown recipe owner: assume it's ours, which keeps more.
+    assert_eq!(classify_parent_image(&arn(ACCOUNT, "base/1.2.3"), None), own("1.2.3", None));
+    for weird in [
+        "ami-123",
+        "arn:aws:ec2:us-east-1:123456789012:image/ami-1",
+        &arn(ACCOUNT, "base"),
+        "latest",
+    ] {
+        assert!(
+            matches!(classify_parent_image(weird, Some(ACCOUNT)), ParentImage::Unresolved(_)),
+            "{weird}"
+        );
+    }
+}
+
+#[test]
+fn image_versions_match_x_wildcards() {
+    assert!(image_version_matches("x.x.x", "1.2.3"));
+    assert!(image_version_matches("1.x.x", "1.9.0/3"));
+    assert!(image_version_matches("1.2.3", "1.2.3/1"));
+    assert!(!image_version_matches("1.x.x", "2.0.0"));
+    assert!(!image_version_matches("1.2.3", "1.2.4"));
+    assert!(
+        image_version_matches("1.2.3", "weird"),
+        "unparseable versions match (keeps more)"
+    );
+}
+
+#[test]
+fn ami_ids_and_ssm_references_are_found_in_templates() {
+    let template = r#"{"Mappings": {"R": {"us-east-1": {"Ami": "ami-0123456789ABCDEF0"}}},
+        "Image": "ami-12345678", "NotAnAmi": "ami-123", "Long": "ami-0123456789abcdef0123",
+        "Ssm": "{{resolve:ssm:/amis/app}}", "Versioned": "{{resolve:ssm:/amis/app:3}}",
+        "Secret": "{{resolve:ssm-secure:/db/password}}", "Broken": "{{resolve:ssm:"}"#;
+
+    assert_eq!(find_ami_ids(template), ids(&[AMI_A, "ami-12345678"]));
+    assert_eq!(find_ssm_dynamic_references(template), ids(&["/amis/app", "/amis/app:3"]));
+}
+
+#[tokio::test]
+async fn image_builder_recipes_reference_parents_and_builds_of_own_images() {
+    let own_parent = format!("arn:aws:imagebuilder:us-east-1:{ACCOUNT}:image/base/1.x.x");
+    let recipes = mock!(imagebuilder::Client::list_image_recipes).then_output(move || {
+        imagebuilder::operation::list_image_recipes::ListImageRecipesOutput::builder()
+            .image_recipe_summary_list(
+                imagebuilder::types::ImageRecipeSummary::builder()
+                    .owner(ACCOUNT)
+                    .parent_image(AMI_A)
+                    .build(),
+            )
+            .image_recipe_summary_list(
+                imagebuilder::types::ImageRecipeSummary::builder()
+                    .owner(ACCOUNT)
+                    .parent_image(own_parent.clone())
+                    .build(),
+            )
+            .image_recipe_summary_list(
+                imagebuilder::types::ImageRecipeSummary::builder()
+                    .owner(ACCOUNT)
+                    .parent_image(
+                        "arn:aws:imagebuilder:us-east-1:aws:image/amazon-linux-2023-x86/x.x.x",
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let versions = mock!(imagebuilder::Client::list_images).then_output(|| {
+        let version = |v: &str| {
+            imagebuilder::types::ImageVersion::builder()
+                .arn(format!("arn:aws:imagebuilder:us-east-1:{ACCOUNT}:image/base/{v}"))
+                .version(v)
+                .build()
+        };
+        imagebuilder::operation::list_images::ListImagesOutput::builder()
+            .image_version_list(version("1.0.0"))
+            .image_version_list(version("2.0.0"))
+            .build()
+    });
+    let builds = mock!(imagebuilder::Client::list_image_build_versions)
+        .match_requests(|request| request.image_version_arn().is_some_and(|arn| arn.ends_with("/1.0.0")))
+        .then_output(|| {
+            imagebuilder::operation::list_image_build_versions::ListImageBuildVersionsOutput::builder()
+                .image_summary_list(
+                    imagebuilder::types::ImageSummary::builder()
+                        .arn(format!("arn:aws:imagebuilder:us-east-1:{ACCOUNT}:image/base/1.0.0/1"))
+                        .output_resources(
+                            imagebuilder::types::OutputResources::builder()
+                                .amis(imagebuilder::types::Ami::builder().region("us-east-1").image(AMI_B).build())
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build()
+        });
+    let container_recipes = mock!(imagebuilder::Client::list_container_recipes).then_output(|| {
+        imagebuilder::operation::list_container_recipes::ListContainerRecipesOutput::builder()
+            .container_recipe_summary_list(
+                imagebuilder::types::ContainerRecipeSummary::builder()
+                    .arn("arn:aws:imagebuilder:us-east-1:123456789012:container-recipe/app/1.0.0")
+                    .owner(ACCOUNT)
+                    .build(),
+            )
+            .build()
+    });
+    let container_recipe = mock!(imagebuilder::Client::get_container_recipe).then_output(|| {
+        imagebuilder::operation::get_container_recipe::GetContainerRecipeOutput::builder()
+            .container_recipe(
+                imagebuilder::types::ContainerRecipe::builder()
+                    .instance_configuration(
+                        imagebuilder::types::InstanceConfiguration::builder().image(AMI_C).build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let image_builder = mock_client!(
+        aws_sdk_imagebuilder,
+        RuleMode::MatchAny,
+        [&recipes, &versions, &builds, &container_recipes, &container_recipe]
+    );
+    let ec2_client = empty_ec2();
+    let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+    clients.image_builder = Some(image_builder);
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_image_builder_recipes().await.unwrap();
+
+    assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B, AMI_C]), "2.0.0 doesn't match 1.x.x");
+    assert!(
+        collector.scan.unresolved_references.is_empty(),
+        "{:?}",
+        collector.scan.unresolved_references
+    );
+    assert_eq!(builds.num_calls(), 1);
+}
+
+#[tokio::test]
+async fn unreadable_reference_source_fails_the_scan() {
+    let denied = mock!(imagebuilder::Client::list_image_recipes).then_error(|| {
+        imagebuilder::operation::list_image_recipes::ListImageRecipesError::generic(ec2_error(
+            "AccessDeniedException",
+            "not authorized",
+        ))
+    });
+    let image_builder = mock_client!(aws_sdk_imagebuilder, RuleMode::MatchAny, [&denied]);
+    let ec2_client = empty_ec2();
+    let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+    clients.image_builder = Some(image_builder);
+    let mut collector = collector(&ec2_client, &clients);
+
+    let error = collector.collect_image_builder_recipes().await.unwrap_err();
+
+    assert!(error_chain(error.as_ref()).contains("ListImageRecipes failed: AccessDeniedException"));
+}
+
+fn ssm_parameter_rule(name: &'static str, value: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(ssm::Client::get_parameter)
+        .match_requests(move |request| request.name() == Some(name))
+        .then_output(move || {
+            ssm::operation::get_parameter::GetParameterOutput::builder()
+                .parameter(ssm::types::Parameter::builder().name(name).value(value).build())
+                .build()
+        })
+}
+
+#[tokio::test]
+async fn cloudformation_templates_and_parameters_reference_amis() {
+    let stacks = mock!(cloudformation::Client::describe_stacks).then_output(|| {
+        cloudformation::operation::describe_stacks::DescribeStacksOutput::builder()
+            .stacks(
+                cloudformation::types::Stack::builder()
+                    .stack_id("arn:aws:cloudformation:us-east-1:123456789012:stack/app/1")
+                    .parameters(
+                        cloudformation::types::Parameter::builder().parameter_value(AMI_A).build(),
+                    )
+                    .parameters(
+                        cloudformation::types::Parameter::builder()
+                            .parameter_value("/amis/base")
+                            .resolved_value(AMI_B)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let template = mock!(cloudformation::Client::get_template).then_output(|| {
+        cloudformation::operation::get_template::GetTemplateOutput::builder()
+            .template_body(format!(
+                "Resources:\n  Lt:\n    ImageId: {AMI_C}\n  Other:\n    ImageId: '{{{{resolve:ssm:/amis/app}}}}'\n    VpcId: '{{{{resolve:ssm:/config/vpc}}}}'\n"
+            ))
+            .build()
+    });
+    let cloudformation =
+        mock_client!(aws_sdk_cloudformation, RuleMode::MatchAny, [&stacks, &template]);
+    let app = ssm_parameter_rule("/amis/app", AMI_D);
+    let vpc = ssm_parameter_rule("/config/vpc", "vpc-0123456789abcdef0");
+    let ssm_client = mock_client!(aws_sdk_ssm, RuleMode::MatchAny, [&app, &vpc]);
+    let ec2_client = empty_ec2();
+    let mut clients = reference_clients(empty_asg_client(), ssm_client);
+    clients.cloudformation = Some(cloudformation);
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_cloudformation_stacks().await.unwrap();
+
+    assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B, AMI_C, AMI_D]));
+    assert!(
+        collector.scan.unresolved_references.is_empty(),
+        "a non-AMI parameter is fine: {:?}",
+        collector.scan.unresolved_references
+    );
+}
+
+#[tokio::test]
+async fn cloudformation_ssm_reference_that_fails_to_resolve_is_unresolved() {
+    let stacks = mock!(cloudformation::Client::describe_stacks).then_output(|| {
+        cloudformation::operation::describe_stacks::DescribeStacksOutput::builder()
+            .stacks(cloudformation::types::Stack::builder().stack_id("stack-1").build())
+            .build()
+    });
+    let template = mock!(cloudformation::Client::get_template).then_output(|| {
+        cloudformation::operation::get_template::GetTemplateOutput::builder()
+            .template_body("ImageId: '{{resolve:ssm:/amis/gone}}'")
+            .build()
+    });
+    let cloudformation =
+        mock_client!(aws_sdk_cloudformation, RuleMode::MatchAny, [&stacks, &template]);
+    let gone = mock!(ssm::Client::get_parameter).then_error(|| {
+        ssm::operation::get_parameter::GetParameterError::generic(ec2_error(
+            "AccessDeniedException",
+            "no",
+        ))
+    });
+    let ssm_client = mock_client!(aws_sdk_ssm, RuleMode::MatchAny, [&gone]);
+    let ec2_client = empty_ec2();
+    let mut clients = reference_clients(empty_asg_client(), ssm_client);
+    clients.cloudformation = Some(cloudformation);
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_cloudformation_stacks().await.unwrap();
+
+    assert_eq!(collector.scan.unresolved_references.len(), 1);
+    assert!(
+        collector.scan.unresolved_references.iter().all(|reason| reason.contains("/amis/gone"))
+    );
+}
+
+#[tokio::test]
+#[allow(deprecated)] // ComputeResource::image_id is deprecated but still used by older environments.
+async fn batch_compute_environments_reference_image_ids_and_overrides() {
+    let environments = mock!(batch::Client::describe_compute_environments).then_output(|| {
+        batch::operation::describe_compute_environments::DescribeComputeEnvironmentsOutput::builder(
+        )
+        .compute_environments(
+            batch::types::ComputeEnvironmentDetail::builder()
+                .compute_environment_name("legacy")
+                .compute_environment_arn(
+                    "arn:aws:batch:us-east-1:123456789012:compute-environment/legacy",
+                )
+                .compute_resources(
+                    batch::types::ComputeResource::builder()
+                        .image_id(AMI_A)
+                        .ec2_configuration(
+                            batch::types::Ec2Configuration::builder()
+                                .image_type("ECS_AL2")
+                                .image_id_override(AMI_B)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build(),
+        )
+        .build()
+    });
+    let batch_client = mock_client!(aws_sdk_batch, RuleMode::MatchAny, [&environments]);
+    let ec2_client = empty_ec2();
+    let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+    clients.batch = Some(batch_client);
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_batch_compute_environments().await.unwrap();
+
+    assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B]));
+}
+
+#[tokio::test]
+async fn emr_clusters_reference_cluster_group_and_fleet_amis() {
+    let clusters = mock!(emr::Client::list_clusters)
+        .match_requests(|request| {
+            // Only clusters that can still launch or scale; terminated ones can't.
+            request.cluster_states()
+                == [
+                    emr::types::ClusterState::Starting,
+                    emr::types::ClusterState::Bootstrapping,
+                    emr::types::ClusterState::Running,
+                    emr::types::ClusterState::Waiting,
+                ]
+        })
+        .then_output(|| {
+            emr::operation::list_clusters::ListClustersOutput::builder()
+                .clusters(emr::types::ClusterSummary::builder().id("j-GROUPS").build())
+                .clusters(emr::types::ClusterSummary::builder().id("j-FLEETS").build())
+                .build()
+        });
+    let group_cluster = mock!(emr::Client::describe_cluster)
+        .match_requests(|request| request.cluster_id() == Some("j-GROUPS"))
+        .then_output(|| {
+            emr::operation::describe_cluster::DescribeClusterOutput::builder()
+                .cluster(
+                    emr::types::Cluster::builder()
+                        .custom_ami_id(AMI_A)
+                        .instance_collection_type(emr::types::InstanceCollectionType::InstanceGroup)
+                        .build(),
+                )
+                .build()
+        });
+    let fleet_cluster = mock!(emr::Client::describe_cluster)
+        .match_requests(|request| request.cluster_id() == Some("j-FLEETS"))
+        .then_output(|| {
+            emr::operation::describe_cluster::DescribeClusterOutput::builder()
+                .cluster(
+                    emr::types::Cluster::builder()
+                        .instance_collection_type(emr::types::InstanceCollectionType::InstanceFleet)
+                        .build(),
+                )
+                .build()
+        });
+    let groups = mock!(emr::Client::list_instance_groups).then_output(|| {
+        emr::operation::list_instance_groups::ListInstanceGroupsOutput::builder()
+            .instance_groups(emr::types::InstanceGroup::builder().custom_ami_id(AMI_B).build())
+            .build()
+    });
+    let fleets = mock!(emr::Client::list_instance_fleets).then_output(|| {
+        emr::operation::list_instance_fleets::ListInstanceFleetsOutput::builder()
+            .instance_fleets(
+                emr::types::InstanceFleet::builder()
+                    .instance_type_specifications(
+                        emr::types::InstanceTypeSpecification::builder()
+                            .custom_ami_id(AMI_C)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let emr_client = mock_client!(
+        aws_sdk_emr,
+        RuleMode::MatchAny,
+        [&clusters, &group_cluster, &fleet_cluster, &groups, &fleets]
+    );
+    let ec2_client = empty_ec2();
+    let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+    clients.emr = Some(emr_client);
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_emr_clusters().await.unwrap();
+
+    assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B, AMI_C]));
+    assert_eq!(
+        (groups.num_calls(), fleets.num_calls()),
+        (1, 1),
+        "each cluster uses its own listing"
+    );
+}
+
+#[tokio::test]
+async fn full_reference_scan_reads_every_enabled_source() {
+    fn denied() -> ErrorMetadata {
+        ec2_error("AccessDeniedException", "not authorized")
+    }
+    let image_builder = mock!(imagebuilder::Client::list_image_recipes).then_error(|| {
+        imagebuilder::operation::list_image_recipes::ListImageRecipesError::generic(denied())
+    });
+    let cloudformation = mock!(cloudformation::Client::describe_stacks).then_error(|| {
+        cloudformation::operation::describe_stacks::DescribeStacksError::generic(denied())
+    });
+    let batch = mock!(batch::Client::describe_compute_environments).then_error(|| {
+        batch::operation::describe_compute_environments::DescribeComputeEnvironmentsError::generic(
+            denied(),
+        )
+    });
+    let emr = mock!(emr::Client::list_clusters)
+        .then_error(|| emr::operation::list_clusters::ListClustersError::generic(denied()));
+    let ec2_client = ec2_with(empty_reference_scan_rules(), &[]);
+
+    for (source, expected) in [
+        ("image-builder", "ListImageRecipes"),
+        ("cloudformation", "DescribeStacks"),
+        ("batch", "DescribeComputeEnvironments"),
+        ("emr", "ListClusters"),
+    ] {
+        let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+        match source {
+            "image-builder" => {
+                clients.image_builder =
+                    Some(mock_client!(aws_sdk_imagebuilder, RuleMode::MatchAny, [&image_builder]));
+            }
+            "cloudformation" => {
+                clients.cloudformation = Some(mock_client!(
+                    aws_sdk_cloudformation,
+                    RuleMode::MatchAny,
+                    [&cloudformation]
+                ));
+            }
+            "batch" => {
+                clients.batch = Some(mock_client!(aws_sdk_batch, RuleMode::MatchAny, [&batch]))
+            }
+            _ => clients.emr = Some(mock_client!(aws_sdk_emr, RuleMode::MatchAny, [&emr])),
+        }
+
+        let error = collect_referenced_ami_ids(&ec2_client, &clients).await.unwrap_err();
+        assert!(
+            error_chain(error.as_ref()).contains(expected),
+            "{source}: {}",
+            error_chain(error.as_ref())
+        );
+    }
+
+    // With every optional source skipped, the scan only reads EC2 and Auto Scaling.
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    assert!(collect_referenced_ami_ids(&ec2_client, &clients).await.is_ok());
 }

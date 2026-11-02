@@ -3,6 +3,7 @@
 Conservative EC2 AMI + EBS snapshot cleanup using a mark-and-sweep strategy:
 
 - Mark AMIs referenced by instances, launch templates, Auto Scaling groups and launch configurations, EC2 Fleets, Spot Fleets and open Spot requests (including `resolve:ssm:` image parameters).
+- Also mark AMIs used by EC2 Image Builder (recipe parent images, including every build of this account's own parent images, and container recipe build instances), CloudFormation (AMI ids and `{{resolve:ssm:...}}` references in stack templates and parameters), AWS Batch compute environments, and active EMR clusters. These are on by default; `--skip-reference-sources` turns individual ones off.
 - Mark snapshots referenced by AMIs that will remain registered.
 - Deregister only old, unreferenced, unprotected, tagged AMIs that aren't shared with other accounts.
 - Delete only old, unreferenced, unprotected, tagged snapshots that aren't shared with other accounts — including the snapshots of AMIs it deregisters.
@@ -40,6 +41,15 @@ Tags:
 ### IAM permissions
 
 Read (plan mode): `ec2:DescribeRegions`, `ec2:DescribeImages`, `ec2:DescribeImageAttribute`, `ec2:DescribeSnapshots`, `ec2:DescribeSnapshotAttribute`, `ec2:DescribeInstances`, `ec2:DescribeLaunchTemplates`, `ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeFleets`, `ec2:DescribeSpotFleetRequests`, `ec2:DescribeSpotInstanceRequests`, `autoscaling:DescribeAutoScalingGroups`, `autoscaling:DescribeLaunchConfigurations`, `ssm:GetParameter`, `backup:ListBackupVaults`, `backup:ListRecoveryPointsByBackupVault`.
+
+Read, per reference source (drop the ones you pass to `--skip-reference-sources`):
+
+| source | permissions |
+|---|---|
+| `image-builder` | `imagebuilder:ListImageRecipes`, `imagebuilder:ListContainerRecipes`, `imagebuilder:GetContainerRecipe`, `imagebuilder:ListImages`, `imagebuilder:ListImageBuildVersions` |
+| `cloudformation` | `cloudformation:DescribeStacks`, `cloudformation:GetTemplate` |
+| `batch` | `batch:DescribeComputeEnvironments` |
+| `emr` | `elasticmapreduce:ListClusters`, `elasticmapreduce:DescribeCluster`, `elasticmapreduce:ListInstanceGroups`, `elasticmapreduce:ListInstanceFleets` |
 
 Write (`--execute`): `ec2:DeregisterImage`, `ec2:DeleteSnapshot`, and `backup:DeleteRecoveryPoint` for `--execute-backup-recovery-point-deletes`.
 
@@ -87,40 +97,89 @@ Usage: amicleaner [OPTIONS]
 Options:
       --execute
           Execute deletions. Without this flag, the tool only prints a plan
+
       --dry-run
           Use AWS API dry-run checks when executing (requires --execute)
+
       --execute-backup-recovery-point-deletes
           Execute AWS Backup DeleteRecoveryPoint calls for backup-managed snapshots (requires --execute)
+
       --backup-delete-tag <BACKUP_DELETE_TAG>
-          Snapshot tag key required before its AWS Backup recovery point may be deleted [default: backup-cleanup]
+          Snapshot tag key required before its AWS Backup recovery point may be deleted
+          
+          [default: backup-cleanup]
+
       --backup-delete-tag-value <BACKUP_DELETE_TAG_VALUE>
-          Expected value for backup delete tag. Use empty string to allow any value [default: true]
+          Expected value for backup delete tag. Use empty string to allow any value
+          
+          [default: true]
+
       --allow-untagged-backup-recovery-points
           Permit deletion of AWS Backup recovery points whose snapshot lacks the backup delete tag
+
       --regions <REGIONS>
           Comma-separated list of regions. If omitted, all enabled account regions are scanned
+
       --min-age-days <MIN_AGE_DAYS>
-          Keep resources newer than this age in days [default: 14]
+          Keep resources newer than this age in days
+          
+          [default: 14]
+
       --ami-recent-launch-days <AMI_RECENT_LAUNCH_DAYS>
-          Keep AMIs launched within the last N days [default: 90]
+          Keep AMIs launched within the last N days
+          
+          [default: 90]
+
       --protect-tag <PROTECT_TAG>
-          Tag key that protects resources from deletion (matched case-insensitively) [default: DoNotDelete]
+          Tag key that protects resources from deletion (matched case-insensitively)
+          
+          [default: DoNotDelete]
+
       --protect-tag-value <PROTECT_TAG_VALUE>
-          Value the protect tag must have. Empty (the default) protects on key presence alone [default: ""]
+          Value the protect tag must have. Empty (the default) protects on key presence alone
+          
+          [default: ""]
+
       --delete-tag <DELETE_TAG>
-          Tag key required for deletion (unless --allow-untagged) [default: cleanup]
+          Tag key required for deletion (unless --allow-untagged)
+          
+          [default: cleanup]
+
       --delete-tag-value <DELETE_TAG_VALUE>
-          Expected value for delete tag. Use empty string to allow any value [default: true]
+          Expected value for delete tag. Use empty string to allow any value
+          
+          [default: true]
+
       --allow-untagged
           Permit deletion of untagged resources
+
       --keep-latest-per-family <KEEP_LATEST_PER_FAMILY>
-          Keep newest N AMIs per ImageFamily tag. When N > 0, AMIs without that tag are always kept [default: 0]
+          Keep newest N AMIs per ImageFamily tag. When N > 0, AMIs without that tag are always kept
+          
+          [default: 0]
+
+      --skip-reference-sources <SKIP_REFERENCE_SOURCES>
+          Comma-separated AMI reference sources to skip: image-builder, cloudformation, batch, emr. All are scanned by default; a source you can't read (e.g. missing IAM permission) blocks AMI deregistration rather than being ignored
+
+          Possible values:
+          - image-builder:  Image recipe parent images and container recipe build-instance AMIs
+          - cloudformation: AMI ids (and SSM dynamic references to AMIs) in stack templates and parameters
+          - batch:          Compute environment image ids and EC2 configuration overrides
+          - emr:            Custom AMIs of active clusters, instance groups and instance fleets
+
       --max-retries <MAX_RETRIES>
-          Retries after the first attempt when a mutating call hits throttling or a transient error [default: 2]
+          Retries after the first attempt when a mutating call hits throttling or a transient error
+          
+          [default: 2]
+
       --retry-delay-ms <RETRY_DELAY_MS>
-          Base delay in milliseconds between retries (doubles on each retry) [default: 1000]
+          Base delay in milliseconds between retries (doubles on each retry)
+          
+          [default: 1000]
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
+
   -V, --version
           Print version
 ```
