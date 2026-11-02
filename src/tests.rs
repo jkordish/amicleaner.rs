@@ -2687,3 +2687,38 @@ fn incomplete_references_are_called_out_even_when_nothing_was_cancelled() {
     let markdown = render_markdown(&Report::new(&args, Utc::now(), vec![region]));
     assert!(markdown.contains("| us-east-1 | ⚠️ ok, references incomplete |"), "{markdown}");
 }
+
+#[tokio::test]
+async fn pinned_asg_template_version_is_fetched_without_a_page_size() {
+    // EC2: "Maximum results filter is not applicable when given a list of versions."
+    let versions = mock!(ec2::Client::describe_launch_template_versions)
+        .match_requests(|request| {
+            request.versions() == ["$Latest".to_string()] && request.max_results().is_none()
+        })
+        .then_output(|| {
+            ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder()
+                .launch_template_versions(
+                    ec2::types::LaunchTemplateVersion::builder()
+                        .launch_template_data(ec2::types::ResponseLaunchTemplateData::builder().image_id(AMI_A).build())
+                        .build(),
+                )
+                .build()
+        });
+    let ec2_client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&versions], no_sdk_retries);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    let template = LaunchTemplateRef {
+        launch_template_id: Some("lt-0123456789abcdef0".to_string()),
+        launch_template_name: None,
+        version: Some("$Latest".to_string()),
+    };
+    collector.collect_launch_template_ref(Some("app"), &template).await;
+
+    assert_eq!(referenced(&collector), ids(&[AMI_A]));
+    assert!(
+        collector.scan.unresolved_references.is_empty(),
+        "{:?}",
+        collector.scan.unresolved_references
+    );
+}

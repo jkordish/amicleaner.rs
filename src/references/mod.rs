@@ -424,13 +424,16 @@ impl ReferenceCollector<'_> {
                 return;
             };
 
-        // No version means "all versions" here, which is the conservative reading.
-        if let Some(version) = launch_template_ref.version.as_deref() {
-            request = request.versions(version);
-        }
+        // No version means "all versions" here, which is the conservative reading. EC2 rejects a
+        // page size combined with an explicit version list (InvalidParameterCombination), so a
+        // pinned version is paginated without one.
+        let paginator = match launch_template_ref.version.as_deref() {
+            Some(version) => request.versions(version).into_paginator(),
+            None => request.into_paginator().page_size(100),
+        };
 
         let mut image_references = Vec::new();
-        let mut pages = request.into_paginator().page_size(100).send();
+        let mut pages = paginator.send();
         while let Some(page) = pages.next().await {
             match page {
                 Ok(output) => image_references.extend(
