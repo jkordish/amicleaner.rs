@@ -22,7 +22,23 @@ Running against AWS uses the default credential chain. Region auto-discovery (no
 
 ## Architecture
 
-All logic is in `src/main.rs`; tests are in `src/tests.rs` (`#[cfg(test)] mod tests;`). It is a conservative mark-and-sweep cleaner for **account-owned** AMIs, EBS snapshots, and AWS Backup EBS recovery points. Regions are processed sequentially; AWS calls within a region are sequential awaits.
+Source layout (everything is `pub(crate)` at most; tests live in `src/tests.rs`, declared from `main.rs`):
+
+| module | role |
+|---|---|
+| `main.rs` | `main`, `run` (per-region loop, exit code), region resolution, startup warnings |
+| `cli.rs` | clap `Args` and value parsers |
+| `model.rs` | data types: `AmiInfo`, `SnapshotInfo`, `RegionPlan`, `ExecutionSummary`, `ExternalUse`, `Cutoffs`, `RunOutcome`… |
+| `errors.rs` | `AppResult`, `error_chain`, `describe_sdk_error`, `AwsResultExt::aws_context` |
+| `inventory.rs` | owned AMI/snapshot listing, id/timestamp parsing, launch/create-volume permission lookups |
+| `policy.rs` | pure eligibility rules (tags, protection, keep-latest, `should_deregister_ami`, `snapshot_is_deletable`) |
+| `plan.rs` | `build_region_plan` (I/O) → `plan_region` (pure), `apply_snapshot_external_use`, `print_region_plan` |
+| `aws_backup.rs` | recovery-point listing and `classify_backup_snapshots` (named so it doesn't clash with the `backup` SDK alias) |
+| `references/mod.rs` | `ReferenceCollector` + EC2/ASG/SSM sources, `ReferenceClients`, `resolve_image_reference` |
+| `references/services.rs` | Image Builder, CloudFormation, Batch, EMR sources and their parsers |
+| `execute.rs` | execute phase, `send_with_retries`, retry classification |
+
+It is a conservative mark-and-sweep cleaner for **account-owned** AMIs, EBS snapshots, and AWS Backup EBS recovery points. Regions are processed sequentially; AWS calls within a region are sequential awaits.
 
 Per region, two phases:
 
@@ -49,6 +65,6 @@ AWS calls are tested with `aws-smithy-mocks` (`mock!` / `mock_client!`, `RuleMod
 
 ## Repo notes
 
-- The `amicleaner --help` block in `README.md` is pasted from the binary; regenerate it when flags change. Flag definitions and defaults are in the clap `Args` struct at the top of `src/main.rs`.
+- The `amicleaner --help` block in `README.md` is pasted from the binary; regenerate it when flags change. Flag definitions and defaults are in the clap `Args` struct in `src/cli.rs`.
 - `.clippy.toml` sets `cognitive-complexity-threshold`, but that lint isn't enabled by default, so it has no effect unless explicitly turned on.
 - `*.yml` is gitignored, which would block adding GitHub Actions workflows.

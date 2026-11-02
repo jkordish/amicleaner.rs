@@ -1,7 +1,53 @@
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::process::ExitCode;
+use std::time::Duration as StdDuration;
 
+use aws_config::BehaviorVersion;
+use aws_sdk_autoscaling as autoscaling;
+use aws_sdk_backup as backup;
+use aws_sdk_batch as batch;
+use aws_sdk_cloudformation as cloudformation;
+use aws_sdk_ec2 as ec2;
+use aws_sdk_emr as emr;
+use aws_sdk_imagebuilder as imagebuilder;
+use aws_sdk_ssm as ssm;
 use aws_smithy_mocks::{RuleMode, mock, mock_client};
+use aws_types::SdkConfig;
+use chrono::{DateTime, Duration, Utc};
+use clap::Parser;
 use ec2::error::ErrorMetadata;
+
+use super::{inert_flag_warnings, is_enabled_region, skipped_reference_sources_warning};
+use crate::aws_backup::{
+    apply_backup_classification, block_all_snapshot_deletions, classify_backup_snapshots,
+    snapshot_id_from_arn,
+};
+use crate::cli::{Args, parse_region};
+use crate::errors::error_chain;
+use crate::execute::{
+    execute_region_plan, is_retryable_code, retry_delay_for_attempt, send_with_retries,
+};
+use crate::inventory::{
+    ami_has_external_launch_permissions, is_ami_id, list_owned_amis, lookup_snapshot_external_use,
+};
+use crate::model::{
+    AmiInfo, EXIT_BLOCKED, ExecutionSummary, ExternalUse, LastLaunched, RecoveryPointRecord,
+    RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
+};
+use crate::plan::{apply_snapshot_external_use, plan_region};
+use crate::policy::{
+    backup_recovery_point_deletion_tag_allows, has_expected_tag, is_protected,
+    looks_backup_created, optional_expected_value, select_latest_ami_ids_by_family,
+};
+use crate::references::services::{
+    OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids,
+    find_ssm_dynamic_references, image_version_matches,
+};
+use crate::references::{
+    AmiReferenceScan, ImageReferenceResolution, LaunchTemplateRef, ReferenceClients,
+    ReferenceCollector, ReferenceSource, collect_referenced_ami_ids, extract_ssm_parameter_name,
+    resolve_image_reference,
+};
 
 const AMI_A: &str = "ami-0123456789abcdef0";
 const AMI_B: &str = "ami-0123456789abcdef1";
