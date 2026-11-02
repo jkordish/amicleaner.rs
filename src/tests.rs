@@ -67,7 +67,7 @@ fn plan(
     snapshots: Vec<SnapshotInfo>,
     scan: &AmiReferenceScan,
 ) -> RegionPlan {
-    plan_region(args, "us-east-1", Utc::now(), amis, snapshots, scan, &HashMap::new())
+    plan_region(args, "us-east-1", Utc::now(), &amis, &snapshots, scan, &HashMap::new())
 }
 
 fn ec2_error(code: &str, message: &str) -> ErrorMetadata {
@@ -371,8 +371,7 @@ fn shared_amis_are_kept_and_failed_lookups_block() {
         (AMI_B.to_string(), ExternalUse::Unknown("AccessDenied".to_string())),
     ]);
 
-    let plan =
-        plan_region(&args, "us-east-1", Utc::now(), amis, Vec::new(), &scan(&[], &[]), &external);
+    let plan = plan_region(&args, "us-east-1", Utc::now(), &amis, &[], &scan(&[], &[]), &external);
 
     assert!(plan.deregister_amis.is_empty());
     assert_eq!(plan.skipped_amis, 2);
@@ -770,8 +769,6 @@ fn collector<'a>(
 ) -> ReferenceCollector<'a> {
     ReferenceCollector {
         ec2: ec2_client,
-        asg: &clients.asg,
-        ssm: &clients.ssm,
         clients,
         ssm_cache: HashMap::new(),
         scan: AmiReferenceScan::default(),
@@ -2056,7 +2053,7 @@ async fn full_reference_scan_reads_every_enabled_source() {
                 ));
             }
             "batch" => {
-                clients.batch = Some(mock_client!(aws_sdk_batch, RuleMode::MatchAny, [&batch]))
+                clients.batch = Some(mock_client!(aws_sdk_batch, RuleMode::MatchAny, [&batch]));
             }
             _ => clients.emr = Some(mock_client!(aws_sdk_emr, RuleMode::MatchAny, [&emr])),
         }
@@ -2072,4 +2069,20 @@ async fn full_reference_scan_reads_every_enabled_source() {
     // With every optional source skipped, the scan only reads EC2 and Auto Scaling.
     let clients = reference_clients(empty_asg_client(), no_ssm_client());
     assert!(collect_referenced_ami_ids(&ec2_client, &clients).await.is_ok());
+}
+
+#[test]
+fn skipping_reference_sources_is_announced() {
+    assert_eq!(skipped_reference_sources_warning(&[]), None);
+
+    let warning = skipped_reference_sources_warning(&[
+        ReferenceSource::Emr,
+        ReferenceSource::ImageBuilder,
+        ReferenceSource::Emr,
+    ])
+    .unwrap();
+    assert!(
+        warning.starts_with("not scanning emr, image-builder for AMI references"),
+        "{warning}"
+    );
 }

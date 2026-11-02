@@ -418,6 +418,9 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
     for warning in inert_flag_warnings(args) {
         warn!("{warning}");
     }
+    if let Some(warning) = skipped_reference_sources_warning(&args.skip_reference_sources) {
+        warn!("{warning}");
+    }
 
     let shared_config = aws_config::defaults(BehaviorVersion::latest()).load().await;
     let home_ec2 = ec2::Client::new(&shared_config);
@@ -510,6 +513,23 @@ fn inert_flag_warnings(args: &Args) -> Vec<&'static str> {
     warnings
 }
 
+/// Skipping a reference source means AMIs it uses aren't protected, so say so on every run.
+fn skipped_reference_sources_warning(skipped: &[ReferenceSource]) -> Option<String> {
+    if skipped.is_empty() {
+        return None;
+    }
+    let mut names = skipped
+        .iter()
+        .filter_map(|source| source.to_possible_value().map(|value| value.get_name().to_string()))
+        .collect::<Vec<String>>();
+    names.sort_unstable();
+    names.dedup();
+    Some(format!(
+        "not scanning {} for AMI references (--skip-reference-sources); AMIs used only there are not protected",
+        names.join(", ")
+    ))
+}
+
 async fn resolve_regions(args: &Args, ec2_client: &ec2::Client) -> AppResult<Vec<String>> {
     if !args.regions.is_empty() {
         let mut regions = args.regions.clone();
@@ -595,8 +615,15 @@ async fn build_region_plan(
         }
     }
 
-    let mut plan =
-        plan_region(args, region, now, owned_amis, owned_snapshots, &reference_scan, &external_use);
+    let mut plan = plan_region(
+        args,
+        region,
+        now,
+        &owned_amis,
+        &owned_snapshots,
+        &reference_scan,
+        &external_use,
+    );
 
     // Snapshots shared to other accounts are kept, like shared AMIs. Checked before the Backup
     // classification so shared recovery-point snapshots are kept too.
@@ -627,21 +654,21 @@ fn plan_region(
     args: &Args,
     region: &str,
     now: DateTime<Utc>,
-    owned_amis: Vec<AmiInfo>,
-    owned_snapshots: Vec<SnapshotInfo>,
+    owned_amis: &[AmiInfo],
+    owned_snapshots: &[SnapshotInfo],
     reference_scan: &AmiReferenceScan,
     external_use: &HashMap<String, ExternalUse>,
 ) -> RegionPlan {
     let cutoffs = Cutoffs::new(args, now);
     let referenced_ami_ids = &reference_scan.referenced_ami_ids;
     let keep_latest_ami_ids =
-        select_latest_ami_ids_by_family(&owned_amis, args.keep_latest_per_family);
+        select_latest_ami_ids_by_family(owned_amis, args.keep_latest_per_family);
 
     let mut blocked = Vec::new();
     let mut deregister_amis = Vec::new();
     let mut skipped_amis = 0usize;
 
-    for ami in &owned_amis {
+    for ami in owned_amis {
         if !should_deregister_ami(ami, referenced_ami_ids, &keep_latest_ami_ids, cutoffs, args) {
             skipped_amis += 1;
             continue;
@@ -701,7 +728,7 @@ fn plan_region(
     let mut delete_snapshots = Vec::new();
     let mut skipped_snapshots = 0usize;
 
-    for snapshot in &owned_snapshots {
+    for snapshot in owned_snapshots {
         let released = snapshots_released_by_ami.contains_key(&snapshot.snapshot_id);
         if snapshot_is_deletable(
             snapshot,
@@ -1331,8 +1358,6 @@ async fn collect_referenced_ami_ids(
 ) -> AppResult<AmiReferenceScan> {
     let mut collector = ReferenceCollector {
         ec2: ec2_client,
-        asg: &reference_clients.asg,
-        ssm: &reference_clients.ssm,
         clients: reference_clients,
         ssm_cache: HashMap::new(),
         scan: AmiReferenceScan::default(),
@@ -1357,8 +1382,6 @@ async fn collect_referenced_ami_ids(
 /// resolved to a concrete AMI id is recorded as unresolved, which blocks AMI deregistration.
 struct ReferenceCollector<'a> {
     ec2: &'a ec2::Client,
-    asg: &'a autoscaling::Client,
-    ssm: &'a ssm::Client,
     clients: &'a ReferenceClients,
     ssm_cache: HashMap<String, Option<String>>,
     scan: AmiReferenceScan,
@@ -1366,7 +1389,8 @@ struct ReferenceCollector<'a> {
 
 impl ReferenceCollector<'_> {
     async fn record(&mut self, image_reference: &str) {
-        match resolve_image_reference(image_reference, self.ssm, &mut self.ssm_cache).await {
+        match resolve_image_reference(image_reference, &self.clients.ssm, &mut self.ssm_cache).await
+        {
             ImageReferenceResolution::Ami(ami_id) => {
                 self.scan.referenced_ami_ids.insert(ami_id);
             }
@@ -1446,7 +1470,7 @@ impl ReferenceCollector<'_> {
 
     async fn collect_auto_scaling_groups(&mut self) -> AppResult<()> {
         let mut group_pages =
-            self.asg.describe_auto_scaling_groups().into_paginator().page_size(100).send();
+            self.clients.asg.describe_auto_scaling_groups().into_paginator().page_size(100).send();
 
         while let Some(group_page) = group_pages.next().await {
             let output = group_page.aws_context("DescribeAutoScalingGroups")?;
@@ -1561,8 +1585,13 @@ impl ReferenceCollector<'_> {
     }
 
     async fn collect_launch_configurations(&mut self) -> AppResult<()> {
-        let mut pages =
-            self.asg.describe_launch_configurations().into_paginator().page_size(100).send();
+        let mut pages = self
+            .clients
+            .asg
+            .describe_launch_configurations()
+            .into_paginator()
+            .page_size(100)
+            .send();
 
         while let Some(page) = pages.next().await {
             let output = page.aws_context("DescribeLaunchConfigurations")?;
@@ -1862,7 +1891,7 @@ impl ReferenceCollector<'_> {
                             fleet_output
                                 .instance_fleets()
                                 .iter()
-                                .flat_map(|fleet| fleet.instance_type_specifications())
+                                .flat_map(emr::types::InstanceFleet::instance_type_specifications)
                                 .filter_map(|specification| specification.custom_ami_id())
                                 .map(ToString::to_string),
                         );
@@ -1898,7 +1927,7 @@ impl ReferenceCollector<'_> {
     /// Records any AMI ids an SSM parameter holds. Unlike `record`, a value that isn't an AMI is
     /// fine here (templates resolve all kinds of parameters); only a failed lookup is unresolved.
     async fn record_ssm_parameter_amis(&mut self, parameter: &str, stack_id: &str) {
-        match self.ssm.get_parameter().name(parameter).send().await {
+        match self.clients.ssm.get_parameter().name(parameter).send().await {
             Ok(output) => {
                 if let Some(value) = output.parameter().and_then(|parameter| parameter.value()) {
                     self.scan.referenced_ami_ids.extend(find_ami_ids(value));
@@ -2056,7 +2085,7 @@ async fn own_image_builder_amis(
                     build
                         .output_resources()
                         .into_iter()
-                        .flat_map(|resources| resources.amis())
+                        .flat_map(imagebuilder::types::OutputResources::amis)
                         .filter_map(|ami| ami.image())
                         .map(ToString::to_string),
                 );
@@ -2120,35 +2149,14 @@ async fn resolve_image_reference(
 
     let Some(parameter_name) = extract_ssm_parameter_name(image_reference) else {
         let reason = format!("unresolved image reference '{}'", image_reference.escape_debug());
-        warn!("{}", reason);
+        warn!("{reason}");
         return ImageReferenceResolution::Unresolved(reason);
     };
 
     let resolved_ami = match ssm_cache.get(&parameter_name) {
         Some(cached) => cached.clone(),
         None => {
-            let response = ssm_client.get_parameter().name(parameter_name.clone()).send().await;
-            let resolved_ami = match response {
-                Ok(output) => {
-                    let value = output.parameter().and_then(|parameter| parameter.value());
-                    let ami_id = value.filter(|value| is_ami_id(value)).map(ToString::to_string);
-                    if ami_id.is_none() {
-                        warn!(
-                            "SSM image parameter '{}' does not hold a single AMI id (value: {:?})",
-                            parameter_name, value
-                        );
-                    }
-                    ami_id
-                }
-                Err(error) => {
-                    warn!(
-                        "Failed to resolve SSM image parameter '{}': {}",
-                        parameter_name,
-                        describe_sdk_error(&error)
-                    );
-                    None
-                }
-            };
+            let resolved_ami = fetch_ssm_ami_id(ssm_client, &parameter_name).await;
             ssm_cache.insert(parameter_name.clone(), resolved_ami.clone());
             resolved_ami
         }
@@ -2157,9 +2165,32 @@ async fn resolve_image_reference(
     match resolved_ami {
         Some(ami_id) => ImageReferenceResolution::Ami(ami_id),
         None => ImageReferenceResolution::Unresolved(format!(
-            "failed to resolve SSM image parameter '{}'",
-            parameter_name
+            "failed to resolve SSM image parameter '{parameter_name}'"
         )),
+    }
+}
+
+/// Reads an SSM parameter that should hold exactly one AMI id. `None` (with a warning) when it
+/// can't be read or holds anything else.
+async fn fetch_ssm_ami_id(ssm_client: &ssm::Client, parameter_name: &str) -> Option<String> {
+    match ssm_client.get_parameter().name(parameter_name).send().await {
+        Ok(output) => {
+            let value = output.parameter().and_then(|parameter| parameter.value());
+            let ami_id = value.filter(|value| is_ami_id(value)).map(ToString::to_string);
+            if ami_id.is_none() {
+                warn!(
+                    "SSM image parameter '{parameter_name}' does not hold a single AMI id (value: {value:?})"
+                );
+            }
+            ami_id
+        }
+        Err(error) => {
+            warn!(
+                "Failed to resolve SSM image parameter '{parameter_name}': {}",
+                describe_sdk_error(&error)
+            );
+            None
+        }
     }
 }
 
@@ -2221,7 +2252,7 @@ fn print_region_plan(plan: &RegionPlan) {
     if !plan.unresolved_ami_references.is_empty() {
         println!("unresolved_ami_references:");
         for unresolved in plan.unresolved_ami_references.iter().take(20) {
-            println!("  {}", unresolved);
+            println!("  {unresolved}");
         }
         if plan.unresolved_ami_references.len() > 20 {
             println!(
@@ -2600,9 +2631,8 @@ where
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        let error = match send().await {
-            Ok(_) => return Ok(()),
-            Err(error) => error,
+        let Err(error) = send().await else {
+            return Ok(());
         };
 
         if dry_run && error.code() == Some(DRY_RUN_OPERATION) {
