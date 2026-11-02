@@ -19,6 +19,7 @@ dependencies = [
  "aws-types",
  "chrono",
  "clap",
+ "futures-util",
  "log",
  "simple_logger",
  "tokio",

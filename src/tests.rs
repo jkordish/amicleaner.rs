@@ -807,7 +807,15 @@ async fn ami_without_an_id_fails_the_inventory_instead_of_dropping_its_snapshot_
 
 /// Reference clients with only the always-on sources; the optional ones are skipped.
 fn reference_clients(asg: autoscaling::Client, ssm: ssm::Client) -> ReferenceClients {
-    ReferenceClients { asg, ssm, image_builder: None, cloudformation: None, batch: None, emr: None }
+    ReferenceClients {
+        asg,
+        ssm,
+        image_builder: None,
+        cloudformation: None,
+        batch: None,
+        emr: None,
+        concurrency: 4,
+    }
 }
 
 fn collector<'a>(
@@ -818,6 +826,7 @@ fn collector<'a>(
         ec2: ec2_client,
         clients,
         ssm_cache: HashMap::new(),
+        scanned_launch_templates: HashSet::new(),
         scan: AmiReferenceScan::default(),
     }
 }
@@ -1410,18 +1419,13 @@ async fn create_volume_permissions_mark_a_snapshot_as_shared() {
     let private = not_shared_snapshot_rule();
     let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&shared, &private], no_sdk_retries);
 
-    let external_use = lookup_snapshot_external_use(
-        &client,
-        &[make_snapshot(SNAP_A, Utc::now(), &[]), make_snapshot(SNAP_B, Utc::now(), &[])],
-    )
-    .await;
+    let external_use = lookup_snapshot_external_use(&client, &[SNAP_A, SNAP_B], 4).await;
 
     assert_eq!(external_use, HashMap::from([(SNAP_A.to_string(), ExternalUse::Shared)]));
 
     let failing = snapshot_permission_error_rule();
     let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&failing], no_sdk_retries);
-    let external_use =
-        lookup_snapshot_external_use(&client, &[make_snapshot(SNAP_A, Utc::now(), &[])]).await;
+    let external_use = lookup_snapshot_external_use(&client, &[SNAP_A], 4).await;
     assert!(
         matches!(external_use.get(SNAP_A), Some(ExternalUse::Unknown(reason)) if reason.contains("UnauthorizedOperation"))
     );
@@ -1646,14 +1650,14 @@ fn empty_ec2() -> ec2::Client {
 fn reference_sources_are_on_by_default_and_can_be_skipped() {
     let config = SdkConfig::builder().behavior_version(BehaviorVersion::latest()).build();
 
-    let all = ReferenceClients::new(&config, &test_args().skip_reference_sources);
+    let all = ReferenceClients::new(&config, &test_args().skip_reference_sources, 8);
     assert!(all.image_builder.is_some() && all.cloudformation.is_some());
     assert!(all.batch.is_some() && all.emr.is_some());
 
     let args =
         Args::try_parse_from(["amicleaner", "--skip-reference-sources", "image-builder,emr"])
             .unwrap();
-    let some = ReferenceClients::new(&config, &args.skip_reference_sources);
+    let some = ReferenceClients::new(&config, &args.skip_reference_sources, 8);
     assert!(some.image_builder.is_none() && some.emr.is_none());
     assert!(some.cloudformation.is_some() && some.batch.is_some());
 
@@ -2133,4 +2137,213 @@ fn skipping_reference_sources_is_announced() {
         warning.starts_with("not scanning emr, image-builder for AMI references"),
         "{warning}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Concurrency and launch template churn (delta0 plan run: a template deleted mid-scan failed it)
+// ---------------------------------------------------------------------------------------------
+
+fn launch_templates_rule(ids: &'static [&'static str]) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_launch_templates).then_output(move || {
+        let mut output =
+            ec2::operation::describe_launch_templates::DescribeLaunchTemplatesOutput::builder();
+        for id in ids {
+            output = output.launch_templates(
+                ec2::types::LaunchTemplate::builder().launch_template_id(*id).build(),
+            );
+        }
+        output.build()
+    })
+}
+
+fn template_versions_rule(id: &'static str, image_id: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_launch_template_versions)
+        .match_requests(move |request| request.launch_template_id() == Some(id))
+        .then_output(move || {
+            ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder()
+                .launch_template_versions(
+                    ec2::types::LaunchTemplateVersion::builder()
+                        .launch_template_id(id)
+                        .launch_template_data(ec2::types::ResponseLaunchTemplateData::builder().image_id(image_id).build())
+                        .build(),
+                )
+                .build()
+        })
+}
+
+fn template_versions_error_rule(id: &'static str, code: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_launch_template_versions)
+        .match_requests(move |request| request.launch_template_id() == Some(id))
+        .then_error(move || {
+            ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsError::generic(ec2_error(
+                code, "nope",
+            ))
+        })
+}
+
+#[tokio::test]
+async fn launch_template_deleted_during_the_scan_is_skipped() {
+    let templates = launch_templates_rule(&[
+        "lt-0123456789abcdef0",
+        "lt-0123456789abcdef1",
+        "lt-0123456789abcdef2",
+    ]);
+    let first = template_versions_rule("lt-0123456789abcdef0", AMI_A);
+    let gone =
+        template_versions_error_rule("lt-0123456789abcdef1", "InvalidLaunchTemplateId.NotFound");
+    let third = template_versions_rule("lt-0123456789abcdef2", AMI_B);
+    let ec2_client = mock_client!(
+        aws_sdk_ec2,
+        RuleMode::MatchAny,
+        [&templates, &first, &gone, &third],
+        no_sdk_retries
+    );
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+
+    assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B]));
+    assert!(collector.scan.unresolved_references.is_empty());
+    assert!(collector.scanned_launch_templates.contains("lt-0123456789abcdef0"));
+    assert!(
+        !collector.scanned_launch_templates.contains("lt-0123456789abcdef1"),
+        "not scanned, so an ASG ref is still checked"
+    );
+}
+
+#[tokio::test]
+async fn other_launch_template_errors_still_fail_the_scan() {
+    let templates = launch_templates_rule(&["lt-0123456789abcdef0"]);
+    let denied = template_versions_error_rule("lt-0123456789abcdef0", "UnauthorizedOperation");
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &denied], no_sdk_retries);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    let error = collector.collect_launch_templates().await.unwrap_err();
+
+    assert!(
+        error_chain(error.as_ref())
+            .contains("DescribeLaunchTemplateVersions failed: UnauthorizedOperation")
+    );
+}
+
+#[tokio::test]
+async fn auto_scaling_groups_reuse_fully_scanned_launch_templates() {
+    let templates = launch_templates_rule(&["lt-0123456789abcdef0"]);
+    let versions = template_versions_rule("lt-0123456789abcdef0", AMI_A);
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &versions], no_sdk_retries);
+    let groups = mock!(autoscaling::Client::describe_auto_scaling_groups).then_output(|| {
+        autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput::builder()
+            .auto_scaling_groups(
+                autoscaling::types::AutoScalingGroup::builder()
+                    .auto_scaling_group_name("app")
+                    .launch_template(
+                        autoscaling::types::LaunchTemplateSpecification::builder()
+                            .launch_template_id("lt-0123456789abcdef0")
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let asg_client = mock_client!(aws_sdk_autoscaling, RuleMode::MatchAny, [&groups]);
+    let clients = reference_clients(asg_client, no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+    collector.collect_auto_scaling_groups().await.unwrap();
+
+    assert_eq!(referenced(&collector), ids(&[AMI_A]));
+    assert_eq!(versions.num_calls(), 1, "the ASG pass doesn't fetch the template again");
+}
+
+#[test]
+fn max_concurrency_is_bounded() {
+    assert_eq!(test_args().max_concurrency, 8);
+    for bad in ["0", "65"] {
+        assert!(Args::try_parse_from(["amicleaner", "--max-concurrency", bad]).is_err(), "{bad}");
+    }
+    assert_eq!(
+        Args::try_parse_from(["amicleaner", "--max-concurrency", "64"]).unwrap().max_concurrency,
+        64
+    );
+}
+
+#[tokio::test]
+async fn auto_scaling_group_template_missed_by_the_full_scan_is_still_resolved() {
+    // The full scan listed no templates (e.g. it was created after listing); the ASG's ref must
+    // still be fetched and its AMI recorded.
+    let templates = launch_templates_rule(&[]);
+    let versions = template_versions_rule("lt-0123456789abcdef9", AMI_C);
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &versions], no_sdk_retries);
+    let groups = mock!(autoscaling::Client::describe_auto_scaling_groups).then_output(|| {
+        autoscaling::operation::describe_auto_scaling_groups::DescribeAutoScalingGroupsOutput::builder()
+            .auto_scaling_groups(
+                autoscaling::types::AutoScalingGroup::builder()
+                    .auto_scaling_group_name("late")
+                    .launch_template(
+                        autoscaling::types::LaunchTemplateSpecification::builder()
+                            .launch_template_id("lt-0123456789abcdef9")
+                            .version("$Latest")
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let asg_client = mock_client!(aws_sdk_autoscaling, RuleMode::MatchAny, [&groups]);
+    let clients = reference_clients(asg_client, no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_templates().await.unwrap();
+    collector.collect_auto_scaling_groups().await.unwrap();
+
+    assert_eq!(referenced(&collector), ids(&[AMI_C]));
+    assert_eq!(versions.num_calls(), 1);
+}
+
+#[tokio::test]
+async fn ami_shared_after_planning_is_not_deregistered() {
+    let mut args = test_args();
+    args.execute = true;
+    args.dry_run = true;
+    let old = Utc::now() - Duration::days(365);
+    let plan = plan(
+        &args,
+        vec![make_ami(AMI_A, old, &[("cleanup", "true")], &[])],
+        Vec::new(),
+        &scan(&[], &[]),
+    );
+    assert_eq!(plan.deregister_amis.len(), 1);
+
+    // Shared with a consumer account between plan and execute.
+    let shared = mock!(ec2::Client::describe_image_attribute).then_output(|| {
+        ec2::operation::describe_image_attribute::DescribeImageAttributeOutput::builder()
+            .launch_permissions(
+                ec2::types::LaunchPermission::builder().user_id("210987654321").build(),
+            )
+            .build()
+    });
+    let mut rules = vec![shared];
+    rules.extend(empty_reference_scan_rules());
+    let images = images_rule(vec![image(AMI_A, &[("cleanup", "true")], &[])]);
+    let deregister = deregister_dry_run_rule();
+    let ec2_client = ec2_with(rules, &[&images, &deregister]);
+
+    let summary = execute_region_plan(
+        &ec2_client,
+        &no_backup_client(),
+        &reference_clients(empty_asg_client(), no_ssm_client()),
+        &plan,
+        &args,
+    )
+    .await;
+
+    assert_eq!(deregister.num_calls(), 0);
+    assert_eq!(summary.skipped_amis, 1);
+    assert!(summary.failures.is_empty() && summary.blocked.is_empty());
 }

@@ -1,9 +1,11 @@
 //! Lists account-owned AMIs and snapshots and looks up who else can use them.
 
 use std::collections::HashMap;
+use std::future::Future;
 
 use aws_sdk_ec2 as ec2;
 use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, stream};
 use log::warn;
 
 use crate::errors::{AppResult, AwsResultExt, error_chain};
@@ -161,26 +163,56 @@ pub(crate) async fn snapshot_has_external_create_volume_permissions(
     Ok(!output.create_volume_permissions().is_empty())
 }
 
+/// Looks up, `concurrency` at a time, which AMIs grant launch permissions to anyone else.
+/// Unshared AMIs are absent from the result; a failed lookup is `ExternalUse::Unknown`.
+pub(crate) async fn lookup_ami_external_use(
+    ec2_client: &ec2::Client,
+    ami_ids: &[&str],
+    concurrency: usize,
+) -> HashMap<String, ExternalUse> {
+    lookup_external_use(ami_ids, concurrency, |ami_id| {
+        ami_has_external_launch_permissions(ec2_client, ami_id)
+    })
+    .await
+}
+
+/// Looks up, `concurrency` at a time, which snapshots grant create-volume permissions to anyone
+/// else. Unshared snapshots are absent from the result; a failed lookup is `ExternalUse::Unknown`.
 pub(crate) async fn lookup_snapshot_external_use(
     ec2_client: &ec2::Client,
-    snapshots: &[SnapshotInfo],
+    snapshot_ids: &[&str],
+    concurrency: usize,
 ) -> HashMap<String, ExternalUse> {
-    let mut external_use = HashMap::new();
-    for snapshot in snapshots {
-        match snapshot_has_external_create_volume_permissions(ec2_client, &snapshot.snapshot_id)
-            .await
-        {
-            Ok(false) => {}
-            Ok(true) => {
-                external_use.insert(snapshot.snapshot_id.clone(), ExternalUse::Shared);
+    lookup_external_use(snapshot_ids, concurrency, |snapshot_id| {
+        snapshot_has_external_create_volume_permissions(ec2_client, snapshot_id)
+    })
+    .await
+}
+
+async fn lookup_external_use<'a, F, Fut>(
+    ids: &[&'a str],
+    concurrency: usize,
+    is_shared: F,
+) -> HashMap<String, ExternalUse>
+where
+    F: Fn(&'a str) -> Fut,
+    Fut: Future<Output = AppResult<bool>>,
+{
+    stream::iter(ids.iter().copied())
+        .map(|id| {
+            let lookup = is_shared(id);
+            async move { (id, lookup.await) }
+        })
+        .buffered(concurrency.max(1))
+        .filter_map(|(id, result)| async move {
+            match result {
+                Ok(false) => None,
+                Ok(true) => Some((id.to_string(), ExternalUse::Shared)),
+                Err(error) => {
+                    Some((id.to_string(), ExternalUse::Unknown(error_chain(error.as_ref()))))
+                }
             }
-            Err(error) => {
-                external_use.insert(
-                    snapshot.snapshot_id.clone(),
-                    ExternalUse::Unknown(error_chain(error.as_ref())),
-                );
-            }
-        }
-    }
-    external_use
+        })
+        .collect()
+        .await
 }

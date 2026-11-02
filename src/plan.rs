@@ -1,11 +1,12 @@
 //! Builds a region plan: inventory and references (I/O), then decisions (pure `plan_region`).
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use aws_sdk_backup as backup;
 use aws_sdk_ec2 as ec2;
 use chrono::{DateTime, Utc};
-use log::warn;
+use log::{info, warn};
 
 use crate::aws_backup::{
     apply_backup_classification, block_all_snapshot_deletions, classify_backup_snapshots,
@@ -14,8 +15,7 @@ use crate::aws_backup::{
 use crate::cli::Args;
 use crate::errors::{AppResult, error_chain};
 use crate::inventory::{
-    ami_has_external_launch_permissions, list_owned_amis, list_owned_snapshots,
-    lookup_snapshot_external_use,
+    list_owned_amis, list_owned_snapshots, lookup_ami_external_use, lookup_snapshot_external_use,
 };
 use crate::model::{AmiInfo, Cutoffs, ExternalUse, LastLaunched, RegionPlan, SnapshotInfo};
 use crate::policy::{
@@ -33,8 +33,14 @@ pub(crate) async fn build_region_plan(
     let now = Utc::now();
     let owned_amis = list_owned_amis(ec2_client).await?;
     let owned_snapshots = list_owned_snapshots(ec2_client).await?;
+    info!(
+        "region {region}: {} owned AMIs, {} owned snapshots; scanning AMI references",
+        owned_amis.len(),
+        owned_snapshots.len()
+    );
 
     // A failed reference scan only blocks AMI deregistration; snapshot cleanup doesn't depend on it.
+    let started = Instant::now();
     let reference_scan = collect_referenced_ami_ids(ec2_client, reference_clients)
         .await
         .unwrap_or_else(|error| AmiReferenceScan {
@@ -45,33 +51,37 @@ pub(crate) async fn build_region_plan(
             )]),
         });
 
+    info!(
+        "region {region}: reference scan found {} referenced AMIs, {} unresolved references in {:.0?}",
+        reference_scan.referenced_ami_ids.len(),
+        reference_scan.unresolved_references.len(),
+        started.elapsed()
+    );
+
     // Launch permissions are looked up per candidate, so only bother when deregistration can happen.
+    let concurrency = usize::from(args.max_concurrency);
     let mut external_use = HashMap::new();
     if reference_scan.unresolved_references.is_empty() {
         let cutoffs = Cutoffs::new(args, now);
         let keep_latest = select_latest_ami_ids_by_family(&owned_amis, args.keep_latest_per_family);
-        for ami in owned_amis.iter().filter(|ami| {
-            should_deregister_ami(
-                ami,
-                &reference_scan.referenced_ami_ids,
-                &keep_latest,
-                cutoffs,
-                args,
-            )
-        }) {
-            match ami_has_external_launch_permissions(ec2_client, &ami.ami_id).await {
-                Ok(false) => {}
-                Ok(true) => {
-                    external_use.insert(ami.ami_id.clone(), ExternalUse::Shared);
-                }
-                Err(error) => {
-                    external_use.insert(
-                        ami.ami_id.clone(),
-                        ExternalUse::Unknown(error_chain(error.as_ref())),
-                    );
-                }
-            }
-        }
+        let candidates = owned_amis
+            .iter()
+            .filter(|ami| {
+                should_deregister_ami(
+                    ami,
+                    &reference_scan.referenced_ami_ids,
+                    &keep_latest,
+                    cutoffs,
+                    args,
+                )
+            })
+            .map(|ami| ami.ami_id.as_str())
+            .collect::<Vec<&str>>();
+        info!(
+            "region {region}: checking launch permissions of {} AMI candidates",
+            candidates.len()
+        );
+        external_use = lookup_ami_external_use(ec2_client, &candidates, concurrency).await;
     }
 
     let mut plan = plan_region(
@@ -86,8 +96,17 @@ pub(crate) async fn build_region_plan(
 
     // Snapshots shared to other accounts are kept, like shared AMIs. Checked before the Backup
     // classification so shared recovery-point snapshots are kept too.
+    let snapshot_ids = plan
+        .delete_snapshots
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id.as_str())
+        .collect::<Vec<_>>();
+    info!(
+        "region {region}: checking create-volume permissions of {} snapshot candidates",
+        snapshot_ids.len()
+    );
     let snapshot_external_use =
-        lookup_snapshot_external_use(ec2_client, &plan.delete_snapshots).await;
+        lookup_snapshot_external_use(ec2_client, &snapshot_ids, concurrency).await;
     apply_snapshot_external_use(&mut plan, &snapshot_external_use);
 
     if !plan.delete_snapshots.is_empty() {

@@ -15,7 +15,8 @@ use aws_sdk_ssm as ssm;
 use aws_types::SdkConfig;
 use clap::ValueEnum;
 use ec2::error::ProvideErrorMetadata;
-use log::warn;
+use futures_util::{StreamExt, stream};
+use log::{info, warn};
 
 use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
 use crate::inventory::is_ami_id;
@@ -42,10 +43,13 @@ pub(crate) struct ReferenceClients {
     pub(crate) cloudformation: Option<cloudformation::Client>,
     pub(crate) batch: Option<batch::Client>,
     pub(crate) emr: Option<emr::Client>,
+    /// Maximum concurrent requests for the fan-out lookups (launch template versions,
+    /// CloudFormation templates).
+    pub(crate) concurrency: usize,
 }
 
 impl ReferenceClients {
-    pub(crate) fn new(config: &SdkConfig, skip: &[ReferenceSource]) -> Self {
+    pub(crate) fn new(config: &SdkConfig, skip: &[ReferenceSource], concurrency: usize) -> Self {
         let enabled = |source| !skip.contains(&source);
         Self {
             asg: autoscaling::Client::new(config),
@@ -56,6 +60,7 @@ impl ReferenceClients {
                 .then(|| cloudformation::Client::new(config)),
             batch: enabled(ReferenceSource::Batch).then(|| batch::Client::new(config)),
             emr: enabled(ReferenceSource::Emr).then(|| emr::Client::new(config)),
+            concurrency: concurrency.max(1),
         }
     }
 }
@@ -87,6 +92,7 @@ pub(crate) async fn collect_referenced_ami_ids(
         ec2: ec2_client,
         clients: reference_clients,
         ssm_cache: HashMap::new(),
+        scanned_launch_templates: HashSet::new(),
         scan: AmiReferenceScan::default(),
     };
 
@@ -111,6 +117,8 @@ pub(crate) struct ReferenceCollector<'a> {
     pub(crate) ec2: &'a ec2::Client,
     pub(crate) clients: &'a ReferenceClients,
     pub(crate) ssm_cache: HashMap<String, Option<String>>,
+    /// Ids and names of launch templates whose versions were all recorded.
+    pub(crate) scanned_launch_templates: HashSet<String>,
     pub(crate) scan: AmiReferenceScan,
 }
 
@@ -159,36 +167,46 @@ impl ReferenceCollector<'_> {
         Ok(())
     }
 
+    /// Every version of every launch template, since any version can be launched by number.
+    /// Versions are fetched `concurrency` templates at a time (build accounts can have tens of
+    /// thousands of versions). Templates scanned here are remembered so the Auto Scaling pass
+    /// doesn't fetch them again.
     pub(crate) async fn collect_launch_templates(&mut self) -> AppResult<()> {
+        let mut templates = Vec::new();
         let mut template_pages =
-            self.ec2.describe_launch_templates().into_paginator().page_size(100).send();
-
+            self.ec2.describe_launch_templates().into_paginator().page_size(200).send();
         while let Some(template_page) = template_pages.next().await {
             let output = template_page.aws_context("DescribeLaunchTemplates")?;
             for launch_template in output.launch_templates() {
-                let mut request = self.ec2.describe_launch_template_versions();
-
-                if let Some(launch_template_id) = launch_template.launch_template_id() {
-                    request = request.launch_template_id(launch_template_id);
-                } else if let Some(launch_template_name) = launch_template.launch_template_name() {
-                    request = request.launch_template_name(launch_template_name);
-                } else {
-                    continue;
+                let id = launch_template.launch_template_id().map(ToString::to_string);
+                let name = launch_template.launch_template_name().map(ToString::to_string);
+                if id.is_some() || name.is_some() {
+                    templates.push(LaunchTemplateRef {
+                        launch_template_id: id,
+                        launch_template_name: name,
+                        version: None,
+                    });
                 }
+            }
+        }
 
-                let mut version_pages = request.into_paginator().page_size(100).send();
-                while let Some(version_page) = version_pages.next().await {
-                    let version_output =
-                        version_page.aws_context("DescribeLaunchTemplateVersions")?;
-                    for version in version_output.launch_template_versions() {
-                        if let Some(image_reference) = version
-                            .launch_template_data()
-                            .and_then(|launch_template_data| launch_template_data.image_id())
-                        {
-                            self.record(image_reference).await;
-                        }
-                    }
-                }
+        info!("scanning every version of {} launch templates", templates.len());
+        let ec2_client = self.ec2;
+        let results = stream::iter(&templates)
+            .map(|template| launch_template_image_references(ec2_client, template))
+            .buffered(self.clients.concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (template, result) in templates.iter().zip(results) {
+            let Some(image_references) = result? else {
+                continue;
+            };
+            self.scanned_launch_templates.extend(
+                template.launch_template_id.iter().chain(&template.launch_template_name).cloned(),
+            );
+            for image_reference in image_references {
+                self.record(&image_reference).await;
             }
         }
 
@@ -235,6 +253,15 @@ impl ReferenceCollector<'_> {
                 }
 
                 for template_ref in &template_refs {
+                    let already_scanned = template_ref
+                        .launch_template_id
+                        .iter()
+                        .chain(&template_ref.launch_template_name)
+                        .any(|key| self.scanned_launch_templates.contains(key));
+                    if already_scanned {
+                        // collect_launch_templates already recorded every version of it.
+                        continue;
+                    }
                     self.collect_launch_template_ref(group.auto_scaling_group_name(), template_ref)
                         .await;
                 }
@@ -430,6 +457,51 @@ impl ReferenceCollector<'_> {
     }
 }
 
+/// Image references in every version of one launch template. `None` when the template was deleted
+/// after it was listed: it can't launch anything any more, and build accounts churn templates
+/// constantly, so failing the whole scan over it would block AMI cleanup for no reason.
+async fn launch_template_image_references(
+    ec2_client: &ec2::Client,
+    template: &LaunchTemplateRef,
+) -> AppResult<Option<Vec<String>>> {
+    let mut request = ec2_client.describe_launch_template_versions();
+    if let Some(id) = &template.launch_template_id {
+        request = request.launch_template_id(id);
+    } else if let Some(name) = &template.launch_template_name {
+        request = request.launch_template_name(name);
+    }
+
+    let mut image_references = Vec::new();
+    let mut pages = request.into_paginator().page_size(200).send();
+    while let Some(page) = pages.next().await {
+        let output = match page {
+            Ok(output) => output,
+            Err(error) if is_launch_template_not_found(error.code()) => {
+                warn!(
+                    "launch template {} was deleted during the scan; ignoring it",
+                    template
+                        .launch_template_id
+                        .as_deref()
+                        .or(template.launch_template_name.as_deref())
+                        .unwrap_or("<unknown>")
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(error).aws_context("DescribeLaunchTemplateVersions"),
+        };
+        image_references.extend(
+            output
+                .launch_template_versions()
+                .iter()
+                .filter_map(|version| {
+                    version.launch_template_data().and_then(|data| data.image_id())
+                })
+                .map(ToString::to_string),
+        );
+    }
+    Ok(Some(image_references))
+}
+
 fn is_launch_template_not_found(code: Option<&str>) -> bool {
     code.is_some_and(|code| code.starts_with("InvalidLaunchTemplate") && code.contains("NotFound"))
 }
@@ -468,10 +540,7 @@ pub(crate) async fn resolve_image_reference(
 
 /// Reads an SSM parameter that should hold exactly one AMI id. `None` (with a warning) when it
 /// can't be read or holds anything else.
-async fn fetch_ssm_ami_id(
-    ssm_client: &ssm::Client,
-    parameter_name: &str,
-) -> Option<String> {
+async fn fetch_ssm_ami_id(ssm_client: &ssm::Client, parameter_name: &str) -> Option<String> {
     match ssm_client.get_parameter().name(parameter_name).send().await {
         Ok(output) => {
             let value = output.parameter().and_then(|parameter| parameter.value());

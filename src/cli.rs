@@ -90,6 +90,11 @@ pub(crate) struct Args {
     #[arg(long, value_enum, value_delimiter = ',')]
     pub(crate) skip_reference_sources: Vec<ReferenceSource>,
 
+    /// Maximum concurrent read requests per region (launch template versions, CloudFormation
+    /// templates, permission lookups). Lower it if AWS throttles the account.
+    #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub(crate) max_concurrency: u16,
+
     /// Retries after the first attempt when a mutating call hits throttling or a transient error.
     #[arg(long, default_value_t = 2)]
     pub(crate) max_retries: u32,

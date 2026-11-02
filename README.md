@@ -57,6 +57,8 @@ A missing read permission fails closed: AMI deregistrations or snapshot deletion
 
 Set `RUST_LOG=debug|info|warn|error` to change log verbosity.
 
+Read-heavy steps run up to `--max-concurrency` requests at a time (default 8): launch template versions (a build account can have tens of thousands), CloudFormation templates, and the AMI/snapshot sharing lookups. Lower it if the account gets throttled. Mutations (deregister, delete) always run one at a time. A launch template deleted while the scan runs is skipped, since it can no longer launch anything.
+
 ## building
 
 This project targets:
@@ -166,6 +168,11 @@ Options:
           - cloudformation: AMI ids (and SSM dynamic references to AMIs) in stack templates and parameters
           - batch:          Compute environment image ids and EC2 configuration overrides
           - emr:            Custom AMIs of active clusters, instance groups and instance fleets
+
+      --max-concurrency <MAX_CONCURRENCY>
+          Maximum concurrent read requests per region (launch template versions, CloudFormation templates, permission lookups). Lower it if AWS throttles the account
+          
+          [default: 8]
 
       --max-retries <MAX_RETRIES>
           Retries after the first attempt when a mutating call hits throttling or a transient error

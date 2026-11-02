@@ -38,7 +38,7 @@ Source layout (everything is `pub(crate)` at most; tests live in `src/tests.rs`,
 | `references/services.rs` | Image Builder, CloudFormation, Batch, EMR sources and their parsers |
 | `execute.rs` | execute phase, `send_with_retries`, retry classification |
 
-It is a conservative mark-and-sweep cleaner for **account-owned** AMIs, EBS snapshots, and AWS Backup EBS recovery points. Regions are processed sequentially; AWS calls within a region are sequential awaits.
+It is a conservative mark-and-sweep cleaner for **account-owned** AMIs, EBS snapshots, and AWS Backup EBS recovery points. Regions are processed sequentially. Within a region, fan-out reads (launch template versions, CloudFormation templates, sharing lookups) use `futures_util` `buffered(--max-concurrency)`, which keeps results in input order without spawning tasks; mutations are always sequential. Execute prefetches sharing for the still-eligible items right before its mutation loop.
 
 Per region, two phases:
 

@@ -14,10 +14,12 @@ use ec2::error::{ProvideErrorMetadata, SdkError};
 use crate::cli::Args;
 use crate::errors::{describe_sdk_error, error_chain};
 use crate::inventory::{
-    ami_has_external_launch_permissions, list_owned_amis, list_owned_snapshots,
-    snapshot_has_external_create_volume_permissions,
+    list_owned_amis, list_owned_snapshots, lookup_ami_external_use, lookup_snapshot_external_use,
 };
-use crate::model::{AmiInfo, Cutoffs, ExecutionSummary, RegionPlan, RetryPolicy, SnapshotInfo};
+use crate::model::{
+    AmiInfo, BackupRecoveryPoint, Cutoffs, ExecutionSummary, ExternalUse, RegionPlan, RetryPolicy,
+    SnapshotInfo,
+};
 use crate::policy::{
     backup_recovery_point_deletion_tag_allows, looks_backup_created,
     select_latest_ami_ids_by_family, should_deregister_ami, snapshot_is_deletable,
@@ -153,27 +155,35 @@ async fn execute_ami_deregistrations(
         .collect::<HashMap<&str, &AmiInfo>>();
     let retry_policy = RetryPolicy::from_args(args);
 
+    let mut eligible = Vec::new();
     for ami in &plan.deregister_amis {
         let still_eligible = current_by_id.get(ami.ami_id.as_str()).is_some_and(|current| {
             should_deregister_ami(current, &references, &keep_latest, cutoffs, args)
         });
-        if !still_eligible {
+        if still_eligible {
+            eligible.push(ami);
+        } else {
             summary.skipped_amis += 1;
-            continue;
         }
+    }
 
-        match ami_has_external_launch_permissions(ec2_client, &ami.ami_id).await {
-            Ok(false) => {}
-            Ok(true) => {
+    // Prefetched right before the deregistration loop, concurrently; the mutations stay sequential.
+    let eligible_ids = eligible.iter().map(|ami| ami.ami_id.as_str()).collect::<Vec<&str>>();
+    let external_use =
+        lookup_ami_external_use(ec2_client, &eligible_ids, usize::from(args.max_concurrency)).await;
+
+    for ami in eligible {
+        match external_use.get(&ami.ami_id) {
+            None => {}
+            Some(ExternalUse::Shared) => {
                 summary.skipped_amis += 1;
                 continue;
             }
-            Err(error) => {
+            Some(ExternalUse::Unknown(reason)) => {
                 summary.skipped_amis += 1;
                 summary.blocked.push(format!(
                     "skipped {}: launch permission check failed: {}",
-                    ami.ami_id,
-                    error_chain(error.as_ref())
+                    ami.ami_id, reason
                 ));
                 continue;
             }
@@ -268,12 +278,46 @@ async fn execute_snapshot_deletions(
     };
     let retry_policy = RetryPolicy::from_args(args);
 
-    for snapshot in &plan.delete_snapshots {
-        let deletable = still_deletable(&snapshot.snapshot_id).is_some_and(|current| {
-            !looks_backup_created(&current.tags, current.description.as_deref())
-        });
-        if !deletable || !snapshot_still_unshared(ec2_client, &snapshot.snapshot_id, summary).await
-        {
+    let direct_deletes = plan
+        .delete_snapshots
+        .iter()
+        .filter(|snapshot| {
+            still_deletable(&snapshot.snapshot_id).is_some_and(|current| {
+                !looks_backup_created(&current.tags, current.description.as_deref())
+            })
+        })
+        .collect::<Vec<&SnapshotInfo>>();
+    summary.skipped_snapshots += plan.delete_snapshots.len() - direct_deletes.len();
+
+    // The recovery point *is* the snapshot, so it gets the same live checks as a direct delete
+    // plus the backup delete tag (read from the snapshot's current tags).
+    let recovery_point_deletes = if args.execute_backup_recovery_point_deletes {
+        plan.delete_backup_recovery_points
+            .iter()
+            .filter(|recovery_point| {
+                still_deletable(&recovery_point.snapshot_id).is_some_and(|current| {
+                    backup_recovery_point_deletion_tag_allows(&current.tags, args)
+                })
+            })
+            .collect::<Vec<&BackupRecoveryPoint>>()
+    } else {
+        Vec::new()
+    };
+    summary.skipped_backup_recovery_points +=
+        plan.delete_backup_recovery_points.len() - recovery_point_deletes.len();
+
+    // Sharing is prefetched right before the deletion loops, concurrently; deletes stay sequential.
+    let snapshot_ids = direct_deletes
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id.as_str())
+        .chain(recovery_point_deletes.iter().map(|point| point.snapshot_id.as_str()))
+        .collect::<Vec<&str>>();
+    let external_use =
+        lookup_snapshot_external_use(ec2_client, &snapshot_ids, usize::from(args.max_concurrency))
+            .await;
+
+    for snapshot in direct_deletes {
+        if !snapshot_unshared(&external_use, &snapshot.snapshot_id, summary) {
             summary.skipped_snapshots += 1;
             continue;
         }
@@ -295,20 +339,9 @@ async fn execute_snapshot_deletions(
         }
     }
 
-    if !args.execute_backup_recovery_point_deletes {
-        summary.skipped_backup_recovery_points += plan.delete_backup_recovery_points.len();
-        return;
-    }
-
-    for recovery_point in &plan.delete_backup_recovery_points {
-        // The recovery point *is* the snapshot, so it gets the same live checks as a direct delete
-        // plus the backup delete tag (read from the snapshot's current tags).
-        let deletable = still_deletable(&recovery_point.snapshot_id)
-            .is_some_and(|current| backup_recovery_point_deletion_tag_allows(&current.tags, args))
-            && snapshot_still_unshared(ec2_client, &recovery_point.snapshot_id, summary).await;
-
+    for recovery_point in recovery_point_deletes {
         // AWS Backup has no dry-run mode, so dry runs stop after the checks.
-        if !deletable || args.dry_run {
+        if !snapshot_unshared(&external_use, &recovery_point.snapshot_id, summary) || args.dry_run {
             summary.skipped_backup_recovery_points += 1;
             continue;
         }
@@ -332,19 +365,19 @@ async fn execute_snapshot_deletions(
     }
 }
 
-/// Execution-time re-check of snapshot sharing. A failed lookup keeps the snapshot and is recorded
-/// as a safety block.
-async fn snapshot_still_unshared(
-    ec2_client: &ec2::Client,
+/// Whether the prefetched sharing lookup says a snapshot is unshared. A failed lookup keeps the
+/// snapshot and is recorded as a safety block.
+fn snapshot_unshared(
+    external_use: &HashMap<String, ExternalUse>,
     snapshot_id: &str,
     summary: &mut ExecutionSummary,
 ) -> bool {
-    match snapshot_has_external_create_volume_permissions(ec2_client, snapshot_id).await {
-        Ok(shared) => !shared,
-        Err(error) => {
+    match external_use.get(snapshot_id) {
+        None => true,
+        Some(ExternalUse::Shared) => false,
+        Some(ExternalUse::Unknown(reason)) => {
             summary.blocked.push(format!(
-                "skipped {snapshot_id}: create-volume permission check failed: {}",
-                error_chain(error.as_ref())
+                "skipped {snapshot_id}: create-volume permission check failed: {reason}"
             ));
             false
         }

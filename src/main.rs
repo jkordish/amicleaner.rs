@@ -84,7 +84,11 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
 
         let ec2_client = ec2::Client::new(&region_config);
         let backup_client = backup::Client::new(&region_config);
-        let reference_clients = ReferenceClients::new(&region_config, &args.skip_reference_sources);
+        let reference_clients = ReferenceClients::new(
+            &region_config,
+            &args.skip_reference_sources,
+            usize::from(args.max_concurrency),
+        );
 
         match build_region_plan(args, &region, &ec2_client, &backup_client, &reference_clients)
             .await

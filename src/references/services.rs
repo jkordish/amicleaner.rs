@@ -3,6 +3,7 @@
 
 use aws_sdk_emr as emr;
 use aws_sdk_imagebuilder as imagebuilder;
+use futures_util::{StreamExt, stream};
 use log::warn;
 
 use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
@@ -78,6 +79,7 @@ impl ReferenceCollector<'_> {
             return Ok(());
         };
 
+        let mut stack_ids = Vec::new();
         let mut pages = client.describe_stacks().into_paginator().send();
         while let Some(page) = pages.next().await {
             let output = page.aws_context("DescribeStacks")?;
@@ -85,7 +87,6 @@ impl ReferenceCollector<'_> {
                 let Some(stack_id) = stack.stack_id() else {
                     return Err("DescribeStacks returned a stack without an id".into());
                 };
-
                 for parameter in stack.parameters() {
                     for value in [parameter.parameter_value(), parameter.resolved_value()]
                         .into_iter()
@@ -94,18 +95,25 @@ impl ReferenceCollector<'_> {
                         self.scan.referenced_ami_ids.extend(find_ami_ids(value));
                     }
                 }
+                stack_ids.push(stack_id.to_string());
+            }
+        }
 
-                let template = client
-                    .get_template()
-                    .stack_name(stack_id)
-                    .send()
-                    .await
-                    .aws_context(&format!("GetTemplate({stack_id})"))?;
-                if let Some(body) = template.template_body() {
-                    self.scan.referenced_ami_ids.extend(find_ami_ids(body));
-                    for parameter in find_ssm_dynamic_references(body) {
-                        self.record_ssm_parameter_amis(&parameter, stack_id).await;
-                    }
+        // One GetTemplate per stack, `concurrency` at a time.
+        let templates = stream::iter(&stack_ids)
+            .map(|stack_id| {
+                let request = client.get_template().stack_name(stack_id).send();
+                async move { request.await.aws_context(&format!("GetTemplate({stack_id})")) }
+            })
+            .buffered(self.clients.concurrency)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (stack_id, template) in stack_ids.iter().zip(templates) {
+            if let Some(body) = template?.template_body() {
+                self.scan.referenced_ami_ids.extend(find_ami_ids(body));
+                for parameter in find_ssm_dynamic_references(body) {
+                    self.record_ssm_parameter_amis(&parameter, stack_id).await;
                 }
             }
         }
