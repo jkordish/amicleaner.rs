@@ -5,7 +5,7 @@ Conservative EC2 AMI + EBS snapshot cleanup using a mark-and-sweep strategy:
 - Mark AMIs referenced by instances, launch templates, Auto Scaling groups and launch configurations, EC2 Fleets, Spot Fleets and open Spot requests (including `resolve:ssm:` image parameters).
 - Mark snapshots referenced by AMIs that will remain registered.
 - Deregister only old, unreferenced, unprotected, tagged AMIs that aren't shared with other accounts.
-- Delete only old, unreferenced, unprotected, tagged snapshots — including the snapshots of AMIs it deregisters.
+- Delete only old, unreferenced, unprotected, tagged snapshots that aren't shared with other accounts — including the snapshots of AMIs it deregisters.
 - Optionally delete AWS Backup recovery points for backup-managed snapshots.
 - Default behavior is **plan-only**; pass `--execute` to apply changes.
 
@@ -15,7 +15,8 @@ Anything the tool can't determine blocks the deletions it affects:
 
 - An AMI reference that can't be resolved (for example an SSM parameter that doesn't hold an AMI id) cancels all AMI deregistrations in that region. Snapshot cleanup continues.
 - If the AWS Backup inventory can't be read, or a snapshot looks AWS Backup-created but has no matching recovery point, those snapshot deletions are cancelled.
-- AMIs with launch permissions for other accounts (or a failed launch-permission lookup), AMIs created by AWS Backup, and AMIs with missing or unparseable dates are kept.
+- Anything shared is kept. That means an AMI with any launch permission, or a snapshot with any create-volume permission, granted to another account, an Organization or OU, or the public. If the permission lookup fails, the resource is kept and the region exits with code 3. This protects the build-account pattern, where AMIs are built in one account and shared to the accounts that run them. A shared AMI also keeps its snapshots, because they stay referenced.
+- AMIs created by AWS Backup and AMIs with missing or unparseable dates are kept.
 - With `--execute`, every planned item is re-checked against live state right before it is deleted.
 
 Tags:
@@ -34,11 +35,11 @@ Tags:
 | 0 | success |
 | 1 | errors (a region failed, or a deletion failed) |
 | 2 | invalid arguments |
-| 3 | no errors, but safety checks cancelled planned deletions (see `blocked_by_safety_checks` in the plan output) |
+| 3 | no errors, but safety checks cancelled planned deletions: `blocked_by_safety_checks` in the plan output, or `execution_blocked` during `--execute` |
 
 ### IAM permissions
 
-Read (plan mode): `ec2:DescribeRegions`, `ec2:DescribeImages`, `ec2:DescribeImageAttribute`, `ec2:DescribeSnapshots`, `ec2:DescribeInstances`, `ec2:DescribeLaunchTemplates`, `ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeFleets`, `ec2:DescribeSpotFleetRequests`, `ec2:DescribeSpotInstanceRequests`, `autoscaling:DescribeAutoScalingGroups`, `autoscaling:DescribeLaunchConfigurations`, `ssm:GetParameter`, `backup:ListBackupVaults`, `backup:ListRecoveryPointsByBackupVault`.
+Read (plan mode): `ec2:DescribeRegions`, `ec2:DescribeImages`, `ec2:DescribeImageAttribute`, `ec2:DescribeSnapshots`, `ec2:DescribeSnapshotAttribute`, `ec2:DescribeInstances`, `ec2:DescribeLaunchTemplates`, `ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeFleets`, `ec2:DescribeSpotFleetRequests`, `ec2:DescribeSpotInstanceRequests`, `autoscaling:DescribeAutoScalingGroups`, `autoscaling:DescribeLaunchConfigurations`, `ssm:GetParameter`, `backup:ListBackupVaults`, `backup:ListRecoveryPointsByBackupVault`.
 
 Write (`--execute`): `ec2:DeregisterImage`, `ec2:DeleteSnapshot`, and `backup:DeleteRecoveryPoint` for `--execute-backup-recovery-point-deletes`.
 

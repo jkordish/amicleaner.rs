@@ -7,6 +7,7 @@ const AMI_A: &str = "ami-0123456789abcdef0";
 const AMI_B: &str = "ami-0123456789abcdef1";
 const SNAP_A: &str = "snap-0123456789abcdef0";
 const SNAP_B: &str = "snap-0123456789abcdef1";
+const SNAP_C: &str = "snap-0123456789abcdef2";
 
 fn test_args() -> Args {
     let mut args = Args::try_parse_from(["amicleaner"]).expect("defaults parse");
@@ -1040,7 +1041,38 @@ fn empty_reference_scan_rules() -> Vec<aws_smithy_mocks::Rule> {
         mock!(ec2::Client::describe_image_attribute).then_output(|| {
             ec2::operation::describe_image_attribute::DescribeImageAttributeOutput::builder().build()
         }),
+        not_shared_snapshot_rule(),
     ]
+}
+
+/// Snapshot has no create-volume permissions (not shared). In `MatchAny` mode the first matching
+/// rule wins, so a test overriding this must put its own rule earlier.
+fn not_shared_snapshot_rule() -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_snapshot_attribute).then_output(|| {
+        ec2::operation::describe_snapshot_attribute::DescribeSnapshotAttributeOutput::builder()
+            .build()
+    })
+}
+
+fn shared_snapshot_rule(snapshot_id: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_snapshot_attribute)
+        .match_requests(move |request| request.snapshot_id() == Some(snapshot_id))
+        .then_output(|| {
+            ec2::operation::describe_snapshot_attribute::DescribeSnapshotAttributeOutput::builder()
+                .create_volume_permissions(
+                    // e.g. shared from the build account to a consumer account
+                    ec2::types::CreateVolumePermission::builder().user_id("210987654321").build(),
+                )
+                .build()
+        })
+}
+
+fn snapshot_permission_error_rule() -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_snapshot_attribute).then_error(|| {
+        ec2::operation::describe_snapshot_attribute::DescribeSnapshotAttributeError::generic(
+            ec2_error("UnauthorizedOperation", "no"),
+        )
+    })
 }
 
 fn empty_asg_client() -> autoscaling::Client {
@@ -1317,6 +1349,211 @@ async fn recovery_point_deletion_rechecks_the_live_snapshot() {
         assert_eq!(summary.skipped_backup_recovery_points, 1, "{live_tags:?}");
         assert_eq!(calls, 0, "{live_tags:?}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cross-account sharing: build account shares AMIs/snapshots to consumer accounts
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_volume_permissions_mark_a_snapshot_as_shared() {
+    let shared = shared_snapshot_rule(SNAP_A);
+    let private = not_shared_snapshot_rule();
+    let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&shared, &private], no_sdk_retries);
+
+    let external_use = lookup_snapshot_external_use(
+        &client,
+        &[make_snapshot(SNAP_A, Utc::now(), &[]), make_snapshot(SNAP_B, Utc::now(), &[])],
+    )
+    .await;
+
+    assert_eq!(external_use, HashMap::from([(SNAP_A.to_string(), ExternalUse::Shared)]));
+
+    let failing = snapshot_permission_error_rule();
+    let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&failing], no_sdk_retries);
+    let external_use =
+        lookup_snapshot_external_use(&client, &[make_snapshot(SNAP_A, Utc::now(), &[])]).await;
+    assert!(
+        matches!(external_use.get(SNAP_A), Some(ExternalUse::Unknown(reason)) if reason.contains("UnauthorizedOperation"))
+    );
+}
+
+#[test]
+fn shared_snapshots_are_kept_and_failed_lookups_block() {
+    let args = test_args();
+    let old = Utc::now() - Duration::days(365);
+    let mut plan = plan(
+        &args,
+        vec![make_ami(AMI_A, old, &[("cleanup", "true")], &[SNAP_A])],
+        vec![
+            make_snapshot(SNAP_A, old, &[]),
+            make_snapshot(SNAP_B, old, &[("cleanup", "true")]),
+            make_snapshot(SNAP_C, old, &[("cleanup", "true")]),
+        ],
+        &scan(&[], &[]),
+    );
+    assert_eq!(plan.delete_snapshots.len(), 3);
+    assert!(plan.snapshots_released_by_ami.contains_key(SNAP_A));
+    let skipped_before = plan.skipped_snapshots;
+
+    apply_snapshot_external_use(
+        &mut plan,
+        &HashMap::from([
+            (SNAP_A.to_string(), ExternalUse::Shared),
+            (SNAP_B.to_string(), ExternalUse::Unknown("AccessDenied".to_string())),
+        ]),
+    );
+
+    let planned = plan.delete_snapshots.iter().map(|s| s.snapshot_id.as_str()).collect::<Vec<_>>();
+    assert_eq!(planned, vec![SNAP_C]);
+    assert_eq!(plan.skipped_snapshots, skipped_before + 2);
+    assert_eq!(plan.blocked.len(), 1, "only the failed lookup is a safety block");
+    assert!(plan.blocked[0].contains(SNAP_B));
+    assert!(plan.snapshots_released_by_ami.is_empty(), "pruned with the shared snapshot");
+}
+
+async fn execute_single_snapshot_delete(
+    first_rules: Vec<aws_smithy_mocks::Rule>,
+) -> (ExecutionSummary, usize) {
+    let mut args = test_args();
+    args.execute = true;
+    args.dry_run = true;
+    let old = Utc::now() - Duration::days(365);
+    let plan = plan(
+        &args,
+        Vec::new(),
+        vec![make_snapshot(SNAP_A, old, &[("cleanup", "true")])],
+        &scan(&[], &[]),
+    );
+    assert_eq!(plan.delete_snapshots.len(), 1);
+
+    let mut rules = first_rules;
+    rules.extend(empty_reference_scan_rules());
+    let images = images_rule(Vec::new());
+    let snapshots = snapshots_rule(vec![ec2_snapshot(SNAP_A, &[("cleanup", "true")])]);
+    let delete_snapshot = delete_snapshot_dry_run_rule();
+    let ec2_client = ec2_with(rules, &[&images, &snapshots, &delete_snapshot]);
+
+    let summary = execute_region_plan(
+        &ec2_client,
+        &empty_asg_client(),
+        &no_backup_client(),
+        &no_ssm_client(),
+        &plan,
+        &args,
+    )
+    .await;
+    (summary, delete_snapshot.num_calls())
+}
+
+#[tokio::test]
+async fn snapshot_shared_after_planning_is_not_deleted() {
+    let (summary, calls) = execute_single_snapshot_delete(vec![shared_snapshot_rule(SNAP_A)]).await;
+
+    assert_eq!(calls, 0);
+    assert_eq!(summary.skipped_snapshots, 1);
+    assert!(summary.failures.is_empty() && summary.blocked.is_empty());
+}
+
+#[tokio::test]
+async fn failed_snapshot_permission_recheck_blocks_instead_of_failing() {
+    let (summary, calls) =
+        execute_single_snapshot_delete(vec![snapshot_permission_error_rule()]).await;
+
+    assert_eq!(calls, 0);
+    assert_eq!(summary.skipped_snapshots, 1);
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+    assert_eq!(summary.blocked.len(), 1);
+    assert!(summary.blocked[0].contains("UnauthorizedOperation"), "{}", summary.blocked[0]);
+}
+
+#[tokio::test]
+async fn recovery_point_for_a_shared_snapshot_is_not_deleted() {
+    let mut args = test_args();
+    args.execute = true;
+    args.execute_backup_recovery_point_deletes = true;
+    let plan = recovery_point_plan(&args);
+
+    let mut rules = vec![shared_snapshot_rule(SNAP_A)];
+    rules.extend(empty_reference_scan_rules());
+    let images = images_rule(Vec::new());
+    let snapshots = snapshots_rule(vec![ec2_snapshot(
+        SNAP_A,
+        &[("cleanup", "true"), ("backup-cleanup", "true")],
+    )]);
+    let ec2_client = ec2_with(rules, &[&images, &snapshots]);
+    let delete_recovery_point = mock!(backup::Client::delete_recovery_point).then_output(|| {
+        backup::operation::delete_recovery_point::DeleteRecoveryPointOutput::builder().build()
+    });
+    let backup_client = mock_client!(aws_sdk_backup, RuleMode::MatchAny, [&delete_recovery_point]);
+
+    let summary = execute_region_plan(
+        &ec2_client,
+        &empty_asg_client(),
+        &backup_client,
+        &no_ssm_client(),
+        &plan,
+        &args,
+    )
+    .await;
+
+    assert_eq!(delete_recovery_point.num_calls(), 0);
+    assert_eq!(summary.skipped_backup_recovery_points, 1);
+}
+
+#[tokio::test]
+async fn execution_time_safety_blocks_are_blocks_not_failures() {
+    let mut args = test_args();
+    args.execute = true;
+    args.dry_run = true;
+    let old = Utc::now() - Duration::days(365);
+    let plan = plan(
+        &args,
+        vec![make_ami(AMI_A, old, &[("cleanup", "true")], &[])],
+        Vec::new(),
+        &scan(&[], &[]),
+    );
+
+    // A launch template that now points at something that isn't an AMI id.
+    let templates = mock!(ec2::Client::describe_launch_templates).then_output(|| {
+        ec2::operation::describe_launch_templates::DescribeLaunchTemplatesOutput::builder()
+            .launch_templates(
+                ec2::types::LaunchTemplate::builder()
+                    .launch_template_id("lt-0123456789abcdef0")
+                    .build(),
+            )
+            .build()
+    });
+    let versions = mock!(ec2::Client::describe_launch_template_versions).then_output(|| {
+        ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder()
+            .launch_template_versions(
+                ec2::types::LaunchTemplateVersion::builder()
+                    .launch_template_data(
+                        ec2::types::ResponseLaunchTemplateData::builder().image_id("not-an-ami").build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let mut rules = vec![templates, versions];
+    rules.extend(empty_reference_scan_rules());
+    let deregister = deregister_dry_run_rule();
+    let ec2_client = ec2_with(rules, &[&deregister]);
+
+    let summary = execute_region_plan(
+        &ec2_client,
+        &empty_asg_client(),
+        &no_backup_client(),
+        &no_ssm_client(),
+        &plan,
+        &args,
+    )
+    .await;
+
+    assert_eq!(deregister.num_calls(), 0);
+    assert_eq!(summary.skipped_amis, 1);
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+    assert_eq!(summary.blocked.len(), 1);
 }
 
 // ---------------------------------------------------------------------------------------------

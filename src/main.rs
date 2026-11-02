@@ -263,6 +263,8 @@ struct ExecutionSummary {
     skipped_snapshots: usize,
     deleted_backup_recovery_points: usize,
     skipped_backup_recovery_points: usize,
+    /// Safety checks that cancelled work at execution time. Non-empty means exit code 3.
+    blocked: Vec<String>,
     failures: Vec<String>,
 }
 
@@ -285,12 +287,14 @@ enum ImageReferenceResolution {
     Unresolved(String),
 }
 
-/// Why an AMI candidate is kept because of who else can launch it.
+/// Why an AMI or snapshot candidate is kept because other accounts may use it. AMIs built in one
+/// account and shared to others are the main case: deleting them breaks launches elsewhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ExternalUse {
-    /// Launch permissions are granted to other accounts, organizations or the public.
+    /// Launch (AMI) or create-volume (snapshot) permissions are granted to other accounts,
+    /// organizations, OUs or the public.
     Shared,
-    /// The launch-permission lookup failed.
+    /// The permission lookup failed.
     Unknown(String),
 }
 
@@ -423,6 +427,9 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
                     if !summary.failures.is_empty() {
                         outcome.failed_regions.push(region.clone());
                     }
+                    if !summary.blocked.is_empty() && !outcome.blocked_regions.contains(&region) {
+                        outcome.blocked_regions.push(region.clone());
+                    }
                 }
             }
             Err(error) => {
@@ -549,6 +556,12 @@ async fn build_region_plan(
 
     let mut plan =
         plan_region(args, region, now, owned_amis, owned_snapshots, &reference_scan, &external_use);
+
+    // Snapshots shared to other accounts are kept, like shared AMIs. Checked before the Backup
+    // classification so shared recovery-point snapshots are kept too.
+    let snapshot_external_use =
+        lookup_snapshot_external_use(ec2_client, &plan.delete_snapshots).await;
+    apply_snapshot_external_use(&mut plan, &snapshot_external_use);
 
     if !plan.delete_snapshots.is_empty() {
         match list_ebs_recovery_points(backup_client).await {
@@ -982,6 +995,71 @@ async fn ami_has_external_launch_permissions(
         .await
         .aws_context("DescribeImageAttribute")?;
     Ok(!output.launch_permissions().is_empty())
+}
+
+/// Whether a snapshot grants create-volume permissions to anyone (other accounts, organizations,
+/// OUs, or the public). The owner never needs one, so any entry means someone else can use it.
+async fn snapshot_has_external_create_volume_permissions(
+    ec2_client: &ec2::Client,
+    snapshot_id: &str,
+) -> AppResult<bool> {
+    let output = ec2_client
+        .describe_snapshot_attribute()
+        .snapshot_id(snapshot_id)
+        .attribute(ec2::types::SnapshotAttributeName::CreateVolumePermission)
+        .send()
+        .await
+        .aws_context("DescribeSnapshotAttribute")?;
+    Ok(!output.create_volume_permissions().is_empty())
+}
+
+async fn lookup_snapshot_external_use(
+    ec2_client: &ec2::Client,
+    snapshots: &[SnapshotInfo],
+) -> HashMap<String, ExternalUse> {
+    let mut external_use = HashMap::new();
+    for snapshot in snapshots {
+        match snapshot_has_external_create_volume_permissions(ec2_client, &snapshot.snapshot_id)
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                external_use.insert(snapshot.snapshot_id.clone(), ExternalUse::Shared);
+            }
+            Err(error) => {
+                external_use.insert(
+                    snapshot.snapshot_id.clone(),
+                    ExternalUse::Unknown(error_chain(error.as_ref())),
+                );
+            }
+        }
+    }
+    external_use
+}
+
+/// Drops shared snapshots from the deletion plan. A failed lookup also keeps the snapshot and
+/// counts as a safety block, since "couldn't tell" must never mean "not shared".
+fn apply_snapshot_external_use(plan: &mut RegionPlan, external_use: &HashMap<String, ExternalUse>) {
+    let mut kept = 0usize;
+    let mut blocked = Vec::new();
+    plan.delete_snapshots.retain(|snapshot| match external_use.get(&snapshot.snapshot_id) {
+        None => true,
+        Some(ExternalUse::Shared) => {
+            kept += 1;
+            false
+        }
+        Some(ExternalUse::Unknown(reason)) => {
+            kept += 1;
+            blocked.push(format!(
+                "snapshot {} kept: create-volume permission lookup failed: {}",
+                snapshot.snapshot_id, reason
+            ));
+            false
+        }
+    });
+    plan.skipped_snapshots += kept;
+    plan.blocked.extend(blocked);
+    prune_released_snapshots(plan);
 }
 
 async fn list_ebs_recovery_points(
@@ -1779,9 +1857,14 @@ async fn execute_ami_deregistrations(
         return released_amis;
     }
 
-    let block = |summary: &mut ExecutionSummary, reason: String| {
+    let fail = |summary: &mut ExecutionSummary, reason: String| {
         summary.skipped_amis += plan.deregister_amis.len();
         summary.failures.push(reason);
+    };
+    // Same outcome as `fail`, but reported as a safety block (exit code 3), matching the plan.
+    let block = |summary: &mut ExecutionSummary, reason: String| {
+        summary.skipped_amis += plan.deregister_amis.len();
+        summary.blocked.push(reason);
     };
 
     let references = match collect_referenced_ami_ids(ec2_client, asg_client, ssm_client).await {
@@ -1811,7 +1894,7 @@ async fn execute_ami_deregistrations(
     let current_amis = match list_owned_amis(ec2_client).await {
         Ok(amis) => amis,
         Err(error) => {
-            block(
+            fail(
                 summary,
                 format!(
                     "skipped AMI deregistration: failed to refresh AMI inventory: {}",
@@ -1846,7 +1929,7 @@ async fn execute_ami_deregistrations(
             }
             Err(error) => {
                 summary.skipped_amis += 1;
-                summary.failures.push(format!(
+                summary.blocked.push(format!(
                     "skipped {}: launch permission check failed: {}",
                     ami.ami_id,
                     error_chain(error.as_ref())
@@ -1948,7 +2031,8 @@ async fn execute_snapshot_deletions(
         let deletable = still_deletable(&snapshot.snapshot_id).is_some_and(|current| {
             !looks_backup_created(&current.tags, current.description.as_deref())
         });
-        if !deletable {
+        if !deletable || !snapshot_still_unshared(ec2_client, &snapshot.snapshot_id, summary).await
+        {
             summary.skipped_snapshots += 1;
             continue;
         }
@@ -1979,7 +2063,8 @@ async fn execute_snapshot_deletions(
         // The recovery point *is* the snapshot, so it gets the same live checks as a direct delete
         // plus the backup delete tag (read from the snapshot's current tags).
         let deletable = still_deletable(&recovery_point.snapshot_id)
-            .is_some_and(|current| backup_recovery_point_deletion_tag_allows(&current.tags, args));
+            .is_some_and(|current| backup_recovery_point_deletion_tag_allows(&current.tags, args))
+            && snapshot_still_unshared(ec2_client, &recovery_point.snapshot_id, summary).await;
 
         // AWS Backup has no dry-run mode, so dry runs stop after the checks.
         if !deletable || args.dry_run {
@@ -2002,6 +2087,25 @@ async fn execute_snapshot_deletions(
                 "delete recovery point {} in vault {} failed: {}",
                 recovery_point.recovery_point_arn, recovery_point.backup_vault_name, error
             )),
+        }
+    }
+}
+
+/// Execution-time re-check of snapshot sharing. A failed lookup keeps the snapshot and is recorded
+/// as a safety block.
+async fn snapshot_still_unshared(
+    ec2_client: &ec2::Client,
+    snapshot_id: &str,
+    summary: &mut ExecutionSummary,
+) -> bool {
+    match snapshot_has_external_create_volume_permissions(ec2_client, snapshot_id).await {
+        Ok(shared) => !shared,
+        Err(error) => {
+            summary.blocked.push(format!(
+                "skipped {snapshot_id}: create-volume permission check failed: {}",
+                error_chain(error.as_ref())
+            ));
+            false
         }
     }
 }
@@ -2107,7 +2211,7 @@ where
 
 fn print_execution_summary(region: &str, summary: &ExecutionSummary) {
     println!(
-        "execution region={} mode={} deregistered_amis={} skipped_amis={} deleted_snapshots={} skipped_snapshots={} deleted_backup_recovery_points={} skipped_backup_recovery_points={} failures={}",
+        "execution region={} mode={} deregistered_amis={} skipped_amis={} deleted_snapshots={} skipped_snapshots={} deleted_backup_recovery_points={} skipped_backup_recovery_points={} blocked={} failures={}",
         region,
         if summary.dry_run { "dry-run" } else { "execute" },
         summary.deregistered_amis,
@@ -2116,12 +2220,20 @@ fn print_execution_summary(region: &str, summary: &ExecutionSummary) {
         summary.skipped_snapshots,
         summary.deleted_backup_recovery_points,
         summary.skipped_backup_recovery_points,
+        summary.blocked.len(),
         summary.failures.len(),
     );
     if summary.dry_run {
         println!(
             "  (dry-run: deregistered/deleted counts are requests that passed the AWS dry-run check)"
         );
+    }
+
+    if !summary.blocked.is_empty() {
+        println!("execution_blocked:");
+        for reason in &summary.blocked {
+            println!("  {reason}");
+        }
     }
 
     if !summary.failures.is_empty() {
