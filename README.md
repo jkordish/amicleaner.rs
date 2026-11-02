@@ -18,6 +18,7 @@ Anything the tool can't determine blocks the deletions it affects:
 - If the AWS Backup inventory can't be read, or a snapshot looks AWS Backup-created but has no matching recovery point, those snapshot deletions are cancelled.
 - Anything shared is kept. That means an AMI with any launch permission, or a snapshot with any create-volume permission, granted to another account, an Organization or OU, or the public. If the permission lookup fails, the resource is kept and the region exits with code 3. This protects the build-account pattern, where AMIs are built in one account and shared to the accounts that run them. A shared AMI also keeps its snapshots, because they stay referenced. The plan prints how many candidates were kept this way as `kept_shared_amis` and `kept_shared_snapshots`.
 - AMIs created by AWS Backup and AMIs with missing or unparseable dates are kept.
+- Snapshots and AMIs created by Amazon Data Lifecycle Manager (an `aws:dlm:` tag, or a "Created for policy: policy-…" description) are always kept, even with the delete tag. DLM deletes them on its own retention schedule.
 - With `--execute`, every planned item is re-checked against live state right before it is deleted.
 
 Tags:

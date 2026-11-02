@@ -36,7 +36,7 @@ use crate::model::{
     RecoveryPointRecord, RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
 };
 use crate::plan::{apply_snapshot_external_use, plan_region};
-use crate::policy::{ami_keep_reason, snapshot_keep_reason};
+use crate::policy::{ami_keep_reason, looks_lifecycle_managed, snapshot_keep_reason};
 use crate::policy::{
     backup_recovery_point_deletion_tag_allows, has_expected_tag, is_protected,
     looks_backup_created, optional_expected_value, select_latest_ami_ids_by_family,
@@ -267,6 +267,44 @@ fn backup_created_heuristic() {
         Some("This snapshot is created by the AWS Backup service.")
     ));
     assert!(!looks_backup_created(&tags(&[("cleanup", "true")]), Some("manual")));
+}
+
+#[test]
+fn lifecycle_manager_snapshots_and_amis_are_kept_even_when_tagged_for_deletion() {
+    assert!(looks_lifecycle_managed(
+        &tags(&[("aws:dlm:lifecycle-policy-id", "policy-1")]),
+        None
+    ));
+    assert!(looks_lifecycle_managed(
+        &HashMap::new(),
+        Some("Created for policy: policy-03ab9fdd24ee91b3d schedule: Schedule 1")
+    ));
+    assert!(!looks_lifecycle_managed(&HashMap::new(), Some("Created by CreateImage(i-1)")));
+
+    let mut args = test_args();
+    args.allow_untagged = true;
+    let old = Utc::now() - Duration::days(90);
+    let cutoff = Utc::now() - Duration::days(30);
+    let mut snapshot = make_snapshot(SNAP_A, old, &[("aws:dlm:lifecycle-policy-id", "policy-1")]);
+    let none = HashSet::new();
+    assert_eq!(
+        snapshot_keep_reason(&snapshot, true, &none, cutoff, &args),
+        Some(KeepReason::LifecycleManaged),
+        "a deregistered AMI's authorization doesn't extend to DLM snapshots"
+    );
+    snapshot.tags.clear();
+    snapshot.description = Some("Created for policy: policy-1 schedule: Daily".to_string());
+    assert_eq!(
+        snapshot_keep_reason(&snapshot, false, &none, cutoff, &args),
+        Some(KeepReason::LifecycleManaged)
+    );
+
+    let ami = make_ami(AMI_A, old, &[("aws:dlm:lifecycle-policy-id", "policy-2")], &[]);
+    let cutoffs = Cutoffs { min_age: cutoff, recent_launch: cutoff };
+    assert_eq!(
+        ami_keep_reason(&ami, &none, &none, cutoffs, &args),
+        Some(KeepReason::LifecycleManaged)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

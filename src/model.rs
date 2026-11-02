@@ -147,6 +147,7 @@ pub(crate) enum KeepReason {
     NoFamilyTag,
     Protected,
     BackupCreated,
+    LifecycleManaged,
     NoDeleteTag,
     RecentlyLaunched,
     LaunchTimeUnknown,
@@ -168,6 +169,7 @@ impl KeepReason {
             Self::NoFamilyTag => "no_family_tag",
             Self::Protected => "protected",
             Self::BackupCreated => "backup_created",
+            Self::LifecycleManaged => "lifecycle_managed",
             Self::NoDeleteTag => "no_delete_tag",
             Self::RecentlyLaunched => "recently_launched",
             Self::LaunchTimeUnknown => "launch_time_unknown",
@@ -197,6 +199,9 @@ impl fmt::Display for KeepReason {
             }
             Self::Protected => f.write_str("protect tag"),
             Self::BackupCreated => f.write_str("created by AWS Backup"),
+            Self::LifecycleManaged => {
+                f.write_str("managed by Data Lifecycle Manager (it enforces its own retention)")
+            }
             Self::NoDeleteTag => f.write_str("no delete tag"),
             Self::RecentlyLaunched => f.write_str("launched within --ami-recent-launch-days"),
             Self::LaunchTimeUnknown => f.write_str("last launch time unparseable"),

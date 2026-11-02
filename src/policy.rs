@@ -14,6 +14,13 @@ const FAMILY_TAG: &str = "ImageFamily";
 /// Prefix of the tags AWS Backup puts on the AMIs and snapshots it creates.
 const AWS_BACKUP_TAG_PREFIX: &str = "aws:backup:";
 
+/// Prefix of the tags Amazon Data Lifecycle Manager puts on the snapshots and AMIs it creates
+/// (`aws:dlm:lifecycle-policy-id`, `aws:dlm:lifecycle-schedule-name`, ...).
+const DLM_TAG_PREFIX: &str = "aws:dlm:";
+
+/// Description DLM gives its snapshots: "Created for policy: policy-0abc... schedule: Daily".
+const DLM_DESCRIPTION_PREFIX: &str = "Created for policy: policy-";
+
 pub(crate) fn should_deregister_ami(
     ami: &AmiInfo,
     referenced_ami_ids: &HashSet<String>,
@@ -53,6 +60,9 @@ pub(crate) fn ami_keep_reason(
     }
     if looks_backup_created(&ami.tags, ami.description.as_deref()) {
         return Some(KeepReason::BackupCreated);
+    }
+    if looks_lifecycle_managed(&ami.tags, ami.description.as_deref()) {
+        return Some(KeepReason::LifecycleManaged);
     }
     if !deletion_tag_allows(&ami.tags, args) {
         return Some(KeepReason::NoDeleteTag);
@@ -99,6 +109,11 @@ pub(crate) fn snapshot_keep_reason(
     }
     if is_protected(&snapshot.tags, args) {
         return Some(KeepReason::Protected);
+    }
+    // DLM retires its own snapshots on schedule; deleting them early breaks someone's backups,
+    // and a delete tag (or an AMI being deregistered) doesn't change that.
+    if looks_lifecycle_managed(&snapshot.tags, snapshot.description.as_deref()) {
+        return Some(KeepReason::LifecycleManaged);
     }
     if !snapshot_deletion_authorized(&snapshot.tags, released_by_deregistered_ami, args) {
         return Some(KeepReason::NoDeleteTag);
@@ -176,6 +191,15 @@ pub(crate) fn looks_backup_created(
 ) -> bool {
     tags.keys().any(|key| key.starts_with(AWS_BACKUP_TAG_PREFIX))
         || description.is_some_and(|description| description.contains("AWS Backup"))
+}
+
+/// Created by an Amazon Data Lifecycle Manager policy (snapshot or AMI policy).
+pub(crate) fn looks_lifecycle_managed(
+    tags: &HashMap<String, String>,
+    description: Option<&str>,
+) -> bool {
+    tags.keys().any(|key| key.starts_with(DLM_TAG_PREFIX))
+        || description.is_some_and(|description| description.starts_with(DLM_DESCRIPTION_PREFIX))
 }
 
 pub(crate) fn ami_family(ami: &AmiInfo) -> Option<&str> {
