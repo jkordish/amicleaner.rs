@@ -1,6 +1,0 @@
-[env]
-# rustc 1.93.1 overflows its default stack (SIGSEGV) on the generated AWS SDK code: compiling
-# aws-sdk-cloudformation (AST lowering) and aws-sdk-ec2's DescribeSnapshotAttribute under the
-# fat-LTO, codegen-units=1 release profile. 256 MiB (reserved, not committed) avoids both.
-# Remove once a toolchain bump builds `cargo test` and `cargo build --release` without it.
-RUST_MIN_STACK = "268435456"

@@ -62,7 +62,7 @@ Set `RUST_LOG=debug|info|warn|error` to change log verbosity.
 This project targets:
 
 - Rust edition `2024`
-- MSRV `1.93.1` (pinned in `rust-toolchain.toml`)
+- MSRV `1.99.1` (pinned in `rust-toolchain.toml`)
 
 ### Building on Linux/OSX
 

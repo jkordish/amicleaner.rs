@@ -1,3 +1,6 @@
 [toolchain]
-channel = "1.93.1"
+channel = "1.99.1"
+# minimal + the two components we use, so a rustup set to the (deprecated) `complete` profile
+# doesn't fail on components that aren't published for this release (miri, cranelift).
+profile = "minimal"
 components = ["rustfmt", "clippy"]

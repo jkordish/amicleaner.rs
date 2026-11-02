@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Toolchain is pinned to Rust 1.93.1 (edition 2024) via `rust-toolchain.toml`. `.cargo/config.toml` raises `RUST_MIN_STACK` because rustc overflows its stack on the generated AWS SDK code. rustc 1.93.1 also segfaults intermittently on this codebase; re-run the build, and `rm -rf target/debug/incremental` if it keeps happening.
+Toolchain is pinned to Rust 1.99.1 (edition 2024) via `rust-toolchain.toml` (`profile = "minimal"` so a rustup on the `complete` profile doesn't fail on unpublished components). Don't go back to 1.93.x: its rustc overflowed its stack and segfaulted intermittently on the generated AWS SDK code.
 
 ```shell
 cargo build                      # debug build
@@ -16,7 +16,7 @@ cargo test protect_tag           # run tests whose name contains a substring
 ./build.sh                       # Docker musl cross-compile (image tag follows rust-toolchain.toml)
 ```
 
-Dependency versions must stay compatible with Rust 1.93.1. Newer `aws-smithy-*` crates (e.g. `aws-smithy-runtime-api` ≥ 1.13, `aws-smithy-mocks` 0.3) need 1.94.1, which is why `aws-smithy-mocks` is pinned to 0.2.6. When updating, use `CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo update`.
+`rust-version` in `Cargo.toml` matches the toolchain pin, so `cargo update` only picks dependency versions that build on it. The AWS SDK crates are one family and should move together.
 
 Running against AWS uses the default credential chain. Region auto-discovery (no `--regions`) needs a default region configured. Without `--execute` the binary is read-only and only prints a plan. Exit codes: 0 ok, 1 failures, 2 bad args, 3 safety checks blocked planned work.
 
