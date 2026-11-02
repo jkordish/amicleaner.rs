@@ -299,6 +299,10 @@ struct RegionPlan {
     blocked_backup_snapshots: Vec<BlockedSnapshot>,
     tag_filtered_backup_recovery_points: usize,
     kept_untagged_family_amis: usize,
+    /// Candidates kept because other accounts, organizations or the public can use them (also
+    /// counted in the skipped totals).
+    kept_shared_amis: usize,
+    kept_shared_snapshots: usize,
     skipped_amis: usize,
     skipped_snapshots: usize,
     /// Why safety checks cancelled planned deletions. Non-empty means exit code 3.
@@ -667,6 +671,7 @@ fn plan_region(
     let mut blocked = Vec::new();
     let mut deregister_amis = Vec::new();
     let mut skipped_amis = 0usize;
+    let mut kept_shared_amis = 0usize;
 
     for ami in owned_amis {
         if !should_deregister_ami(ami, referenced_ami_ids, &keep_latest_ami_ids, cutoffs, args) {
@@ -676,7 +681,10 @@ fn plan_region(
 
         match external_use.get(&ami.ami_id) {
             None => deregister_amis.push(ami.clone()),
-            Some(ExternalUse::Shared) => skipped_amis += 1,
+            Some(ExternalUse::Shared) => {
+                skipped_amis += 1;
+                kept_shared_amis += 1;
+            }
             Some(ExternalUse::Unknown(reason)) => {
                 skipped_amis += 1;
                 blocked.push(format!(
@@ -765,6 +773,8 @@ fn plan_region(
         blocked_backup_snapshots: Vec::new(),
         tag_filtered_backup_recovery_points: 0,
         kept_untagged_family_amis,
+        kept_shared_amis,
+        kept_shared_snapshots: 0,
         skipped_amis,
         skipped_snapshots,
         blocked,
@@ -1109,11 +1119,13 @@ async fn lookup_snapshot_external_use(
 /// counts as a safety block, since "couldn't tell" must never mean "not shared".
 fn apply_snapshot_external_use(plan: &mut RegionPlan, external_use: &HashMap<String, ExternalUse>) {
     let mut kept = 0usize;
+    let mut shared = 0usize;
     let mut blocked = Vec::new();
     plan.delete_snapshots.retain(|snapshot| match external_use.get(&snapshot.snapshot_id) {
         None => true,
         Some(ExternalUse::Shared) => {
             kept += 1;
+            shared += 1;
             false
         }
         Some(ExternalUse::Unknown(reason)) => {
@@ -1126,6 +1138,7 @@ fn apply_snapshot_external_use(plan: &mut RegionPlan, external_use: &HashMap<Str
         }
     });
     plan.skipped_snapshots += kept;
+    plan.kept_shared_snapshots += shared;
     plan.blocked.extend(blocked);
     prune_released_snapshots(plan);
 }
@@ -2211,16 +2224,17 @@ fn extract_ssm_parameter_name(image_reference: &str) -> Option<String> {
 fn print_region_plan(plan: &RegionPlan) {
     println!("\n=== Region {} ===", plan.region);
     println!(
-        "owned_amis={} referenced_amis={} unresolved_ami_references={} candidate_amis={} skipped_amis={} kept_untagged_family_amis={}",
+        "owned_amis={} referenced_amis={} unresolved_ami_references={} candidate_amis={} skipped_amis={} kept_shared_amis={} kept_untagged_family_amis={}",
         plan.owned_ami_count,
         plan.referenced_ami_count,
         plan.unresolved_ami_references.len(),
         plan.deregister_amis.len(),
         plan.skipped_amis,
+        plan.kept_shared_amis,
         plan.kept_untagged_family_amis,
     );
     println!(
-        "owned_snapshots={} referenced_snapshots_after_ami_keeps={} candidate_snapshots={} released_by_ami_snapshots={} backup_managed_candidates={} backup_recovery_point_candidates={} tag_filtered_backup_recovery_points={} blocked_snapshots={} skipped_snapshots={}",
+        "owned_snapshots={} referenced_snapshots_after_ami_keeps={} candidate_snapshots={} released_by_ami_snapshots={} backup_managed_candidates={} backup_recovery_point_candidates={} tag_filtered_backup_recovery_points={} blocked_snapshots={} kept_shared_snapshots={} skipped_snapshots={}",
         plan.owned_snapshot_count,
         plan.referenced_snapshot_count_after_ami_keeps,
         plan.delete_snapshots.len(),
@@ -2229,6 +2243,7 @@ fn print_region_plan(plan: &RegionPlan) {
         plan.delete_backup_recovery_points.len(),
         plan.tag_filtered_backup_recovery_points,
         plan.blocked_backup_snapshots.len(),
+        plan.kept_shared_snapshots,
         plan.skipped_snapshots,
     );
 

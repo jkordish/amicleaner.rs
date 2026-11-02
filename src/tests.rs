@@ -375,6 +375,7 @@ fn shared_amis_are_kept_and_failed_lookups_block() {
 
     assert!(plan.deregister_amis.is_empty());
     assert_eq!(plan.skipped_amis, 2);
+    assert_eq!(plan.kept_shared_amis, 1, "the failed lookup is blocked, not counted as shared");
     assert_eq!(plan.blocked.len(), 1, "only the failed lookup is uncertain");
     assert!(plan.blocked[0].contains(AMI_B));
 }
@@ -1409,6 +1410,7 @@ fn shared_snapshots_are_kept_and_failed_lookups_block() {
     let planned = plan.delete_snapshots.iter().map(|s| s.snapshot_id.as_str()).collect::<Vec<_>>();
     assert_eq!(planned, vec![SNAP_C]);
     assert_eq!(plan.skipped_snapshots, skipped_before + 2);
+    assert_eq!(plan.kept_shared_snapshots, 1);
     assert_eq!(plan.blocked.len(), 1, "only the failed lookup is a safety block");
     assert!(plan.blocked[0].contains(SNAP_B));
     assert!(plan.snapshots_released_by_ami.is_empty(), "pruned with the shared snapshot");
