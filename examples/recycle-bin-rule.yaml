@@ -31,16 +31,15 @@ Parameters:
     Type: String
     Default: ""
     Description: >-
-      Optional. Snapshots with this tag key (and ExcludeTagValue, if set) are deleted immediately
+      Optional. Snapshots with this tag key and ExcludeTagValue are deleted immediately
       instead of being retained. Leave empty to retain every snapshot.
   ExcludeTagValue:
     Type: String
     Default: ""
-    Description: Optional value for ExcludeTagKey. Leave empty to match any value.
+    Description: Optional value for ExcludeTagKey; passed as an empty string when left empty.
 
 Conditions:
   HasExclusion: !Not [!Equals [!Ref ExcludeTagKey, ""]]
-  HasExclusionValue: !Not [!Equals [!Ref ExcludeTagValue, ""]]
 
 Resources:
   SnapshotRetentionRule:
@@ -63,8 +62,9 @@ Resources:
       Status: available
       ExcludeResourceTags: !If
         - HasExclusion
+        # ResourceTagValue is required in CloudFormation (an empty string is allowed).
         - - ResourceTagKey: !Ref ExcludeTagKey
-            ResourceTagValue: !If [HasExclusionValue, !Ref ExcludeTagValue, !Ref AWS::NoValue]
+            ResourceTagValue: !Ref ExcludeTagValue
         - !Ref AWS::NoValue
       Tags:
         - Key: purpose
