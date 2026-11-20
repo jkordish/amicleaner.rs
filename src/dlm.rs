@@ -232,11 +232,12 @@ pub(crate) fn orphaned_dlm_snapshots(
     now: DateTime<Utc>,
     min_age_cutoff: DateTime<Utc>,
 ) -> DlmOrphanScan {
-    let mut newest: HashMap<GroupKey, DateTime<Utc>> = HashMap::new();
+    // `None`: some snapshot in the group has no start time, so its newest is unknown.
+    let mut newest: HashMap<GroupKey, Option<DateTime<Utc>>> = HashMap::new();
     for snapshot in snapshots {
         if let Some(group) = key(snapshot) {
             let entry = newest.entry(group).or_insert(snapshot.start_time);
-            *entry = (*entry).max(snapshot.start_time);
+            *entry = entry.zip(snapshot.start_time).map(|(a, b)| a.max(b));
         }
     }
 
@@ -273,7 +274,7 @@ pub(crate) fn orphaned_dlm_snapshots(
             },
         };
         let Some(cause) = cause else { continue };
-        if newest.get(&group).is_some_and(|newest| *newest < min_age_cutoff) {
+        if newest.get(&group).copied().flatten().is_some_and(|newest| newest < min_age_cutoff) {
             scan.orphans.insert(snapshot.snapshot_id.clone(), cause);
         }
     }

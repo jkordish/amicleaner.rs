@@ -425,11 +425,14 @@ pub(crate) fn plan_region(
         .flat_map(|ami| ami.snapshot_ids.iter().cloned())
         .collect::<HashSet<String>>();
 
-    let mut snapshots_released_by_ami = HashMap::new();
+    let mut snapshots_released_by_ami: HashMap<String, Vec<String>> = HashMap::new();
     for ami in &deregister_amis {
         for snapshot_id in &ami.snapshot_ids {
             if !remaining_ami_snapshot_refs.contains(snapshot_id) {
-                snapshots_released_by_ami.insert(snapshot_id.clone(), ami.ami_id.clone());
+                let amis = snapshots_released_by_ami.entry(snapshot_id.clone()).or_default();
+                if !amis.contains(&ami.ami_id) {
+                    amis.push(ami.ami_id.clone());
+                }
             }
         }
     }

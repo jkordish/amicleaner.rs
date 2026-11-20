@@ -37,7 +37,8 @@ use crate::execute::{
     execute_region_plan, is_retryable_code, retry_delay_for_attempt, send_with_retries,
 };
 use crate::inventory::{
-    ami_launch_grants, is_ami_id, list_owned_amis, lookup_snapshot_external_use,
+    ami_launch_grants, is_ami_id, list_owned_amis, list_owned_snapshots,
+    lookup_snapshot_external_use,
 };
 use crate::lt_prune::{
     execute_launch_template_pruning, plan_launch_template_pruning, prune_block_reason,
@@ -113,6 +114,7 @@ fn make_ami(
         last_launched: LastLaunched::Never,
         snapshot_ids: snapshot_ids.iter().map(|entry| (*entry).to_string()).collect(),
         tags: tags(tag_pairs),
+        state: Some("available".to_string()),
     }
 }
 
@@ -125,11 +127,12 @@ fn make_snapshot(
         snapshot_id: snapshot_id.to_string(),
         size_bytes: Some(8 << 30),
         archived: false,
-        start_time,
+        start_time: Some(start_time),
         description: None,
         tags: tags(tag_pairs),
         volume_id: None,
         dlm_orphan: None,
+        state: Some("completed".to_string()),
     }
 }
 
@@ -398,8 +401,8 @@ fn snapshots_freed_by_ami_go_through_snapshot_checks_and_inherit_authorization()
     let planned = plan.delete_snapshots.iter().map(|s| s.snapshot_id.as_str()).collect::<Vec<_>>();
     assert_eq!(planned, vec!["snap-freed"]);
     assert_eq!(
-        plan.snapshots_released_by_ami.get("snap-freed").map(String::as_str),
-        Some("ami-delete")
+        plan.snapshots_released_by_ami.get("snap-freed"),
+        Some(&vec!["ami-delete".to_string()])
     );
     assert_eq!(plan.snapshots_released_by_ami.len(), 1);
 }
@@ -518,6 +521,81 @@ fn select_latest_ami_ids_by_family_keeps_latest_per_group() {
 
     let kept = select_latest_ami_ids_by_family(&[ami_old, ami_new], 1);
     assert_eq!(kept, HashSet::from(["ami-new".to_string()]));
+}
+
+/// Only launchable AMIs take a keep-latest slot, and AMIs or snapshots that aren't in a final
+/// state (or whose state is unknown) are kept.
+#[test]
+fn state_decides_keep_latest_slots_and_readiness() {
+    let mut args = test_args();
+    args.keep_latest_per_family = 1;
+    let now = Utc::now();
+    let family = [("ImageFamily", "web"), ("cleanup", "true")];
+    let working = make_ami(AMI_A, now - Duration::days(200), &family, &[]);
+    let mut failed = make_ami(AMI_B, now - Duration::days(100), &family, &[]);
+    failed.state = Some("failed".into());
+    let keep = select_latest_ami_ids_by_family(&[working.clone(), failed.clone()], 1);
+    assert_eq!(keep, HashSet::from([AMI_A.to_string()]), "the failed newer build takes no slot");
+
+    let cutoffs = Cutoffs::new(&args, now);
+    let mut pending = working.clone();
+    pending.state = Some("pending".into());
+    assert_eq!(
+        ami_keep_reason(&pending, &HashSet::new(), &HashSet::new(), cutoffs, &args),
+        Some(KeepReason::NotReady("pending".into()))
+    );
+    pending.state = None;
+    assert_eq!(
+        ami_keep_reason(&pending, &HashSet::new(), &HashSet::new(), cutoffs, &args),
+        Some(KeepReason::NotReady("unknown".into()))
+    );
+
+    let old = now - Duration::days(400);
+    let mut snapshot = make_snapshot(SNAP_A, old, &[("cleanup", "true")]);
+    snapshot.state = Some("pending".into());
+    let reason = snapshot_keep_reason(&snapshot, false, &HashSet::new(), cutoffs.min_age, &args);
+    assert_eq!(reason, Some(KeepReason::NotReady("pending".into())));
+    snapshot.state = Some("completed".into());
+    snapshot.start_time = None;
+    let reason = snapshot_keep_reason(&snapshot, false, &HashSet::new(), cutoffs.min_age, &args);
+    assert_eq!(reason, Some(KeepReason::NoStartTime));
+}
+
+/// A snapshot two deregistered AMIs share is freed by both: both must go before it's released.
+#[test]
+fn snapshot_shared_by_two_deregistered_amis_names_both() {
+    let args = test_args();
+    let old = Utc::now() - Duration::days(400);
+    let tag = [("cleanup", "true")];
+    let plan = plan(
+        &args,
+        vec![make_ami(AMI_A, old, &tag, &[SNAP_A]), make_ami(AMI_B, old, &tag, &[SNAP_A])],
+        vec![make_snapshot(SNAP_A, old, &[])],
+        &scan(&[], &[]),
+    );
+    assert_eq!(plan.deregister_amis.len(), 2);
+    assert_eq!(
+        plan.snapshots_released_by_ami.get(SNAP_A),
+        Some(&vec![AMI_A.to_string(), AMI_B.to_string()])
+    );
+}
+
+/// A snapshot without a start time is listed (and kept), not dropped from the report; a tag with
+/// no value still protects.
+#[tokio::test]
+async fn inventory_keeps_snapshots_without_start_time_and_valueless_tags() {
+    let snapshot = ec2::types::Snapshot::builder()
+        .snapshot_id(SNAP_A)
+        .state(ec2::types::SnapshotState::Completed)
+        .tags(ec2::types::Tag::builder().key("DoNotDelete").build())
+        .build();
+    let snapshots = snapshots_rule(vec![snapshot]);
+    let ec2_client = ec2_with(Vec::new(), &[&snapshots]);
+    let listed = list_owned_snapshots(&ec2_client).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].start_time, None);
+    assert_eq!(listed[0].tags.get("DoNotDelete").map(String::as_str), Some(""));
+    assert!(is_protected(&listed[0].tags, &test_args()));
 }
 
 #[test]
@@ -704,7 +782,7 @@ fn backup_looking_snapshot_without_recovery_point_is_blocked() {
     assert!(classification.blocked[0].uncertain);
 
     let mut plan = RegionPlan::default();
-    plan.snapshots_released_by_ami.insert(SNAP_A.to_string(), AMI_A.to_string());
+    plan.snapshots_released_by_ami.insert(SNAP_A.to_string(), vec![AMI_A.to_string()]);
     apply_backup_classification(&mut plan, classification);
     assert_eq!(plan.blocked.len(), 1, "uncertain blocks feed exit code 3");
     assert!(plan.snapshots_released_by_ami.is_empty(), "blocked snapshots aren't released");
@@ -715,7 +793,7 @@ fn backup_inventory_failure_blocks_every_snapshot_deletion() {
     let old = Utc::now() - Duration::days(90);
     let mut plan = RegionPlan {
         delete_snapshots: vec![make_snapshot(SNAP_A, old, &[]), make_snapshot(SNAP_B, old, &[])],
-        snapshots_released_by_ami: HashMap::from([(SNAP_A.to_string(), AMI_A.to_string())]),
+        snapshots_released_by_ami: HashMap::from([(SNAP_A.to_string(), vec![AMI_A.to_string()])]),
         ..RegionPlan::default()
     };
 
@@ -1160,7 +1238,10 @@ fn old_timestamp() -> &'static str {
 }
 
 fn image(ami_id: &str, tag_pairs: &[(&str, &str)], snapshot_ids: &[&str]) -> ec2::types::Image {
-    let mut builder = ec2::types::Image::builder().image_id(ami_id).creation_date(old_timestamp());
+    let mut builder = ec2::types::Image::builder()
+        .image_id(ami_id)
+        .creation_date(old_timestamp())
+        .state(ec2::types::ImageState::Available);
     for (key, value) in tag_pairs {
         builder = builder.tags(ec2::types::Tag::builder().key(*key).value(*value).build());
     }
@@ -1177,6 +1258,7 @@ fn image(ami_id: &str, tag_pairs: &[(&str, &str)], snapshot_ids: &[&str]) -> ec2
 fn ec2_snapshot(snapshot_id: &str, tag_pairs: &[(&str, &str)]) -> ec2::types::Snapshot {
     let mut builder = ec2::types::Snapshot::builder()
         .snapshot_id(snapshot_id)
+        .state(ec2::types::SnapshotState::Completed)
         .start_time(ec2::primitives::DateTime::from_secs(1_577_836_800));
     for (key, value) in tag_pairs {
         builder = builder.tags(ec2::types::Tag::builder().key(*key).value(*value).build());
@@ -4096,6 +4178,7 @@ fn ec2_dlm_snapshot(snapshot_id: &str, volume: &str) -> ec2::types::Snapshot {
     ec2::types::Snapshot::builder()
         .snapshot_id(snapshot_id)
         .volume_id(volume)
+        .state(ec2::types::SnapshotState::Completed)
         .start_time(ec2::primitives::DateTime::from_secs(1_577_836_800))
         .tags(
             ec2::types::Tag::builder().key("aws:dlm:lifecycle-policy-id").value(DLM_POLICY).build(),
@@ -4235,7 +4318,7 @@ fn recycle_plan() -> RegionPlan {
             make_snapshot(SNAP_A, old, &[]),
             make_snapshot(SNAP_B, old, &[("Temp", "yes")]),
         ],
-        snapshots_released_by_ami: HashMap::from([(SNAP_B.to_string(), AMI_A.to_string())]),
+        snapshots_released_by_ami: HashMap::from([(SNAP_B.to_string(), vec![AMI_A.to_string()])]),
         ..RegionPlan::default()
     }
 }

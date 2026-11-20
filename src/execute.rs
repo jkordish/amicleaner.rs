@@ -386,7 +386,7 @@ async fn execute_snapshot_deletions(
         let released = plan
             .snapshots_released_by_ami
             .get(snapshot_id)
-            .is_some_and(|ami_id| released_amis.contains(ami_id));
+            .is_some_and(|amis| amis.iter().all(|ami_id| released_amis.contains(ami_id)));
         (snapshot_is_deletable(current, released, &references, cutoffs.min_age, args)
             && snapshot_reference_keep_reason(snapshot_id, snapshot_references).is_none())
         .then_some(current)

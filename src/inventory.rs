@@ -69,6 +69,7 @@ pub(crate) async fn list_owned_amis(ec2_client: &ec2::Client) -> AppResult<Vec<A
                 last_launched,
                 snapshot_ids,
                 tags: tags_to_map(image.tags()),
+                state: image.state().map(|state| state.as_str().to_string()),
             });
         }
     }
@@ -85,13 +86,15 @@ pub(crate) async fn list_owned_snapshots(ec2_client: &ec2::Client) -> AppResult<
     while let Some(page) = pages.next().await {
         let output = page.aws_context("DescribeSnapshots")?;
         for snapshot in output.snapshots() {
+            // Without an id there's nothing to delete or report; AMIs' references to it still count.
             let Some(snapshot_id) = snapshot.snapshot_id() else {
+                warn!("DescribeSnapshots returned a snapshot without an id; ignoring it");
                 continue;
             };
-            // Without a start time the age check can't pass, so leaving it out keeps it.
-            let Some(start_time) = snapshot.start_time().and_then(smithy_datetime_to_utc) else {
-                continue;
-            };
+            let start_time = snapshot.start_time().and_then(smithy_datetime_to_utc);
+            if start_time.is_none() {
+                warn!("snapshot {snapshot_id} has no start time; it will be kept");
+            }
 
             let size_bytes = snapshot
                 .full_snapshot_size_in_bytes()
@@ -111,6 +114,7 @@ pub(crate) async fn list_owned_snapshots(ec2_client: &ec2::Client) -> AppResult<
                 tags: tags_to_map(snapshot.tags()),
                 volume_id: snapshot.volume_id().map(ToString::to_string),
                 dlm_orphan: None,
+                state: snapshot.state().map(|state| state.as_str().to_string()),
             });
         }
     }
@@ -118,14 +122,11 @@ pub(crate) async fn list_owned_snapshots(ec2_client: &ec2::Client) -> AppResult<
     Ok(snapshots)
 }
 
+/// A tag without a value counts as an empty value: the protect tag protects with any value.
 fn tags_to_map(tags: &[ec2::types::Tag]) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for tag in tags {
-        if let (Some(key), Some(value)) = (tag.key(), tag.value()) {
-            map.insert(key.to_string(), value.to_string());
-        }
-    }
-    map
+    tags.iter()
+        .filter_map(|tag| Some((tag.key()?.to_string(), tag.value().unwrap_or("").to_string())))
+        .collect()
 }
 
 fn parse_aws_timestamp(raw: &str) -> Option<DateTime<Utc>> {

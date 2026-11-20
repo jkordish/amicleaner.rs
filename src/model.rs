@@ -30,6 +30,9 @@ pub(crate) struct AmiInfo {
     pub(crate) last_launched: LastLaunched,
     pub(crate) snapshot_ids: Vec<String>,
     pub(crate) tags: HashMap<String, String>,
+    /// `DescribeImages` state (`available`, `pending`, `failed`, `disabled`, ...); `None` if AWS
+    /// omitted it.
+    pub(crate) state: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -40,7 +43,10 @@ pub(crate) struct SnapshotInfo {
     pub(crate) size_bytes: Option<u64>,
     /// In the EBS Snapshots Archive tier (cheaper storage).
     pub(crate) archived: bool,
-    pub(crate) start_time: DateTime<Utc>,
+    /// `None` when AWS omitted it; such a snapshot is always kept (`NoStartTime`).
+    pub(crate) start_time: Option<DateTime<Utc>>,
+    /// `DescribeSnapshots` state (`completed`, `pending`, `error`, ...); `None` if omitted.
+    pub(crate) state: Option<String>,
     pub(crate) description: Option<String>,
     pub(crate) tags: HashMap<String, String>,
     /// Volume the snapshot was taken from (`vol-ffffffff` for copies).
@@ -156,8 +162,9 @@ pub(crate) struct RegionPlan {
     pub(crate) referenced_ami_count: usize,
     pub(crate) unresolved_ami_references: Vec<String>,
     pub(crate) deregister_amis: Vec<AmiInfo>,
-    /// Snapshot id -> id of the planned AMI whose deregistration leaves the snapshot unreferenced.
-    pub(crate) snapshots_released_by_ami: HashMap<String, String>,
+    /// Snapshot id -> the planned AMIs whose deregistration leaves the snapshot unreferenced (all
+    /// of them must be deregistered for it to be freed).
+    pub(crate) snapshots_released_by_ami: HashMap<String, Vec<String>>,
     pub(crate) delete_snapshots: Vec<SnapshotInfo>,
     pub(crate) backup_managed_snapshots: Vec<SnapshotInfo>,
     pub(crate) delete_backup_recovery_points: Vec<BackupRecoveryPoint>,
@@ -208,6 +215,10 @@ pub(crate) struct Kept<T> {
 /// (sharing, references, AWS Backup) add their own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum KeepReason {
+    /// Not in a state it can be deleted from (pending, transient, or unknown).
+    NotReady(String),
+    /// The snapshot's start time is missing, so its age is unknown.
+    NoStartTime,
     NoCreationDate,
     TooNew,
     Referenced,
@@ -250,6 +261,8 @@ impl KeepReason {
     /// Stable identifier for machine-readable reports.
     pub(crate) fn code(&self) -> &'static str {
         match self {
+            Self::NotReady(_) => "not_ready",
+            Self::NoStartTime => "no_start_time",
             Self::NoCreationDate => "no_creation_date",
             Self::TooNew => "too_new",
             Self::Referenced => "referenced",
@@ -294,6 +307,8 @@ impl KeepReason {
 impl fmt::Display for KeepReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotReady(state) => write!(f, "state is {state}"),
+            Self::NoStartTime => f.write_str("start time missing or unparseable"),
             Self::NoCreationDate => f.write_str("creation date missing or unparseable"),
             Self::TooNew => f.write_str("newer than --min-age-days"),
             Self::Referenced => f.write_str("referenced"),

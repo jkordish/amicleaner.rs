@@ -41,6 +41,9 @@ pub(crate) fn ami_keep_reason(
     cutoffs: Cutoffs,
     args: &Args,
 ) -> Option<KeepReason> {
+    if !ami_state_allows_deregistration(ami.state.as_deref()) {
+        return Some(KeepReason::NotReady(ami.state.clone().unwrap_or_else(|| "unknown".into())));
+    }
     let Some(creation_date) = ami.creation_date else {
         return Some(KeepReason::NoCreationDate);
     };
@@ -102,7 +105,15 @@ pub(crate) fn snapshot_keep_reason(
     min_age_cutoff: DateTime<Utc>,
     args: &Args,
 ) -> Option<KeepReason> {
-    if snapshot.start_time >= min_age_cutoff {
+    if !matches!(snapshot.state.as_deref(), Some("completed" | "error")) {
+        return Some(KeepReason::NotReady(
+            snapshot.state.clone().unwrap_or_else(|| "unknown".into()),
+        ));
+    }
+    let Some(start_time) = snapshot.start_time else {
+        return Some(KeepReason::NoStartTime);
+    };
+    if start_time >= min_age_cutoff {
         return Some(KeepReason::TooNew);
     }
     if referenced_snapshot_ids.contains(&snapshot.snapshot_id) {
@@ -222,6 +233,12 @@ pub(crate) fn looks_lifecycle_managed(
         || description.is_some_and(|description| description.starts_with(DLM_DESCRIPTION_PREFIX))
 }
 
+/// States an AMI can be deregistered from. A pending (still being created) or transient one is
+/// kept, as is one whose state is unknown.
+fn ami_state_allows_deregistration(state: Option<&str>) -> bool {
+    matches!(state, Some("available" | "failed" | "error" | "invalid" | "disabled"))
+}
+
 pub(crate) fn ami_family(ami: &AmiInfo) -> Option<&str> {
     ami.tags.get(FAMILY_TAG).map(|family| family.trim()).filter(|family| !family.is_empty())
 }
@@ -236,7 +253,9 @@ pub(crate) fn select_latest_ami_ids_by_family(
 
     let mut families: HashMap<&str, Vec<&AmiInfo>> = HashMap::new();
 
-    for ami in amis {
+    // Only launchable AMIs take a slot: a failed, disabled or pending newest build mustn't push
+    // the last working one out of "the newest N".
+    for ami in amis.iter().filter(|ami| ami.state.as_deref() == Some("available")) {
         if let Some(family) = ami_family(ami) {
             families.entry(family).or_default().push(ami);
         }

@@ -18,7 +18,8 @@ Anything the tool can't determine blocks the deletions it affects:
 - If the AWS Backup inventory can't be read, or a snapshot looks AWS Backup-created but has no matching recovery point, those snapshot deletions are cancelled.
 - Anything shared is kept. That means an AMI with any launch permission, or a snapshot with any create-volume permission, granted to another account, an Organization or OU, or the public. If the permission lookup fails, the resource is kept and the region exits with code 3. This protects the build-account pattern, where AMIs are built in one account and shared to the accounts that run them. A shared AMI also keeps its snapshots, because they stay referenced. The plan prints how many candidates were kept this way as `kept_shared_amis` and `kept_shared_snapshots`. With `--check-accounts`, amicleaner looks inside the accounts you share with, and only treats something as unshared when none of them use it (see below).
 - A snapshot that a launch template, launch configuration, Spot Fleet or Spot request, Image Builder recipe, or CloudFormation stack in the account names is kept (`snapshot_referenced`), since it can still create volumes. If the reference scan fails, snapshot deletions in that region are cancelled (exit code 3).
-- AMIs created by AWS Backup and AMIs with missing or unparseable dates are kept.
+- AMIs created by AWS Backup and AMIs with missing or unparseable dates are kept, as are snapshots with no start time.
+- AMIs that are still being created (`pending`, `transient`, or an unknown state) and snapshots that aren't `completed` or `error` are kept (`not_ready`). Only `available` AMIs count towards `--keep-latest-per-family`, so a failed or disabled newest build can't push out the last working one.
 - Snapshots and AMIs created by Amazon Data Lifecycle Manager (an `aws:dlm:` tag, or a "Created for policy: policy-…" description) are always kept, even with the delete tag. DLM deletes them on its own retention schedule. The exception is snapshots DLM will never delete, which `--delete-orphaned-dlm-snapshots` can clean up (see below).
 - With `--execute`, every planned item is re-checked against live state right before it is deleted.
 
@@ -29,7 +30,7 @@ Tags:
 - Snapshots freed by deregistering their AMI inherit the AMI's delete authorization, but their own protect tag still wins.
 - For AWS Backup, an EBS recovery point is the snapshot itself, so `--backup-delete-tag` is read from the snapshot's tags.
 
-`--dry-run` (with `--execute`) sends EC2 calls with `DryRun=true`; the summary counts requests that passed the check. AWS Backup has no dry-run mode, so recovery points are only checked, never deleted, in a dry run.
+`--dry-run` (with `--execute`) sends EC2 calls with `DryRun=true`; the summary counts requests that passed the check. AWS Backup has no dry-run mode, so recovery points are only checked, never deleted, in a dry run; those that pass are counted as deletes.
 
 ### exit codes
 

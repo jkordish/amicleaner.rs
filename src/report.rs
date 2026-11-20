@@ -496,7 +496,7 @@ impl RegionReport {
                 monthly_cost_usd: None,
                 action: Action::Deregister,
                 reason_code: "eligible",
-                reason: "old, unreferenced, unshared and tagged for deletion".to_string(),
+                reason: ELIGIBLE.to_string(),
                 details: Vec::new(),
             });
         }
@@ -529,7 +529,7 @@ impl RegionReport {
             let mut details = plan
                 .snapshots_released_by_ami
                 .get(&snapshot.snapshot_id)
-                .map(|ami_id| vec![format!("freed by deregistering {ami_id}")])
+                .map(|amis| vec![format!("freed by deregistering {}", amis.join(", "))])
                 .unwrap_or_default();
             let (reason_code, reason) = match snapshot.dlm_orphan {
                 Some(cause) => {
@@ -550,9 +550,7 @@ impl RegionReport {
                         .extend(snapshot.volume_id.iter().map(|volume| format!("from {volume}")));
                     (cause.code(), cause.to_string())
                 }
-                None => {
-                    ("eligible", "old, unreferenced, unshared and tagged for deletion".to_string())
-                }
+                None => ("eligible", ELIGIBLE.to_string()),
             };
             if let RecycleBinCoverage::Checked(days) = &plan.recycle_bin {
                 details.push(recycle_bin_detail(days.get(&snapshot.snapshot_id)));
@@ -571,8 +569,8 @@ impl RegionReport {
                 format!("vault {}", point.backup_vault_name),
                 format!("recovery point {}", point.recovery_point_arn),
             ];
-            if let Some(ami_id) = plan.snapshots_released_by_ami.get(&point.snapshot_id) {
-                details.push(format!("freed by deregistering {ami_id}"));
+            if let Some(amis) = plan.snapshots_released_by_ami.get(&point.snapshot_id) {
+                details.push(format!("freed by deregistering {}", amis.join(", ")));
             }
             if let RecycleBinCoverage::Checked(days) = &plan.recycle_bin {
                 details.push(recycle_bin_detail(days.get(&point.snapshot_id)));
@@ -583,7 +581,7 @@ impl RegionReport {
             snapshots.push(Decision {
                 id: point.snapshot_id.clone(),
                 name: None,
-                created: snapshot.map(|snapshot| snapshot.start_time),
+                created: snapshot.and_then(|snapshot| snapshot.start_time),
                 size_gib,
                 monthly_cost_usd,
                 action: Action::DeleteRecoveryPoint,
@@ -692,6 +690,10 @@ impl RegionReport {
     }
 }
 
+/// Why an AMI or snapshot is removed: what applies depends on the flags (`--allow-untagged`,
+/// `--check-accounts`) and on being freed by an AMI, so the details carry the specifics.
+const ELIGIBLE: &str = "old and unused, and no keep rule applies";
+
 fn recycle_bin_detail(days: Option<&u32>) -> String {
     days.map_or_else(
         || "permanent: no Recycle Bin rule covers it".to_string(),
@@ -715,7 +717,7 @@ fn snapshot_decision(
     Decision {
         id: snapshot.snapshot_id.clone(),
         name: snapshot.description.clone().filter(|description| !description.is_empty()),
-        created: Some(snapshot.start_time),
+        created: snapshot.start_time,
         size_gib,
         monthly_cost_usd,
         action,
