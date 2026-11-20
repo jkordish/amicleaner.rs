@@ -111,7 +111,7 @@ An EBS [Recycle Bin](https://docs.aws.amazon.com/ebs/latest/userguide/recycle-bi
 
 Whenever a plan deletes snapshots, amicleaner reads the region's EBS snapshot rules and reports:
 
-- **Summary line:** for example, "Recycle Bin: all 1241 snapshot deletes restorable for 14 days", or "no retention rule covers these snapshots; deletes are permanent".
+- **Summary line:** for example, "Recycle Bin: all 1241 snapshot deletes restorable for 30 days", or "no retention rule covers these snapshots; deletes are permanent".
 - **Per snapshot:** each snapshot to delete carries a "restorable for N days" or "permanent" detail.
 
 Matching follows AWS's rules:
@@ -122,11 +122,11 @@ Matching follows AWS's rules:
 
 `--require-recycle-bin` turns the report into a gate. Snapshots no rule would retain are kept (`no_recycle_bin`). If the rules can't be read, the region's snapshot deletes are cancelled (exit code 3). Execute re-reads the rules before deleting, so a rule removed after planning stops the deletes. It doesn't evaluate AWS Backup recovery-point deletes (`--execute-backup-recovery-point-deletes`).
 
-[`examples/recycle-bin-rule.yaml`](examples/recycle-bin-rule.yaml) is a small CloudFormation template for a Region-level rule, with a 14-day default and an optional exclusion tag. It's unlocked, so it can be removed after the cleanup:
+[`examples/recycle-bin-rule.yaml`](examples/recycle-bin-rule.yaml) is a small CloudFormation template for a Region-level rule, with a 30-day default and an optional exclusion tag. It's unlocked, so it can be removed after the cleanup:
 
 ```shell
 aws cloudformation deploy --stack-name snapshot-recycle-bin \
-  --template-file examples/recycle-bin-rule.yaml --parameter-overrides RetentionDays=14
+  --template-file examples/recycle-bin-rule.yaml --parameter-overrides RetentionDays=30
 ```
 
 ### orphaned DLM snapshots

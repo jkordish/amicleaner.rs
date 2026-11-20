@@ -21,7 +21,7 @@ Metadata:
 Parameters:
   RetentionDays:
     Type: Number
-    Default: 14
+    Default: 30
     MinValue: 1
     MaxValue: 365
     Description: >-
