@@ -240,8 +240,9 @@ pub(crate) async fn build_region_plan(
         }
     }
 
-    // Last, so it sees exactly the deletes that remain.
-    if !plan.delete_snapshots.is_empty() {
+    // Last, so it sees exactly the deletes that remain (direct and recovery-point deletes alike:
+    // Recycle Bin also retains snapshots AWS Backup deletes, when a rule matches).
+    if !plan.delete_snapshots.is_empty() || !plan.delete_backup_recovery_points.is_empty() {
         let phase = Phase::start(format!("{region} · Recycle Bin rules"));
         let rules = list_snapshot_retention_rules(&reference_clients.rbin).await;
         match &rules {
@@ -257,13 +258,21 @@ pub(crate) async fn build_region_plan(
     Ok(plan)
 }
 
-/// Records how long each planned snapshot delete stays restorable. With `require`, snapshots no
-/// rule would retain are kept, and an unreadable rule set keeps them all and blocks.
+/// Records how long each planned snapshot delete (direct or AWS Backup recovery point) stays
+/// restorable. With `require`, snapshots no rule would retain are kept, and an unreadable rule set
+/// keeps them all and blocks.
 pub(crate) fn apply_recycle_bin(
     plan: &mut RegionPlan,
     rules: Result<Vec<RetentionRule>, String>,
     require: bool,
 ) {
+    // A recovery point is its snapshot, whose tags (and so rule matching) live on the snapshot.
+    let backup_snapshots = plan
+        .backup_managed_snapshots
+        .iter()
+        .map(|snapshot| (snapshot.snapshot_id.clone(), snapshot.clone()))
+        .collect::<HashMap<String, SnapshotInfo>>();
+
     let rules = match rules {
         Ok(rules) => rules,
         Err(error) => {
@@ -274,6 +283,12 @@ pub(crate) fn apply_recycle_bin(
                         .drain(..)
                         .map(|snapshot| Kept { item: snapshot, reason: reason.clone() }),
                 );
+                for point in plan.delete_backup_recovery_points.drain(..) {
+                    if let Some(snapshot) = backup_snapshots.get(&point.snapshot_id) {
+                        plan.kept_snapshots
+                            .push(Kept { item: snapshot.clone(), reason: reason.clone() });
+                    }
+                }
                 plan.blocked.push(format!(
                     "snapshot deletions cancelled: Recycle Bin rules couldn't be read: {error}"
                 ));
@@ -296,6 +311,23 @@ pub(crate) fn apply_recycle_bin(
             false
         }
         None => true,
+    });
+    plan.delete_backup_recovery_points.retain(|point| {
+        // Without the snapshot its tags are unknown, so it can't be shown to be covered.
+        let snapshot = backup_snapshots.get(&point.snapshot_id);
+        match snapshot.and_then(|snapshot| recycle_bin_days(&snapshot.tags, &rules)) {
+            Some(period) => {
+                days.insert(point.snapshot_id.clone(), period);
+                true
+            }
+            None if require => {
+                if let Some(snapshot) = snapshot {
+                    kept.push(Kept { item: snapshot.clone(), reason: KeepReason::NoRecycleBin });
+                }
+                false
+            }
+            None => true,
+        }
     });
     plan.kept_snapshots.extend(kept);
     prune_released_snapshots(plan);

@@ -144,7 +144,7 @@ Matching follows AWS's rules:
 - a Region-level rule's exclusion tags opt a snapshot out
 - when several rules match, the longest retention period applies
 
-`--require-recycle-bin` turns the report into a gate. Snapshots no rule would retain are kept (`no_recycle_bin`). If the rules can't be read, the region's snapshot deletes are cancelled (exit code 3). Execute re-reads the rules before deleting, so a rule removed after planning stops the deletes. AWS says a rule also retains snapshots that AWS Backup or Data Lifecycle Manager delete, but the gate only evaluates amicleaner's direct snapshot deletes, not recovery-point deletes (`--execute-backup-recovery-point-deletes`).
+`--require-recycle-bin` turns the report into a gate. Snapshots no rule would retain are kept (`no_recycle_bin`). If the rules can't be read, the region's snapshot deletes are cancelled (exit code 3). Execute re-reads the rules before deleting, so a rule removed after planning stops the deletes. AWS says a rule also retains snapshots that AWS Backup or Data Lifecycle Manager delete, so the gate and the coverage report include recovery-point deletes (`--execute-backup-recovery-point-deletes`), matched on the snapshot's own tags.
 
 While a Region-level rule exists, it also holds every snapshot that DLM retires on schedule, and those are billed for the retention period too. AWS notes that the first rule for a resource type in a Region may take a while to start retaining, even once it's `available`, so leave time between creating it and a delete run.
 
@@ -321,7 +321,7 @@ Options:
           [default: 60]
 
       --require-recycle-bin
-          Keep snapshots that no Recycle Bin retention rule would retain after deletion, so each snapshot delete can be undone until the rule's period runs out. If the rules can't be read, no snapshots are deleted in that region. Doesn't evaluate AWS Backup recovery-point deletes. Without this flag the plan still reports whether deletes would be recoverable
+          Keep snapshots that no Recycle Bin retention rule would retain after deletion, so each snapshot delete can be undone until the rule's period runs out. If the rules can't be read, no snapshots are deleted in that region. Covers AWS Backup recovery-point deletes too. Without this flag the plan still reports whether deletes would be recoverable
 
       --delete-orphaned-dlm-snapshots
           Also delete Data Lifecycle Manager snapshots that DLM will never retire: those whose policy was deleted, whose schedule was removed, or whose count-based policy lost its source volume. Only once the newest snapshot of that volume and schedule is older than --min-age-days. The normal rules still apply, including the delete tag (or --allow-untagged), the protect tag, sharing and AWS Backup

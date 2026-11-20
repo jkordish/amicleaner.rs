@@ -46,7 +46,7 @@ use crate::model::{
     AmiInfo, DlmOrphanCause, EXIT_BLOCKED, ExecutionSummary, ExternalUse, KeepReason, LastLaunched,
     RecoveryPointRecord, RecycleBinCoverage, RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
 };
-use crate::model::{Cutoffs, Grant};
+use crate::model::{BackupRecoveryPoint, Cutoffs, Grant};
 use crate::model::{LaunchTemplatePrunePlan, TemplatePrune, VersionKeepReason};
 use crate::plan::{apply_recycle_bin, apply_snapshot_external_use, plan_region};
 use crate::policy::{ami_keep_reason, looks_lifecycle_managed, snapshot_keep_reason};
@@ -4071,6 +4071,56 @@ fn apply_recycle_bin_reports_and_optionally_enforces() {
             .iter()
             .all(|kept| matches!(kept.reason, KeepReason::RecycleBinUnknown(_)))
     );
+    assert_eq!(plan.blocked.len(), 1);
+}
+
+/// AWS Backup recovery-point deletes go through the same gate: Recycle Bin retains snapshots
+/// Backup deletes too, but only when a rule matches.
+#[test]
+fn apply_recycle_bin_covers_recovery_point_deletes() {
+    let old = Utc::now() - Duration::days(400);
+    let backup_plan = || RegionPlan {
+        region: "us-east-1".to_string(),
+        backup_managed_snapshots: vec![
+            make_snapshot(SNAP_A, old, &[]),
+            make_snapshot(SNAP_B, old, &[("Temp", "yes")]),
+        ],
+        delete_backup_recovery_points: [SNAP_A, SNAP_B]
+            .iter()
+            .map(|snapshot_id| BackupRecoveryPoint {
+                snapshot_id: (*snapshot_id).to_string(),
+                backup_vault_name: "Default".to_string(),
+                recovery_point_arn: format!("arn:aws:ec2:us-east-1::snapshot/{snapshot_id}"),
+            })
+            .collect(),
+        ..RegionPlan::default()
+    };
+    let rules = vec![retention_rule("region", 14, &[], &[("Temp", Some("yes"))])];
+
+    let mut plan = backup_plan();
+    apply_recycle_bin(&mut plan, Ok(rules.clone()), false);
+    assert_eq!(plan.delete_backup_recovery_points.len(), 2);
+    let report = RegionReport::from_plan(&plan, None, PRICING);
+    let summary = report.recycle_bin.as_ref().map(|bin| (bin.recoverable, bin.permanent));
+    assert_eq!(summary, Some((1, 1)));
+
+    let mut plan = backup_plan();
+    apply_recycle_bin(&mut plan, Ok(rules), true);
+    assert_eq!(
+        plan.delete_backup_recovery_points
+            .iter()
+            .map(|point| point.snapshot_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![SNAP_A]
+    );
+    assert_eq!(plan.kept_snapshots.len(), 1);
+    assert_eq!(plan.kept_snapshots[0].item.snapshot_id, SNAP_B);
+    assert_eq!(plan.kept_snapshots[0].reason, KeepReason::NoRecycleBin);
+
+    let mut plan = backup_plan();
+    apply_recycle_bin(&mut plan, Err("denied".into()), true);
+    assert!(plan.delete_backup_recovery_points.is_empty());
+    assert_eq!(plan.kept_snapshots.len(), 2);
     assert_eq!(plan.blocked.len(), 1);
 }
 

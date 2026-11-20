@@ -374,7 +374,9 @@ async fn execute_snapshot_deletions(
 
     // --require-recycle-bin: re-read the rules, since one may have been deleted or changed since
     // planning, and only delete snapshots a rule still retains.
-    let recycle_bin_rules = if args.require_recycle_bin && !plan.delete_snapshots.is_empty() {
+    let recycle_bin_rules = if args.require_recycle_bin
+        && !(plan.delete_snapshots.is_empty() && plan.delete_backup_recovery_points.is_empty())
+    {
         match list_snapshot_retention_rules(&reference_clients.rbin).await {
             Ok(rules) => Some(rules),
             Err(error) => {
@@ -413,6 +415,7 @@ async fn execute_snapshot_deletions(
             .filter(|recovery_point| {
                 still_deletable(&recovery_point.snapshot_id).is_some_and(|current| {
                     backup_recovery_point_deletion_tag_allows(&current.tags, args)
+                        && recoverable(current)
                 })
             })
             .collect::<Vec<&BackupRecoveryPoint>>()

@@ -187,7 +187,8 @@ pub(crate) struct RecycleBinReport {
     /// The rules couldn't be read; coverage is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error: Option<String>,
-    /// Planned snapshot deletes a retention rule would keep restorable.
+    /// Planned snapshot deletes (direct and AWS Backup recovery points) a retention rule would
+    /// keep restorable.
     pub(crate) recoverable: usize,
     /// Planned snapshot deletes no rule covers (permanent).
     pub(crate) permanent: usize,
@@ -205,7 +206,8 @@ impl RecycleBinReport {
             RecycleBinCoverage::Checked(days) => Some(Self {
                 error: None,
                 recoverable: days.len(),
-                permanent: plan.delete_snapshots.len().saturating_sub(days.len()),
+                permanent: (plan.delete_snapshots.len() + plan.delete_backup_recovery_points.len())
+                    .saturating_sub(days.len()),
                 min_days: days.values().min().copied(),
                 max_days: days.values().max().copied(),
             }),
@@ -546,10 +548,7 @@ impl RegionReport {
                 }
             };
             if let RecycleBinCoverage::Checked(days) = &plan.recycle_bin {
-                details.push(days.get(&snapshot.snapshot_id).map_or_else(
-                    || "permanent: no Recycle Bin rule covers it".to_string(),
-                    |days| format!("restorable from the Recycle Bin for {days} days"),
-                ));
+                details.push(recycle_bin_detail(days.get(&snapshot.snapshot_id)));
             }
             snapshots.push(snapshot_decision(
                 pricing,
@@ -567,6 +566,9 @@ impl RegionReport {
             ];
             if let Some(ami_id) = plan.snapshots_released_by_ami.get(&point.snapshot_id) {
                 details.push(format!("freed by deregistering {ami_id}"));
+            }
+            if let RecycleBinCoverage::Checked(days) = &plan.recycle_bin {
+                details.push(recycle_bin_detail(days.get(&point.snapshot_id)));
             }
             let snapshot = snapshot_by_id.get(point.snapshot_id.as_str());
             let (size_gib, monthly_cost_usd) =
@@ -681,6 +683,13 @@ impl RegionReport {
             execution,
         }
     }
+}
+
+fn recycle_bin_detail(days: Option<&u32>) -> String {
+    days.map_or_else(
+        || "permanent: no Recycle Bin rule covers it".to_string(),
+        |days| format!("restorable from the Recycle Bin for {days} days"),
+    )
 }
 
 fn keep_action(reason: &KeepReason) -> Action {
