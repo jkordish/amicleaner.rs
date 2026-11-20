@@ -3912,11 +3912,17 @@ fn recycle_bin_days_follows_rule_matching() {
         Some(14)
     );
 
-    // A matching tag-level rule wins over the Region-level one, even when shorter.
-    let tag_rule = retention_rule("dev", 1, &[("Mode", Some("Dev"))], &[]);
-    let both = [region.clone(), tag_rule];
-    assert_eq!(recycle_bin_days(&dev, &both), Some(1));
+    // When several rules match, the longest retention applies, whichever kind it is.
+    let short_tag_rule = retention_rule("dev", 1, &[("Mode", Some("Dev"))], &[]);
+    let both = [region.clone(), short_tag_rule];
+    assert_eq!(recycle_bin_days(&dev, &both), Some(14));
     assert_eq!(recycle_bin_days(&untagged, &both), Some(14));
+    let long_tag_rule = retention_rule("dev-long", 60, &[("Mode", Some("Dev"))], &[]);
+    let both = [region.clone(), long_tag_rule];
+    assert_eq!(recycle_bin_days(&dev, &both), Some(60));
+    // A tag-level rule still covers a snapshot the Region-level rule excludes.
+    let temp_rule = retention_rule("temp", 3, &[("Temp", Some("yes"))], &[]);
+    assert_eq!(recycle_bin_days(&temp, &[region.clone(), temp_rule]), Some(3));
     // A tag rule without a value matches any value of that key.
     let any_value = [retention_rule("any", 7, &[("Mode", None)], &[])];
     assert_eq!(recycle_bin_days(&dev, &any_value), Some(7));

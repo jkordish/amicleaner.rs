@@ -117,10 +117,13 @@ Whenever a plan deletes snapshots, amicleaner reads the region's EBS snapshot ru
 Matching follows AWS's rules:
 
 - only `available` rules count
-- tag-level rules (match on tag key and, if set, value) take precedence over Region-level rules
+- a tag-level rule matches snapshots with one of its tags (key and, if set, value)
 - a Region-level rule's exclusion tags opt a snapshot out
+- when several rules match, the longest retention period applies
 
-`--require-recycle-bin` turns the report into a gate. Snapshots no rule would retain are kept (`no_recycle_bin`). If the rules can't be read, the region's snapshot deletes are cancelled (exit code 3). Execute re-reads the rules before deleting, so a rule removed after planning stops the deletes. It doesn't evaluate AWS Backup recovery-point deletes (`--execute-backup-recovery-point-deletes`).
+`--require-recycle-bin` turns the report into a gate. Snapshots no rule would retain are kept (`no_recycle_bin`). If the rules can't be read, the region's snapshot deletes are cancelled (exit code 3). Execute re-reads the rules before deleting, so a rule removed after planning stops the deletes. AWS says a rule also retains snapshots that AWS Backup or Data Lifecycle Manager delete, but the gate only evaluates amicleaner's direct snapshot deletes, not recovery-point deletes (`--execute-backup-recovery-point-deletes`).
+
+While a Region-level rule exists, it also holds every snapshot that DLM retires on schedule, and those are billed for the retention period too. AWS notes that the first rule for a resource type in a Region may take a while to start retaining, even once it's `available`, so leave time between creating it and a delete run.
 
 [`examples/recycle-bin-rule.yaml`](examples/recycle-bin-rule.yaml) is a small CloudFormation template for a Region-level rule, with a 30-day default and an optional exclusion tag. It's unlocked, so it can be removed after the cleanup:
 

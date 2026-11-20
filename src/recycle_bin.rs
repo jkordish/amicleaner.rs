@@ -84,26 +84,25 @@ fn has_tag(tags: &HashMap<String, String>, rule_tag: &RuleTag) -> bool {
 }
 
 /// Days a deleted snapshot with these tags would stay restorable, or `None` if no available rule
-/// retains it (pure). Matching tag-level rules take precedence over Region-level rules; among
-/// several, the longest retention applies. A rule whose period can't be read (a unit other than
-/// days) doesn't count, so the answer errs towards "not recoverable".
+/// retains it (pure). A tag-level rule matches when the snapshot has one of its tags; a
+/// Region-level rule matches unless the snapshot has one of its exclusion tags. When several
+/// match, the longest retention period applies (EBS user guide, "Considerations for Recycle
+/// Bin"). A rule whose period can't be read (a unit other than days) doesn't count, so the answer
+/// errs towards "not recoverable".
 pub(crate) fn recycle_bin_days(
     tags: &HashMap<String, String>,
     rules: &[RetentionRule],
 ) -> Option<u32> {
-    let available = rules.iter().filter(|rule| rule.available);
-    let tag_level = available
-        .clone()
-        .filter(|rule| !rule.resource_tags.is_empty())
-        .filter(|rule| rule.resource_tags.iter().any(|tag| has_tag(tags, tag)))
-        .collect::<Vec<_>>();
-    let matching = if tag_level.is_empty() {
-        available
-            .filter(|rule| rule.resource_tags.is_empty())
-            .filter(|rule| !rule.exclude_tags.iter().any(|tag| has_tag(tags, tag)))
-            .collect()
-    } else {
-        tag_level
-    };
-    matching.iter().filter_map(|rule| rule.days).max()
+    rules
+        .iter()
+        .filter(|rule| rule.available)
+        .filter(|rule| {
+            if rule.resource_tags.is_empty() {
+                !rule.exclude_tags.iter().any(|tag| has_tag(tags, tag))
+            } else {
+                rule.resource_tags.iter().any(|tag| has_tag(tags, tag))
+            }
+        })
+        .filter_map(|rule| rule.days)
+        .max()
 }
