@@ -8,7 +8,8 @@ use chrono::{DateTime, Utc};
 use log::warn;
 
 use crate::accounts::{
-    AccountScans, SharedKind, accounts_to_scan, resolve_external_use, scan_accounts,
+    AccountScans, CheckAccounts, Owner, SharedKind, accounts_to_scan, resolve_external_use,
+    scan_accounts,
 };
 use crate::aws_backup::{
     apply_backup_classification, block_all_snapshot_deletions, classify_backup_snapshots,
@@ -106,11 +107,11 @@ pub(crate) async fn build_region_plan(
     let mut account_scans = AccountScans::new();
     let mut unused_amis = 0;
     if let Some(check) = &reference_clients.check_accounts {
+        let owner = owner(check, region, reference_clients);
         let accounts = accounts_to_scan(&external_use, check);
-        scan_accounts(args, check, region, &accounts, &[], &mut account_scans).await;
-        let before = external_use.len();
-        resolve_external_use(&mut external_use, SharedKind::Ami, check, &account_scans);
-        unused_amis = before - external_use.len();
+        scan_accounts(args, check, owner, &accounts, &[], &mut account_scans).await;
+        unused_amis =
+            resolve_external_use(&mut external_use, SharedKind::Ami, check, &account_scans);
     }
 
     // Only read DLM policies and volumes when asked to; otherwise every DLM snapshot is kept.
@@ -197,9 +198,9 @@ pub(crate) async fn build_region_plan(
             .filter(|(_, usage)| matches!(usage, ExternalUse::Shared(_)))
             .map(|(snapshot_id, _)| snapshot_id.as_str())
             .collect::<Vec<_>>();
-        scan_accounts(args, check, region, &accounts, &candidates, &mut account_scans).await;
-        let before = snapshot_external_use.len();
-        resolve_external_use(
+        let owner = owner(check, region, reference_clients);
+        scan_accounts(args, check, owner, &accounts, &candidates, &mut account_scans).await;
+        let unused_snapshots = resolve_external_use(
             &mut snapshot_external_use,
             SharedKind::Snapshot,
             check,
@@ -213,11 +214,8 @@ pub(crate) async fn build_region_plan(
             })
             .collect::<Vec<_>>();
         scanned.sort();
-        plan.account_check = Some(AccountCheckSummary {
-            accounts: scanned,
-            unused_amis,
-            unused_snapshots: before - snapshot_external_use.len(),
-        });
+        plan.account_check =
+            Some(AccountCheckSummary { accounts: scanned, unused_amis, unused_snapshots });
     }
     apply_snapshot_external_use(&mut plan, &snapshot_external_use);
 
@@ -256,6 +254,19 @@ pub(crate) async fn build_region_plan(
     }
 
     Ok(plan)
+}
+
+/// The account being cleaned, for `--check-accounts` scans of the others.
+pub(crate) fn owner<'a>(
+    check: &'a CheckAccounts,
+    region: &'a str,
+    reference_clients: &'a ReferenceClients,
+) -> Owner<'a> {
+    Owner {
+        account: check.owner.as_deref(),
+        region,
+        image_builder: reference_clients.image_builder.as_ref(),
+    }
 }
 
 /// Records how long each planned snapshot delete (direct or AWS Backup recovery point) stays

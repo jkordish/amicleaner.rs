@@ -101,6 +101,11 @@ impl ReferenceCollector<'_> {
             match classify_parent_image(&parent, owner.as_deref()) {
                 ParentImage::Reference(reference) => self.record(&reference, &source).await,
                 ParentImage::NotOwned => {}
+                ParentImage::OtherAccountImage(image) => {
+                    self.scan
+                        .other_account_parent_images
+                        .push(OtherAccountImage { source, ..image });
+                }
                 ParentImage::OwnImage(image) => {
                     for ami_id in own_image_builder_amis(&client, &image).await? {
                         let via = format!("{source} (parent image {parent})");
@@ -392,9 +397,9 @@ impl ReferenceCollector<'_> {
     }
 }
 
-/// An Image Builder image in this account that a recipe builds on, e.g. from
+/// An Image Builder image that a recipe builds on, e.g. from
 /// `arn:aws:imagebuilder:us-east-1:123456789012:image/base/1.x.x`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OwnImageBuilderImage {
     pub(crate) name: String,
     /// Semantic version, possibly with `x` wildcards (`1.x.x`, `x.x.x`).
@@ -406,11 +411,26 @@ pub(crate) struct OwnImageBuilderImage {
 pub(crate) enum ParentImage {
     /// An AMI id or `resolve:ssm:` reference, for `ReferenceCollector::record`.
     Reference(String),
-    /// AWS-managed or another account's Image Builder image, or a Marketplace product: its AMIs
-    /// aren't owned by this account.
+    /// An AWS-managed Image Builder image or a Marketplace product: its AMIs aren't owned by any
+    /// account this tool cleans.
     NotOwned,
     OwnImage(OwnImageBuilderImage),
+    /// Another account's Image Builder image. Its AMIs aren't this account's, but when that
+    /// account is the one being cleaned (`--check-accounts`), they're in use here.
+    OtherAccountImage(OtherAccountImage),
     Unresolved(String),
+}
+
+/// A parent image owned by another account, as recorded by a scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OtherAccountImage {
+    pub(crate) account: String,
+    pub(crate) region: String,
+    pub(crate) image: OwnImageBuilderImage,
+    /// The full parent reference, for messages.
+    pub(crate) arn: String,
+    /// What builds on it.
+    pub(crate) source: String,
 }
 
 /// Classifies an Image Builder parent image (or container recipe instance image). The recipe
@@ -430,36 +450,46 @@ pub(crate) fn classify_parent_image(parent: &str, recipe_owner: Option<&str>) ->
     let unresolved =
         || ParentImage::Unresolved(format!("unrecognized Image Builder parent image '{parent}'"));
     let parts = parent.splitn(6, ':').collect::<Vec<&str>>();
-    let [_arn, _partition, service, _region, owner, resource] = parts.as_slice() else {
+    let [_arn, _partition, service, region, owner, resource] = parts.as_slice() else {
         return unresolved();
     };
     if *service != "imagebuilder" {
         return unresolved();
     }
-    if *owner == "aws" || recipe_owner.is_some_and(|recipe_owner| recipe_owner != *owner) {
+    if *owner == "aws" {
         return ParentImage::NotOwned;
     }
 
     let segments = resource.split('/').collect::<Vec<&str>>();
-    match segments.as_slice() {
+    let image = match segments.as_slice() {
         ["image", name, version] if !name.is_empty() && !version.is_empty() => {
-            ParentImage::OwnImage(OwnImageBuilderImage {
+            OwnImageBuilderImage {
                 name: (*name).to_string(),
                 version: (*version).to_string(),
                 build: None,
-            })
+            }
         }
         ["image", name, version, build]
             if !name.is_empty() && !version.is_empty() && !build.is_empty() =>
         {
-            ParentImage::OwnImage(OwnImageBuilderImage {
+            OwnImageBuilderImage {
                 name: (*name).to_string(),
                 version: (*version).to_string(),
                 build: Some((*build).to_string()),
-            })
+            }
         }
-        _ => unresolved(),
+        _ => return unresolved(),
+    };
+    if recipe_owner.is_some_and(|recipe_owner| recipe_owner != *owner) {
+        return ParentImage::OtherAccountImage(OtherAccountImage {
+            account: (*owner).to_string(),
+            region: (*region).to_string(),
+            image,
+            arn: parent.to_string(),
+            source: String::new(),
+        });
     }
+    ParentImage::OwnImage(image)
 }
 
 /// Whether an image version (`1.2.3`, or `1.2.3/4` with a build) matches a version pattern where
@@ -480,7 +510,7 @@ pub(crate) fn image_version_matches(pattern: &str, version: &str) -> bool {
 /// Every AMI produced by any build of the matching versions of one of this account's Image
 /// Builder images. Image Builder picks the latest match at build time; keeping all matches is the
 /// conservative superset.
-async fn own_image_builder_amis(
+pub(crate) async fn own_image_builder_amis(
     client: &imagebuilder::Client,
     image: &OwnImageBuilderImage,
 ) -> AppResult<Vec<String>> {

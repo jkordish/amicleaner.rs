@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use aws_sdk_ec2 as ec2;
+use aws_sdk_imagebuilder as imagebuilder;
 use aws_sdk_sts as sts;
 use aws_types::region::Region;
 use log::warn;
@@ -16,6 +17,7 @@ use log::warn;
 use crate::cli::Args;
 use crate::errors::{describe_sdk_error, error_chain};
 use crate::model::{ExternalUse, Grant, KeepReason};
+use crate::references::services::{OtherAccountImage, own_image_builder_amis};
 use crate::references::{ReferenceClients, collect_referenced_ami_ids};
 
 /// Values per `snapshot-id` filter in one DescribeVolumes call.
@@ -120,17 +122,28 @@ pub(crate) fn accounts_to_scan(
         .collect()
 }
 
+/// The account being cleaned, as other accounts' scans need it: Image Builder recipes there can
+/// build on its images, which only its own Image Builder client can expand to AMI ids.
+#[derive(Clone, Copy)]
+pub(crate) struct Owner<'a> {
+    pub(crate) account: Option<&'a str>,
+    pub(crate) region: &'a str,
+    /// `None` when Image Builder is skipped (`--skip-reference-sources image-builder`).
+    pub(crate) image_builder: Option<&'a imagebuilder::Client>,
+}
+
 /// Scans `accounts` in `region` that aren't in `scans` yet, then checks every listed account for
 /// volumes created from `snapshot_candidates`. Every failure is recorded per account, never
 /// skipped: a failed account keeps whatever is shared with it.
 pub(crate) async fn scan_accounts(
     args: &Args,
     check: &CheckAccounts,
-    region: &str,
+    owner: Owner<'_>,
     accounts: &BTreeSet<String>,
     snapshot_candidates: &[&str],
     scans: &mut AccountScans,
 ) {
+    let region = owner.region;
     for account in accounts {
         let Some(profile) = check.profiles.get(account) else {
             continue;
@@ -151,9 +164,14 @@ pub(crate) async fn scan_accounts(
         .with_label(format!("{profile} · {region}"))
         .with_lt_cache(crate::lt_cache_for_account(args, account));
         let previous = scans.remove(account);
-        let result =
-            check_account(&ec2::Client::new(&config), &clients, previous, snapshot_candidates)
-                .await;
+        let result = check_account(
+            &ec2::Client::new(&config),
+            &clients,
+            owner,
+            previous,
+            snapshot_candidates,
+        )
+        .await;
         scans.insert(account.clone(), result);
     }
 }
@@ -163,22 +181,35 @@ pub(crate) async fn scan_accounts(
 pub(crate) async fn check_account(
     ec2_client: &ec2::Client,
     clients: &ReferenceClients,
+    owner: Owner<'_>,
     previous: Option<Result<AccountUse, String>>,
     snapshot_candidates: &[&str],
 ) -> Result<AccountUse, String> {
     let mut usage = match previous {
         Some(previous) => previous?,
         None => match collect_referenced_ami_ids(ec2_client, clients).await {
-            Ok(scan) if scan.unresolved_references.is_empty() => AccountUse {
-                amis: scan
-                    .referenced_ami_ids
-                    .iter()
-                    .map(|ami_id| {
-                        (ami_id.clone(), scan.sources.get(ami_id).cloned().unwrap_or_default())
-                    })
-                    .collect(),
-                snapshots: scan.snapshot_references,
-            },
+            Ok(scan) if scan.unresolved_references.is_empty() => {
+                let mut usage = AccountUse {
+                    amis: scan
+                        .referenced_ami_ids
+                        .iter()
+                        .map(|ami_id| {
+                            (ami_id.clone(), scan.sources.get(ami_id).cloned().unwrap_or_default())
+                        })
+                        .collect(),
+                    snapshots: scan.snapshot_references,
+                };
+                for parent in &scan.other_account_parent_images {
+                    for ami_id in owner_parent_amis(owner, parent).await? {
+                        let sources = usage.amis.entry(ami_id).or_default();
+                        let source = format!("{} (parent image {})", parent.source, parent.arn);
+                        if !sources.contains(&source) {
+                            sources.push(source);
+                        }
+                    }
+                }
+                usage
+            }
             Ok(scan) => {
                 return Err(format!(
                     "{} unresolved AMI reference(s), so its references aren't fully known",
@@ -202,6 +233,39 @@ pub(crate) async fn check_account(
         }
     }
     Ok(usage)
+}
+
+/// The owner's AMIs a checked account's recipe builds on, when `parent` is one of the owner's
+/// Image Builder images. Anything that can't be told apart or expanded fails the account check.
+async fn owner_parent_amis(
+    owner: Owner<'_>,
+    parent: &OtherAccountImage,
+) -> Result<Vec<String>, String> {
+    let Some(owner_account) = owner.account else {
+        return Err(format!(
+            "{} builds on {}, and the account being cleaned is unknown (STS failed), so it can't \
+             be told apart from it",
+            parent.source, parent.arn
+        ));
+    };
+    if parent.account != owner_account {
+        return Ok(Vec::new());
+    }
+    if parent.region != owner.region {
+        return Err(format!(
+            "{} builds on {} from another region, whose builds aren't read",
+            parent.source, parent.arn
+        ));
+    }
+    let Some(client) = owner.image_builder else {
+        return Err(format!(
+            "{} builds on {}, but Image Builder isn't scanned (--skip-reference-sources)",
+            parent.source, parent.arn
+        ));
+    };
+    own_image_builder_amis(client, &parent.image).await.map_err(|error| {
+        format!("expanding parent image {}: {}", parent.arn, error_chain(error.as_ref()))
+    })
 }
 
 /// (snapshot id, volume id) for volumes in the account created from one of `snapshot_ids`. A
@@ -292,13 +356,15 @@ pub(crate) fn shared_keep_reason(
 }
 
 /// Applies the account checks to sharing results: a shared item that must still be kept becomes
-/// `Kept(reason)`; one no checked account uses is removed, so the normal rules decide it.
+/// `Kept(reason)`; one no checked account uses is removed, so the normal rules decide it. Returns
+/// how many removed items were shared with another account (not just with the owner itself).
 pub(crate) fn resolve_external_use(
     external_use: &mut HashMap<String, ExternalUse>,
     kind: SharedKind,
     check: &CheckAccounts,
     scans: &AccountScans,
-) {
+) -> usize {
+    let mut unused_elsewhere = 0;
     external_use.retain(|id, usage| {
         let ExternalUse::Shared(grants) = usage else {
             return true;
@@ -308,7 +374,13 @@ pub(crate) fn resolve_external_use(
                 *usage = ExternalUse::Kept(reason);
                 true
             }
-            None => false,
+            None => {
+                if check.external(grants).next().is_some() {
+                    unused_elsewhere += 1;
+                }
+                false
+            }
         }
     });
+    unused_elsewhere
 }

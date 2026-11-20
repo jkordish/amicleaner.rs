@@ -96,12 +96,17 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
     let check_accounts = if args.check_accounts.is_empty() {
         None
     } else {
-        let owner = sts::Client::new(&shared_config)
-            .get_caller_identity()
-            .send()
-            .await
-            .ok()
-            .and_then(|identity| identity.account().map(ToString::to_string));
+        let owner = match sts::Client::new(&shared_config).get_caller_identity().send().await {
+            Ok(identity) => identity.account().map(ToString::to_string),
+            Err(error) => {
+                warn!(
+                    "--check-accounts: GetCallerIdentity for the account being cleaned failed: {}; \
+                     launch permissions it grants itself count as shared with an unlisted account",
+                    describe_sdk_error(&error)
+                );
+                None
+            }
+        };
         let resolved = accounts::resolve_check_accounts(args, owner.as_deref()).await;
         if let Some(resolved) = &resolved {
             let listed = resolved

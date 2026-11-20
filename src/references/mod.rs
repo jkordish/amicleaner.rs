@@ -29,6 +29,7 @@ use crate::inventory::{is_ami_id, is_snapshot_id};
 use crate::references::lt_cache::{
     CachedTemplate, CachedVersion, FetchPlan, LaunchTemplateCache, LtCacheConfig, fetch_plan,
 };
+use crate::references::services::OtherAccountImage;
 use crate::ui::{Phase, thousands};
 
 /// Services beyond EC2 and Auto Scaling that can launch an AMI and are scanned for references.
@@ -163,6 +164,9 @@ pub(crate) struct AmiReferenceScan {
     pub(crate) snapshot_references: HashMap<String, Vec<String>>,
     /// Why the scan failed, when it did; snapshot references are then unknown.
     pub(crate) failure: Option<String>,
+    /// Image Builder parent images owned by other accounts. Irrelevant to this account's own
+    /// cleanup; `--check-accounts` expands the ones owned by the account being cleaned.
+    pub(crate) other_account_parent_images: Vec<OtherAccountImage>,
 }
 
 /// One launch template and all its versions, for version pruning.

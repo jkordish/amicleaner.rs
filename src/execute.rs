@@ -25,6 +25,7 @@ use crate::model::{
     AmiInfo, BackupRecoveryPoint, Cutoffs, ExecutionSummary, ExternalUse, RegionPlan, RetryPolicy,
     SnapshotInfo,
 };
+use crate::plan::owner;
 use crate::policy::{
     backup_recovery_point_deletion_tag_allows, looks_backup_created,
     select_latest_ami_ids_by_family, should_deregister_ami, snapshot_is_deletable,
@@ -214,7 +215,8 @@ async fn execute_ami_deregistrations(
     if let Some(check) = &reference_clients.check_accounts {
         let mut scans = AccountScans::new();
         let accounts = accounts_to_scan(&external_use, check);
-        scan_accounts(args, check, &plan.region, &accounts, &[], &mut scans).await;
+        let owner = owner(check, &plan.region, reference_clients);
+        scan_accounts(args, check, owner, &accounts, &[], &mut scans).await;
         resolve_external_use(&mut external_use, SharedKind::Ami, check, &scans);
     }
 
@@ -446,7 +448,8 @@ async fn execute_snapshot_deletions(
             .filter(|(_, usage)| matches!(usage, ExternalUse::Shared(_)))
             .map(|(snapshot_id, _)| snapshot_id.as_str())
             .collect::<Vec<_>>();
-        scan_accounts(args, check, &plan.region, &accounts, &candidates, &mut scans).await;
+        let owner = owner(check, &plan.region, reference_clients);
+        scan_accounts(args, check, owner, &accounts, &candidates, &mut scans).await;
         resolve_external_use(&mut external_use, SharedKind::Snapshot, check, &scans);
     }
 

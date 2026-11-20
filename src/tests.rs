@@ -21,7 +21,7 @@ use ec2::error::ErrorMetadata;
 
 use super::{inert_flag_warnings, is_enabled_region, skipped_reference_sources_warning};
 use crate::accounts::{
-    AccountScans, AccountUse, CheckAccounts, SharedKind, accounts_to_scan, check_account,
+    AccountScans, AccountUse, CheckAccounts, Owner, SharedKind, accounts_to_scan, check_account,
     resolve_external_use, shared_keep_reason,
 };
 use crate::aws_backup::{
@@ -62,8 +62,8 @@ use crate::references::lt_cache::{
     default_cache_dir, fetch_plan,
 };
 use crate::references::services::{
-    OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids, find_snapshot_ids,
-    find_ssm_dynamic_references, image_version_matches,
+    OtherAccountImage, OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids,
+    find_snapshot_ids, find_ssm_dynamic_references, image_version_matches,
 };
 use crate::references::version_ranges;
 use crate::references::{
@@ -1795,9 +1795,20 @@ fn image_builder_parent_images_are_classified() {
         classify_parent_image(&arn("aws", "amazon-linux-2023-x86/x.x.x"), Some(ACCOUNT)),
         ParentImage::NotOwned
     );
+    // Another account's image: recorded, so --check-accounts can tell whether it's ours.
     assert_eq!(
         classify_parent_image(&arn("210987654321", "base/1.0.0"), Some(ACCOUNT)),
-        ParentImage::NotOwned
+        ParentImage::OtherAccountImage(OtherAccountImage {
+            account: "210987654321".to_string(),
+            region: "us-east-1".to_string(),
+            image: OwnImageBuilderImage {
+                name: "base".to_string(),
+                version: "1.0.0".to_string(),
+                build: None
+            },
+            arn: arn("210987654321", "base/1.0.0"),
+            source: String::new(),
+        })
     );
     assert_eq!(
         classify_parent_image(&arn(ACCOUNT, "base/x.x.x"), Some(ACCOUNT)),
@@ -4341,6 +4352,8 @@ fn only_items_shared_with_listed_accounts_cost_a_scan() {
             "ami-0123456789abcdef4".to_string(),
             ExternalUse::Shared(accounts(&[ACCOUNT, CHARLIE11])),
         ),
+        // Shared only with the owner itself: drops out, but wasn't unused "elsewhere".
+        ("ami-0123456789abcdef5".to_string(), ExternalUse::Shared(accounts(&[ACCOUNT]))),
     ]);
     assert_eq!(
         accounts_to_scan(&external_use, &check).into_iter().collect::<Vec<_>>(),
@@ -4352,8 +4365,10 @@ fn only_items_shared_with_listed_accounts_cost_a_scan() {
         (CHARLIE1.to_string(), Ok(AccountUse::default())),
         (CHARLIE11.to_string(), Ok(AccountUse::default())),
     ]);
-    resolve_external_use(&mut external_use, SharedKind::Ami, &check, &scans);
+    let unused_elsewhere = resolve_external_use(&mut external_use, SharedKind::Ami, &check, &scans);
+    assert_eq!(unused_elsewhere, 2, "AMI_A and ...f4, not the owner-only ...f5");
     assert!(!external_use.contains_key("ami-0123456789abcdef4"));
+    assert!(!external_use.contains_key("ami-0123456789abcdef5"));
     // AMI_A is unused everywhere it's shared: it drops out, so the normal rules decide it.
     assert!(!external_use.contains_key(AMI_A));
     assert_eq!(external_use[AMI_B], ExternalUse::Kept(KeepReason::SharedPublicly));
@@ -4399,6 +4414,96 @@ fn instance_rule(instance_id: &'static str, image_id: &'static str) -> aws_smith
     })
 }
 
+/// The account being cleaned, without Image Builder.
+fn test_owner() -> Owner<'static> {
+    Owner { account: Some(ACCOUNT), region: "us-east-1", image_builder: None }
+}
+
+/// A checked account's Image Builder recipe that builds on one of the owner's images uses every
+/// matching build's AMI, which only the owner's Image Builder can list.
+#[tokio::test]
+async fn checked_account_recipes_on_owner_images_use_its_builds() {
+    let checked_image_builder = |parent: String| {
+        let recipes = mock!(imagebuilder::Client::list_image_recipes).then_output(move || {
+            imagebuilder::operation::list_image_recipes::ListImageRecipesOutput::builder()
+                .image_recipe_summary_list(
+                    imagebuilder::types::ImageRecipeSummary::builder()
+                        .arn(format!(
+                            "arn:aws:imagebuilder:us-east-1:{CHARLIE1}:image-recipe/app/1.0.0"
+                        ))
+                        .name("app")
+                        .owner(CHARLIE1)
+                        .parent_image(parent.clone())
+                        .build(),
+                )
+                .build()
+        });
+        let recipe = mock!(imagebuilder::Client::get_image_recipe).then_output(|| {
+            imagebuilder::operation::get_image_recipe::GetImageRecipeOutput::builder()
+                .image_recipe(imagebuilder::types::ImageRecipe::builder().build())
+                .build()
+        });
+        let containers = mock!(imagebuilder::Client::list_container_recipes).then_output(|| {
+            imagebuilder::operation::list_container_recipes::ListContainerRecipesOutput::builder()
+                .build()
+        });
+        mock_client!(aws_sdk_imagebuilder, RuleMode::MatchAny, [&recipes, &recipe, &containers])
+    };
+    let versions = mock!(imagebuilder::Client::list_images).then_output(|| {
+        imagebuilder::operation::list_images::ListImagesOutput::builder()
+            .image_version_list(
+                imagebuilder::types::ImageVersion::builder()
+                    .arn(format!("arn:aws:imagebuilder:us-east-1:{ACCOUNT}:image/base/1.0.0"))
+                    .version("1.0.0")
+                    .build(),
+            )
+            .build()
+    });
+    let builds = mock!(imagebuilder::Client::list_image_build_versions).then_output(|| {
+        imagebuilder::operation::list_image_build_versions::ListImageBuildVersionsOutput::builder()
+            .image_summary_list(
+                imagebuilder::types::ImageSummary::builder()
+                    .output_resources(
+                        imagebuilder::types::OutputResources::builder()
+                            .amis(imagebuilder::types::Ami::builder().image(AMI_B).build())
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let owner_image_builder =
+        mock_client!(aws_sdk_imagebuilder, RuleMode::MatchAny, [&versions, &builds]);
+    let owner = Owner { image_builder: Some(&owner_image_builder), ..test_owner() };
+    let owner_parent = format!("arn:aws:imagebuilder:us-east-1:{ACCOUNT}:image/base/1.x.x");
+    let ec2_client = ec2_with(empty_reference_scan_rules(), &[]);
+    let checked_clients = |parent: &str| {
+        let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+        clients.image_builder = Some(checked_image_builder(parent.to_string()));
+        clients
+    };
+
+    let clients = checked_clients(&owner_parent);
+    let usage = check_account(&ec2_client, &clients, owner, None, &[]).await.unwrap();
+    assert_eq!(
+        usage.amis[AMI_B],
+        vec![format!("Image Builder recipe app (parent image {owner_parent})")]
+    );
+
+    // Can't expand it (Image Builder skipped here) or can't tell whose it is: account unknown.
+    let error = check_account(&ec2_client, &clients, test_owner(), None, &[]).await.unwrap_err();
+    assert!(error.contains("Image Builder isn't scanned"), "{error}");
+    let unknown_owner = Owner { account: None, ..owner };
+    let error = check_account(&ec2_client, &clients, unknown_owner, None, &[]).await.unwrap_err();
+    assert!(error.contains("unknown"), "{error}");
+
+    // A third account's image isn't ours: nothing to expand.
+    let clients = checked_clients("arn:aws:imagebuilder:us-east-1:333333333333:image/base/1.x.x");
+    let usage = check_account(&ec2_client, &clients, owner, None, &[]).await.unwrap();
+    assert!(usage.amis.is_empty());
+    assert_eq!(builds.num_calls(), 1);
+}
+
 #[tokio::test]
 async fn checking_an_account_reads_its_references_and_volumes() {
     let instances = instance_rule("i-1", AMI_A);
@@ -4408,16 +4513,19 @@ async fn checking_an_account_reads_its_references_and_volumes() {
     let ec2_client = ec2_with(rules, &[&volumes]);
     let clients = reference_clients(empty_asg_client(), no_ssm_client());
 
-    let usage = check_account(&ec2_client, &clients, None, &[SNAP_A]).await.unwrap();
+    let usage = check_account(&ec2_client, &clients, test_owner(), None, &[SNAP_A]).await.unwrap();
     assert_eq!(usage.amis[AMI_A], vec!["instance i-1".to_string()]);
     assert_eq!(usage.snapshots[SNAP_A], vec!["volume vol-1".to_string()]);
 
     // Already scanned: only the volume check runs; a failed earlier scan stays failed.
     let previous = Ok(AccountUse::default());
-    let usage = check_account(&ec2_client, &clients, Some(previous), &[SNAP_A]).await.unwrap();
+    let usage = check_account(&ec2_client, &clients, test_owner(), Some(previous), &[SNAP_A])
+        .await
+        .unwrap();
     assert!(usage.amis.is_empty());
     assert_eq!(usage.snapshots[SNAP_A], vec!["volume vol-1".to_string()]);
-    let failed = check_account(&ec2_client, &clients, Some(Err("denied".into())), &[]).await;
+    let failed =
+        check_account(&ec2_client, &clients, test_owner(), Some(Err("denied".into())), &[]).await;
     assert_eq!(failed, Err("denied".to_string()));
 
     // A volume lookup that fails makes the account unknown.
@@ -4428,7 +4536,8 @@ async fn checking_an_account_reads_its_references_and_volumes() {
         ))
     });
     let ec2_client = ec2_with(empty_reference_scan_rules(), &[&denied]);
-    let error = check_account(&ec2_client, &clients, None, &[SNAP_A]).await.unwrap_err();
+    let error =
+        check_account(&ec2_client, &clients, test_owner(), None, &[SNAP_A]).await.unwrap_err();
     assert!(error.contains("UnauthorizedOperation"), "{error}");
 
     // Unresolved references make the account unknown too.
@@ -4444,7 +4553,7 @@ async fn checking_an_account_reads_its_references_and_volumes() {
     let ec2_client = ec2_with(rules, &[]);
     let ssm_client = mock_client!(aws_sdk_ssm, RuleMode::MatchAny, [&missing]);
     let clients = reference_clients(empty_asg_client(), ssm_client);
-    let error = check_account(&ec2_client, &clients, None, &[]).await.unwrap_err();
+    let error = check_account(&ec2_client, &clients, test_owner(), None, &[]).await.unwrap_err();
     assert!(error.contains("unresolved"), "{error}");
 }
 
