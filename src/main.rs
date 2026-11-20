@@ -281,8 +281,13 @@ fn skipped_reference_sources_warning(skipped: &[ReferenceSource]) -> Option<Stri
         .collect::<Vec<String>>();
     names.sort_unstable();
     names.dedup();
+    // Image Builder recipes and CloudFormation can also name snapshots directly.
+    let snapshots_too = skipped.iter().any(|source| {
+        matches!(source, ReferenceSource::ImageBuilder | ReferenceSource::Cloudformation)
+    });
+    let what = if snapshots_too { "AMIs and snapshots" } else { "AMIs" };
     Some(format!(
-        "not scanning {} for AMI references (--skip-reference-sources); AMIs used only there are not protected",
+        "not scanning {} for AMI references (--skip-reference-sources); {what} used only there are not protected",
         names.join(", ")
     ))
 }

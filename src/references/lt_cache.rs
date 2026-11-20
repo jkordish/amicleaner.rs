@@ -152,7 +152,7 @@ impl LaunchTemplateCache {
                     && header.region == region => {}
             Ok(header) if header.schema_version != SCHEMA_VERSION => {
                 warn!(
-                    "launch template cache {} is from an older version (format {}); rebuilding it",
+                    "launch template cache {} has format {} (this version uses {SCHEMA_VERSION}); rebuilding it",
                     path.display(),
                     header.schema_version
                 );

@@ -1031,6 +1031,10 @@ async fn missing_launch_template_is_ignored_but_other_errors_are_unresolved() {
         reason.contains("lt-denied") && reason.contains("UnauthorizedOperation"),
         "{reason}"
     );
+    assert!(
+        collector.scan.failure.as_deref().is_some_and(|failure| failure.contains("lt-denied")),
+        "its block devices are unknown, so snapshot references are too"
+    );
 }
 
 #[tokio::test]
@@ -1931,7 +1935,18 @@ async fn image_builder_recipes_reference_parents_and_builds_of_own_images() {
             .container_recipe(
                 imagebuilder::types::ContainerRecipe::builder()
                     .instance_configuration(
-                        imagebuilder::types::InstanceConfiguration::builder().image(AMI_C).build(),
+                        imagebuilder::types::InstanceConfiguration::builder()
+                            .image(AMI_C)
+                            .block_device_mappings(
+                                imagebuilder::types::InstanceBlockDeviceMapping::builder()
+                                    .ebs(
+                                        imagebuilder::types::EbsInstanceBlockDeviceSpecification::builder()
+                                            .snapshot_id(SNAP_B)
+                                            .build(),
+                                    )
+                                    .build(),
+                            )
+                            .build(),
                     )
                     .build(),
             )
@@ -1985,7 +2000,10 @@ async fn image_builder_recipes_reference_parents_and_builds_of_own_images() {
     assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B, AMI_C]), "2.0.0 doesn't match 1.x.x");
     assert_eq!(
         collector.scan.snapshot_references,
-        HashMap::from([(SNAP_A.to_string(), vec!["Image Builder recipe a".to_string()])])
+        HashMap::from([
+            (SNAP_A.to_string(), vec!["Image Builder recipe a".to_string()]),
+            (SNAP_B.to_string(), vec!["Image Builder container recipe <unnamed>".to_string()]),
+        ])
     );
     assert!(
         collector.scan.unresolved_references.is_empty(),
@@ -2047,7 +2065,7 @@ async fn cloudformation_templates_and_parameters_reference_amis() {
     let template = mock!(cloudformation::Client::get_template).then_output(|| {
         cloudformation::operation::get_template::GetTemplateOutput::builder()
             .template_body(format!(
-                "Resources:\n  Lt:\n    ImageId: {AMI_C}\n  Other:\n    ImageId: '{{{{resolve:ssm:/amis/app}}}}'\n    VpcId: '{{{{resolve:ssm:/config/vpc}}}}'\n"
+                "Resources:\n  Lt:\n    ImageId: {AMI_C}\n  Other:\n    ImageId: '{{{{resolve:ssm:/amis/app}}}}'\n    VpcId: '{{{{resolve:ssm:/config/vpc}}}}'\n  Data:\n    SnapshotId: '{{{{resolve:ssm:/golden/data-snap}}}}'\n"
             ))
             .build()
     });
@@ -2055,7 +2073,8 @@ async fn cloudformation_templates_and_parameters_reference_amis() {
         mock_client!(aws_sdk_cloudformation, RuleMode::MatchAny, [&stacks, &template]);
     let app = ssm_parameter_rule("/amis/app", AMI_D);
     let vpc = ssm_parameter_rule("/config/vpc", "vpc-0123456789abcdef0");
-    let ssm_client = mock_client!(aws_sdk_ssm, RuleMode::MatchAny, [&app, &vpc]);
+    let data = ssm_parameter_rule("/golden/data-snap", SNAP_A);
+    let ssm_client = mock_client!(aws_sdk_ssm, RuleMode::MatchAny, [&app, &vpc, &data]);
     let ec2_client = empty_ec2();
     let mut clients = reference_clients(empty_asg_client(), ssm_client);
     clients.cloudformation = Some(cloudformation);
@@ -2064,6 +2083,10 @@ async fn cloudformation_templates_and_parameters_reference_amis() {
     collector.collect_cloudformation_stacks().await.unwrap();
 
     assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B, AMI_C, AMI_D]));
+    assert!(
+        collector.scan.snapshot_references.contains_key(SNAP_A),
+        "a snapshot id held by an SSM parameter the template resolves"
+    );
     assert!(
         collector.scan.unresolved_references.is_empty(),
         "a non-AMI parameter is fine: {:?}",
@@ -2295,6 +2318,12 @@ fn skipping_reference_sources_is_announced() {
         warning.starts_with("not scanning emr, image-builder for AMI references"),
         "{warning}"
     );
+    assert!(
+        warning.ends_with("AMIs and snapshots used only there are not protected"),
+        "{warning}"
+    );
+    let warning = skipped_reference_sources_warning(&[ReferenceSource::Emr]).unwrap();
+    assert!(warning.ends_with("; AMIs used only there are not protected"), "{warning}");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2346,15 +2375,21 @@ async fn launch_template_deleted_during_the_scan_is_skipped() {
         "lt-0123456789abcdef0",
         "lt-0123456789abcdef1",
         "lt-0123456789abcdef2",
+        "lt-0123456789abcdef3",
     ]);
     let first = template_versions_rule("lt-0123456789abcdef0", AMI_A);
     let gone =
         template_versions_error_rule("lt-0123456789abcdef1", "InvalidLaunchTemplateId.NotFound");
     let third = template_versions_rule("lt-0123456789abcdef2", AMI_B);
+    // The template exists but the range has no versions left (pruned): not "deleted".
+    let empty_range = template_versions_error_rule(
+        "lt-0123456789abcdef3",
+        "InvalidLaunchTemplateId.VersionNotFound",
+    );
     let ec2_client = mock_client!(
         aws_sdk_ec2,
         RuleMode::MatchAny,
-        [&templates, &first, &gone, &third],
+        [&templates, &first, &gone, &third, &empty_range],
         no_sdk_retries
     );
     let clients = reference_clients(empty_asg_client(), no_ssm_client());
@@ -2369,6 +2404,7 @@ async fn launch_template_deleted_during_the_scan_is_skipped() {
         !collector.scanned_launch_templates.contains("lt-0123456789abcdef1"),
         "not scanned, so an ASG ref is still checked"
     );
+    assert!(collector.scanned_launch_templates.contains("lt-0123456789abcdef3"));
 }
 
 #[tokio::test]

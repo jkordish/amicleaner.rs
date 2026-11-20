@@ -79,15 +79,22 @@ impl ReferenceCollector<'_> {
                     .send()
                     .await
                     .aws_context("GetContainerRecipe")?;
-                if let Some(image) = recipe
-                    .container_recipe()
-                    .and_then(|recipe| recipe.instance_configuration())
-                    .and_then(|instance| instance.image())
+                let source = format!(
+                    "Image Builder container recipe {}",
+                    summary.name().unwrap_or("<unnamed>")
+                );
+                let instance =
+                    recipe.container_recipe().and_then(|recipe| recipe.instance_configuration());
+                // The build instance's block devices can restore volumes from snapshots.
+                for snapshot_id in instance
+                    .map(|instance| instance.block_device_mappings())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|mapping| mapping.ebs().and_then(|ebs| ebs.snapshot_id()))
                 {
-                    let source = format!(
-                        "Image Builder container recipe {}",
-                        summary.name().unwrap_or("<unnamed>")
-                    );
+                    self.scan.add_snapshot_reference(snapshot_id, &source);
+                }
+                if let Some(image) = instance.and_then(|instance| instance.image()) {
                     parents.push((
                         image.to_string(),
                         summary.owner().map(ToString::to_string),
@@ -160,7 +167,13 @@ impl ReferenceCollector<'_> {
         // (8 at a time got throttled in delta0), so it gets its own small cap.
         let templates = stream::iter(&stack_ids)
             .map(|stack_id| {
-                let request = client.get_template().stack_name(stack_id).send();
+                // Processed (the API default, made explicit): what transforms and macros expand
+                // to, which is what an update or rollback launches.
+                let request = client
+                    .get_template()
+                    .stack_name(stack_id)
+                    .template_stage(aws_sdk_cloudformation::types::TemplateStage::Processed)
+                    .send();
                 async move { request.await.aws_context(&format!("GetTemplate({stack_id})")) }
             })
             .buffered(self.clients.concurrency.min(CLOUDFORMATION_CONCURRENCY))
@@ -370,8 +383,9 @@ impl ReferenceCollector<'_> {
         Ok(())
     }
 
-    /// Records any AMI ids an SSM parameter holds. Unlike `record`, a value that isn't an AMI is
-    /// fine here (templates resolve all kinds of parameters); only a failed lookup is unresolved.
+    /// Records any AMI and snapshot ids an SSM parameter holds. Unlike `record`, a value that isn't
+    /// an AMI is fine here (templates resolve all kinds of parameters); only a failed lookup is
+    /// unresolved.
     pub(crate) async fn record_ssm_parameter_amis(&mut self, parameter: &str, stack_id: &str) {
         match self.clients.ssm.get_parameter().name(parameter).send().await {
             Ok(output) => {
@@ -380,6 +394,9 @@ impl ReferenceCollector<'_> {
                         format!("CloudFormation stack {stack_id} via SSM parameter {parameter}");
                     for ami_id in find_ami_ids(value) {
                         self.scan.add_reference(ami_id, &source);
+                    }
+                    for snapshot_id in find_snapshot_ids(value) {
+                        self.scan.add_snapshot_reference(&snapshot_id, &source);
                     }
                 }
             }

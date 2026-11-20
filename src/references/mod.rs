@@ -162,7 +162,8 @@ pub(crate) struct AmiReferenceScan {
     /// Snapshot id -> the first few things that name it (block device mappings, CloudFormation).
     /// Something that names a snapshot can create a volume from it.
     pub(crate) snapshot_references: HashMap<String, Vec<String>>,
-    /// Why the scan failed, when it did; snapshot references are then unknown.
+    /// Why the scan failed or a snapshot-relevant source couldn't be read, when that happened;
+    /// snapshot references are then unknown.
     pub(crate) failure: Option<String>,
     /// Image Builder parent images owned by other accounts. Irrelevant to this account's own
     /// cleanup; `--check-accounts` expands the ones owned by the account being cleaned.
@@ -693,12 +694,15 @@ impl ReferenceCollector<'_> {
                     return;
                 }
                 Err(error) => {
-                    self.scan.unresolved_references.insert(format!(
+                    let reason = format!(
                         "failed to describe launch template {} for Auto Scaling group {}: {}",
                         label,
                         group_name.unwrap_or("<unnamed>"),
                         describe_sdk_error(&error)
-                    ));
+                    );
+                    // Its block devices (snapshots) are unknown too, not just its image.
+                    self.scan.failure.get_or_insert_with(|| reason.clone());
+                    self.scan.unresolved_references.insert(reason);
                     return;
                 }
             }
@@ -953,6 +957,9 @@ async fn launch_template_versions(
     while let Some(page) = pages.next().await {
         let output = match page {
             Ok(output) => output,
+            // A range whose versions were all deleted: nothing to read there. Only the template
+            // itself being gone means `None`.
+            Err(error) if error.code() == Some(LAUNCH_TEMPLATE_VERSION_NOT_FOUND) => break,
             Err(error) if is_launch_template_not_found(error.code()) => return Ok(None),
             Err(error) => return Err(error).aws_context("DescribeLaunchTemplateVersions"),
         };
@@ -991,8 +998,15 @@ async fn launch_template_versions(
     Ok(Some(fetched))
 }
 
+/// A version (or version range) that doesn't exist in a template that does.
+const LAUNCH_TEMPLATE_VERSION_NOT_FOUND: &str = "InvalidLaunchTemplateId.VersionNotFound";
+
+/// The launch template itself doesn't exist (by id or by name). A missing *version* isn't this.
 fn is_launch_template_not_found(code: Option<&str>) -> bool {
-    code.is_some_and(|code| code.starts_with("InvalidLaunchTemplate") && code.contains("NotFound"))
+    matches!(
+        code,
+        Some("InvalidLaunchTemplateId.NotFound" | "InvalidLaunchTemplateName.NotFoundException")
+    )
 }
 
 pub(crate) async fn resolve_image_reference(

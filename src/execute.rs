@@ -96,6 +96,9 @@ pub(crate) async fn execute_region_plan(
     .await;
 
     let snapshot_references = match &reference_scan {
+        Some(Ok(scan)) if let Some(failure) = &scan.failure => {
+            Err(format!("snapshot references unknown at execution time: {failure}"))
+        }
         Some(Ok(scan)) => Ok(&scan.snapshot_references),
         Some(Err(error)) => Err(format!("reference scan failed at execution time: {error}")),
         None => Err("no reference scan at execution time".to_string()),
