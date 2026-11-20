@@ -1297,8 +1297,15 @@ fn ec2_with(
     mock_client!(aws_sdk_ec2, RuleMode::MatchAny, rules.iter(), no_sdk_retries)
 }
 
+/// AWS Backup with no vaults (so no recovery points).
 fn no_backup_client() -> backup::Client {
-    mock_client!(aws_sdk_backup, RuleMode::MatchAny, Vec::<&aws_smithy_mocks::Rule>::new())
+    mock_client!(aws_sdk_backup, RuleMode::MatchAny, [&no_vaults_rule()])
+}
+
+fn no_vaults_rule() -> aws_smithy_mocks::Rule {
+    mock!(backup::Client::list_backup_vaults).then_output(|| {
+        backup::operation::list_backup_vaults::ListBackupVaultsOutput::builder().build()
+    })
 }
 
 fn no_ssm_client() -> ssm::Client {
@@ -1456,8 +1463,51 @@ fn recovery_point_plan(args: &Args) -> RegionPlan {
     plan
 }
 
+/// AWS Backup listing one vault ("Default") with SNAP_A's recovery point in `status`, plus
+/// a delete rule, whose call count the caller checks.
+fn backup_with_recovery_point(
+    status: &'static str,
+    delete: &aws_smithy_mocks::Rule,
+) -> backup::Client {
+    let vaults = mock!(backup::Client::list_backup_vaults).then_output(|| {
+        backup::operation::list_backup_vaults::ListBackupVaultsOutput::builder()
+            .backup_vault_list(
+                backup::types::BackupVaultListMember::builder()
+                    .backup_vault_name("Default")
+                    .vault_type(backup::types::VaultType::BackupVault)
+                    .build(),
+            )
+            .build()
+    });
+    let points = mock!(backup::Client::list_recovery_points_by_backup_vault).then_output(move || {
+        backup::operation::list_recovery_points_by_backup_vault::ListRecoveryPointsByBackupVaultOutput::builder()
+            .recovery_points(
+                backup::types::RecoveryPointByBackupVault::builder()
+                    .recovery_point_arn(format!("arn:aws:ec2:us-east-1::snapshot/{SNAP_A}"))
+                    .resource_arn("arn:aws:ec2:us-east-1:123456789012:volume/vol-0123456789abcdef0")
+                    .status(backup::types::RecoveryPointStatus::from(status))
+                    .build(),
+            )
+            .build()
+    });
+    mock_client!(aws_sdk_backup, RuleMode::MatchAny, [&vaults, &points, delete])
+}
+
+fn delete_recovery_point_rule() -> aws_smithy_mocks::Rule {
+    mock!(backup::Client::delete_recovery_point).then_output(|| {
+        backup::operation::delete_recovery_point::DeleteRecoveryPointOutput::builder().build()
+    })
+}
+
 async fn execute_recovery_point_plan(
     live_snapshot_tags: &[(&str, &str)],
+) -> (ExecutionSummary, usize) {
+    execute_recovery_point_plan_with(live_snapshot_tags, "COMPLETED").await
+}
+
+async fn execute_recovery_point_plan_with(
+    live_snapshot_tags: &[(&str, &str)],
+    live_status: &'static str,
 ) -> (ExecutionSummary, usize) {
     let mut args = test_args();
     args.execute = true;
@@ -1467,10 +1517,8 @@ async fn execute_recovery_point_plan(
     let images = images_rule(Vec::new());
     let snapshots = snapshots_rule(vec![ec2_snapshot(SNAP_A, live_snapshot_tags)]);
     let ec2_client = ec2_with(empty_reference_scan_rules(), &[&images, &snapshots]);
-    let delete_recovery_point = mock!(backup::Client::delete_recovery_point).then_output(|| {
-        backup::operation::delete_recovery_point::DeleteRecoveryPointOutput::builder().build()
-    });
-    let backup_client = mock_client!(aws_sdk_backup, RuleMode::MatchAny, [&delete_recovery_point]);
+    let delete_recovery_point = delete_recovery_point_rule();
+    let backup_client = backup_with_recovery_point(live_status, &delete_recovery_point);
 
     let summary = execute_region_plan(
         &ec2_client,
@@ -1507,6 +1555,89 @@ async fn recovery_point_deletion_rechecks_the_live_snapshot() {
         assert_eq!(summary.skipped_backup_recovery_points, 1, "{live_tags:?}");
         assert_eq!(calls, 0, "{live_tags:?}");
     }
+
+    // The recovery point itself changed since planning (re-read from AWS Backup): kept.
+    let tags = [("cleanup", "true"), ("backup-cleanup", "true")];
+    let (summary, calls) = execute_recovery_point_plan_with(&tags, "PARTIAL").await;
+    assert_eq!((summary.skipped_backup_recovery_points, calls), (1, 0));
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+}
+
+/// A planned direct delete that became an AWS Backup recovery point is no longer deleted
+/// directly, and one whose Backup listing fails is blocked.
+#[tokio::test]
+async fn direct_delete_is_rechecked_against_aws_backup() {
+    let mut args = test_args();
+    args.execute = true;
+    let old = Utc::now() - Duration::days(365);
+    let plan = plan(
+        &args,
+        Vec::new(),
+        vec![make_snapshot(SNAP_A, old, &[("cleanup", "true")])],
+        &scan(&[], &[]),
+    );
+    assert_eq!(plan.delete_snapshots.len(), 1);
+    let images = images_rule(Vec::new());
+    let snapshots = snapshots_rule(vec![ec2_snapshot(SNAP_A, &[("cleanup", "true")])]);
+    let delete = mock!(ec2::Client::delete_snapshot)
+        .then_output(|| ec2::operation::delete_snapshot::DeleteSnapshotOutput::builder().build());
+    let ec2_client = ec2_with(empty_reference_scan_rules(), &[&images, &snapshots, &delete]);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+
+    let unused = delete_recovery_point_rule();
+    let backup_client = backup_with_recovery_point("COMPLETED", &unused);
+    let summary = execute_region_plan(&ec2_client, &backup_client, &clients, &plan, &args).await;
+    assert_eq!((summary.deleted_snapshots, summary.skipped_snapshots), (0, 1));
+    assert_eq!((delete.num_calls(), unused.num_calls()), (0, 0));
+
+    let denied = mock!(backup::Client::list_backup_vaults).then_error(|| {
+        backup::operation::list_backup_vaults::ListBackupVaultsError::generic(ec2_error(
+            "AccessDeniedException",
+            "no",
+        ))
+    });
+    let backup_client = mock_client!(aws_sdk_backup, RuleMode::MatchAny, [&denied]);
+    let summary = execute_region_plan(&ec2_client, &backup_client, &clients, &plan, &args).await;
+    assert_eq!(delete.num_calls(), 0);
+    assert!(
+        summary.blocked.iter().any(|reason| reason.contains("AWS Backup inventory")),
+        "{:?}",
+        summary.blocked
+    );
+
+    // No recovery point: deleted directly.
+    let summary =
+        execute_region_plan(&ec2_client, &no_backup_client(), &clients, &plan, &args).await;
+    assert_eq!(summary.deleted_snapshots, 1, "{summary:?}");
+}
+
+/// Something already gone (a retried delete whose first response was lost, or deleted by someone
+/// else) is skipped, not a failure.
+#[tokio::test]
+async fn already_deleted_snapshot_is_not_a_failure() {
+    let mut args = test_args();
+    args.execute = true;
+    let old = Utc::now() - Duration::days(365);
+    let plan = plan(
+        &args,
+        Vec::new(),
+        vec![make_snapshot(SNAP_A, old, &[("cleanup", "true")])],
+        &scan(&[], &[]),
+    );
+    let images = images_rule(Vec::new());
+    let snapshots = snapshots_rule(vec![ec2_snapshot(SNAP_A, &[("cleanup", "true")])]);
+    let gone = mock!(ec2::Client::delete_snapshot).then_error(|| {
+        ec2::operation::delete_snapshot::DeleteSnapshotError::generic(ec2_error(
+            "InvalidSnapshot.NotFound",
+            "The snapshot does not exist.",
+        ))
+    });
+    let ec2_client = ec2_with(empty_reference_scan_rules(), &[&images, &snapshots, &gone]);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let summary =
+        execute_region_plan(&ec2_client, &no_backup_client(), &clients, &plan, &args).await;
+    assert!(summary.failures.is_empty(), "{:?}", summary.failures);
+    assert_eq!((summary.deleted_snapshots, summary.skipped_snapshots), (0, 1));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1644,10 +1775,8 @@ async fn recovery_point_for_a_shared_snapshot_is_not_deleted() {
         &[("cleanup", "true"), ("backup-cleanup", "true")],
     )]);
     let ec2_client = ec2_with(rules, &[&images, &snapshots]);
-    let delete_recovery_point = mock!(backup::Client::delete_recovery_point).then_output(|| {
-        backup::operation::delete_recovery_point::DeleteRecoveryPointOutput::builder().build()
-    });
-    let backup_client = mock_client!(aws_sdk_backup, RuleMode::MatchAny, [&delete_recovery_point]);
+    let delete_recovery_point = delete_recovery_point_rule();
+    let backup_client = backup_with_recovery_point("COMPLETED", &delete_recovery_point);
 
     let summary = execute_region_plan(
         &ec2_client,

@@ -14,6 +14,7 @@ use ec2::error::{ProvideErrorMetadata, SdkError};
 use crate::accounts::{
     AccountScans, SharedKind, accounts_to_scan, resolve_external_use, scan_accounts,
 };
+use crate::aws_backup::{classify_backup_snapshots, list_ebs_recovery_points};
 use crate::cli::Args;
 use crate::dlm::{load_dlm_inventory, orphaned_dlm_snapshots};
 use crate::errors::{describe_sdk_error, error_chain};
@@ -22,12 +23,11 @@ use crate::inventory::{
 };
 use crate::lt_prune::execute_launch_template_pruning;
 use crate::model::{
-    AmiInfo, BackupRecoveryPoint, Cutoffs, ExecutionSummary, ExternalUse, RegionPlan, RetryPolicy,
-    SnapshotInfo,
+    AmiInfo, BackupClassification, BackupRecoveryPoint, Cutoffs, ExecutionSummary, ExternalUse,
+    RegionPlan, RetryPolicy, SnapshotInfo,
 };
 use crate::plan::owner;
 use crate::policy::{
-    backup_recovery_point_deletion_tag_allows, looks_backup_created,
     select_latest_ami_ids_by_family, should_deregister_ami, snapshot_is_deletable,
     snapshot_reference_keep_reason,
 };
@@ -37,6 +37,11 @@ use crate::ui::Phase;
 
 /// EC2 returns this error code when a `DryRun=true` request would have succeeded.
 const DRY_RUN_OPERATION: &str = "DryRunOperation";
+
+/// Error codes meaning the thing to delete no longer exists.
+const AMI_GONE: &[&str] = &["InvalidAMIID.NotFound", "InvalidAMIID.Unavailable"];
+const SNAPSHOT_GONE: &[&str] = &["InvalidSnapshot.NotFound"];
+const RECOVERY_POINT_GONE: &[&str] = &["ResourceNotFoundException"];
 
 /// Error codes worth retrying: throttling and transient server-side failures.
 const RETRYABLE_ERROR_CODES: &[&str] = &[
@@ -70,20 +75,18 @@ pub(crate) async fn execute_region_plan(
     let mut summary = ExecutionSummary { dry_run: args.dry_run, ..ExecutionSummary::default() };
     let cutoffs = Cutoffs::new(args, Utc::now());
 
-    // One fresh reference scan serves both phases: AMI references for deregistration, snapshot
-    // references for deletion.
-    let reference_scan = if plan.deregister_amis.is_empty()
-        && plan.delete_snapshots.is_empty()
-        && plan.delete_backup_recovery_points.is_empty()
-    {
-        None
-    } else {
-        Some(
-            collect_referenced_ami_ids(ec2_client, reference_clients)
-                .await
-                .map_err(|error| error_chain(error.as_ref())),
-        )
+    // A fresh reference scan for the AMI phase. The snapshot phase reuses it unless the AMI
+    // phase did work (which can take a while: retries, other accounts' scans), in which case it
+    // gets its own, so a snapshot named meanwhile isn't deleted.
+    let snapshot_work =
+        !(plan.delete_snapshots.is_empty() && plan.delete_backup_recovery_points.is_empty());
+    let scan = || async {
+        collect_referenced_ami_ids(ec2_client, reference_clients)
+            .await
+            .map_err(|error| error_chain(error.as_ref()))
     };
+    let reference_scan =
+        if plan.deregister_amis.is_empty() && !snapshot_work { None } else { Some(scan().await) };
 
     let released_amis = execute_ami_deregistrations(
         ec2_client,
@@ -95,6 +98,11 @@ pub(crate) async fn execute_region_plan(
     )
     .await;
 
+    let reference_scan = if snapshot_work && !plan.deregister_amis.is_empty() {
+        Some(scan().await)
+    } else {
+        reference_scan
+    };
     let snapshot_references = match &reference_scan {
         Some(Ok(scan)) if let Some(failure) = &scan.failure => {
             Err(format!("snapshot references unknown at execution time: {failure}"))
@@ -250,14 +258,20 @@ async fn execute_ami_deregistrations(
             }
         }
 
-        let result = send_with_retries(retry_policy, args.dry_run, || {
+        let result = send_mutation(retry_policy, args.dry_run, AMI_GONE, || {
             ec2_client.deregister_image().image_id(&ami.ami_id).dry_run(args.dry_run).send()
         })
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(Sent::Done(_)) => {
                 summary.deregistered_amis += 1;
+                released_amis.insert(ami.ami_id.clone());
+            }
+            Ok(Sent::Gone(code)) => {
+                // Gone either way, so it no longer holds its snapshots.
+                log::warn!("{} was already deregistered ({code})", ami.ami_id);
+                summary.skipped_amis += 1;
                 released_amis.insert(ami.ami_id.clone());
             }
             Err(error) => {
@@ -402,33 +416,79 @@ async fn execute_snapshot_deletions(
             .is_none_or(|rules| recycle_bin_days(&current.tags, rules).is_some())
     };
 
+    // Candidates that still pass the live snapshot rules (and the Recycle Bin requirement).
+    let recovery_points_wanted = args.execute_backup_recovery_point_deletes;
+    let candidates = plan
+        .delete_snapshots
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id.as_str())
+        .chain(
+            plan.delete_backup_recovery_points
+                .iter()
+                .filter(|_| recovery_points_wanted)
+                .map(|point| point.snapshot_id.as_str()),
+        )
+        .filter_map(&still_deletable)
+        .filter(|current| recoverable(current))
+        .cloned()
+        .collect::<Vec<SnapshotInfo>>();
+
+    // AWS Backup is re-read and the candidates re-classified with the plan's function: a
+    // snapshot that became a recovery point, or a recovery point that changed status, vault lock
+    // or vault since planning, is no longer deleted the planned way.
+    let classification = if candidates.is_empty() {
+        BackupClassification::default()
+    } else {
+        match list_ebs_recovery_points(backup_client).await {
+            Ok(records) => classify_backup_snapshots(&candidates, &records, args),
+            Err(error) => {
+                summary.blocked.push(format!(
+                    "snapshot deletions cancelled: AWS Backup inventory unavailable at execution time: {}",
+                    error_chain(error.as_ref())
+                ));
+                BackupClassification::default()
+            }
+        }
+    };
+    let uncertain =
+        classification.blocked.iter().filter(|blocked| blocked.uncertain).collect::<Vec<_>>();
+    if let Some(example) = uncertain.first() {
+        summary.blocked.push(format!(
+            "{} snapshot deletion(s) skipped at execution time: AWS Backup ownership unknown (e.g. {}: {})",
+            uncertain.len(),
+            example.snapshot.snapshot_id,
+            example.reason
+        ));
+    }
+    let direct_ok = classification
+        .direct_delete
+        .iter()
+        .map(|snapshot| snapshot.snapshot_id.as_str())
+        .collect::<HashSet<&str>>();
+    let recovery_points_ok = classification
+        .recovery_points_to_delete
+        .iter()
+        .map(|point| (point.snapshot_id.as_str(), point.recovery_point_arn.as_str()))
+        .collect::<HashMap<&str, &str>>();
+
     let direct_deletes = plan
         .delete_snapshots
         .iter()
-        .filter(|snapshot| {
-            still_deletable(&snapshot.snapshot_id).is_some_and(|current| {
-                !looks_backup_created(&current.tags, current.description.as_deref())
-                    && recoverable(current)
-            })
-        })
+        .filter(|snapshot| direct_ok.contains(snapshot.snapshot_id.as_str()))
         .collect::<Vec<&SnapshotInfo>>();
     summary.skipped_snapshots += plan.delete_snapshots.len() - direct_deletes.len();
 
-    // The recovery point *is* the snapshot, so it gets the same live checks as a direct delete
-    // plus the backup delete tag (read from the snapshot's current tags).
-    let recovery_point_deletes = if args.execute_backup_recovery_point_deletes {
-        plan.delete_backup_recovery_points
-            .iter()
-            .filter(|recovery_point| {
-                still_deletable(&recovery_point.snapshot_id).is_some_and(|current| {
-                    backup_recovery_point_deletion_tag_allows(&current.tags, args)
-                        && recoverable(current)
-                })
-            })
-            .collect::<Vec<&BackupRecoveryPoint>>()
-    } else {
-        Vec::new()
-    };
+    // The recovery point *is* the snapshot, so it gets the same live checks as a direct delete,
+    // plus the backup delete tag and recovery-point rules (inside the classification).
+    let recovery_point_deletes = plan
+        .delete_backup_recovery_points
+        .iter()
+        .filter(|point| {
+            recovery_points_wanted
+                && recovery_points_ok.get(point.snapshot_id.as_str())
+                    == Some(&point.recovery_point_arn.as_str())
+        })
+        .collect::<Vec<&BackupRecoveryPoint>>();
     summary.skipped_backup_recovery_points +=
         plan.delete_backup_recovery_points.len() - recovery_point_deletes.len();
 
@@ -471,7 +531,7 @@ async fn execute_snapshot_deletions(
             continue;
         }
 
-        let result = send_with_retries(retry_policy, args.dry_run, || {
+        let result = send_mutation(retry_policy, args.dry_run, SNAPSHOT_GONE, || {
             ec2_client
                 .delete_snapshot()
                 .snapshot_id(&snapshot.snapshot_id)
@@ -481,7 +541,11 @@ async fn execute_snapshot_deletions(
         .await;
 
         match result {
-            Ok(()) => summary.deleted_snapshots += 1,
+            Ok(Sent::Done(_)) => summary.deleted_snapshots += 1,
+            Ok(Sent::Gone(code)) => {
+                log::warn!("{} was already deleted ({code})", snapshot.snapshot_id);
+                summary.skipped_snapshots += 1;
+            }
             Err(error) => summary
                 .failures
                 .push(format!("delete snapshot {} failed: {}", snapshot.snapshot_id, error)),
@@ -490,13 +554,17 @@ async fn execute_snapshot_deletions(
 
     for recovery_point in recovery_point_deletes {
         phase.inc();
-        // AWS Backup has no dry-run mode, so dry runs stop after the checks.
-        if !snapshot_unshared(&external_use, &recovery_point.snapshot_id, summary) || args.dry_run {
+        if !snapshot_unshared(&external_use, &recovery_point.snapshot_id, summary) {
             summary.skipped_backup_recovery_points += 1;
             continue;
         }
+        // AWS Backup has no dry-run mode, so a dry run stops after the checks, which passed.
+        if args.dry_run {
+            summary.deleted_backup_recovery_points += 1;
+            continue;
+        }
 
-        let result = send_with_retries(retry_policy, false, || {
+        let result = send_mutation(retry_policy, false, RECOVERY_POINT_GONE, || {
             backup_client
                 .delete_recovery_point()
                 .backup_vault_name(&recovery_point.backup_vault_name)
@@ -506,7 +574,11 @@ async fn execute_snapshot_deletions(
         .await;
 
         match result {
-            Ok(()) => summary.deleted_backup_recovery_points += 1,
+            Ok(Sent::Done(_)) => summary.deleted_backup_recovery_points += 1,
+            Ok(Sent::Gone(code)) => {
+                log::warn!("{} was already deleted ({code})", recovery_point.recovery_point_arn);
+                summary.skipped_backup_recovery_points += 1;
+            }
             Err(error) => summary.failures.push(format!(
                 "delete recovery point {} in vault {} failed: {}",
                 recovery_point.recovery_point_arn, recovery_point.backup_vault_name, error
@@ -555,7 +627,9 @@ fn snapshot_unshared(
 }
 
 /// Sends a mutating request, retrying only throttling and transient failures. Under `dry_run`, the
-/// `DryRunOperation` error means the request would have succeeded.
+/// `DryRunOperation` error means the request would have succeeded. (The execute loops use
+/// `send_mutation`, which also recognizes resources that are already gone.)
+#[cfg(test)]
 pub(crate) async fn send_with_retries<T, E, R, F, Fut>(
     policy: RetryPolicy,
     dry_run: bool,
@@ -574,8 +648,38 @@ where
 pub(crate) async fn send_with_retries_output<T, E, R, F, Fut>(
     policy: RetryPolicy,
     dry_run: bool,
-    mut send: F,
+    send: F,
 ) -> Result<Option<T>, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, SdkError<E, R>>>,
+    E: ProvideErrorMetadata + Error + 'static,
+    R: Debug + 'static,
+{
+    match send_mutation(policy, dry_run, &[], send).await? {
+        Sent::Done(output) => Ok(output),
+        Sent::Gone(code) => Err(format!("{code} (unexpected)")),
+    }
+}
+
+/// What a mutation did.
+#[derive(Debug)]
+pub(crate) enum Sent<T> {
+    /// It succeeded (`None`: a dry run that would have).
+    Done(Option<T>),
+    /// The resource was already gone (this error code): deleted by an earlier attempt whose
+    /// response was lost, or by someone else since the live re-check. Not a failure.
+    Gone(String),
+}
+
+/// `send_with_retries_output`, where an error code in `gone_codes` means the resource no longer
+/// exists.
+pub(crate) async fn send_mutation<T, E, R, F, Fut>(
+    policy: RetryPolicy,
+    dry_run: bool,
+    gone_codes: &[&str],
+    mut send: F,
+) -> Result<Sent<T>, String>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, SdkError<E, R>>>,
@@ -586,12 +690,15 @@ where
     loop {
         attempt += 1;
         let error = match send().await {
-            Ok(output) => return Ok(Some(output)),
+            Ok(output) => return Ok(Sent::Done(Some(output))),
             Err(error) => error,
         };
 
         if dry_run && error.code() == Some(DRY_RUN_OPERATION) {
-            return Ok(None);
+            return Ok(Sent::Done(None));
+        }
+        if let Some(code) = error.code().filter(|code| gone_codes.contains(code)) {
+            return Ok(Sent::Gone(code.to_string()));
         }
 
         if attempt > policy.max_retries || !is_retryable(&error) {
