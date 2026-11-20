@@ -16,8 +16,9 @@ use chrono::{DateTime, Duration, Utc};
 use log::warn;
 use serde::{Deserialize, Serialize};
 
-/// v2 stores every version (with its creation time), not only versions that set an image.
-const SCHEMA_VERSION: u32 = 2;
+/// v2 stores every version (with its creation time), not only versions that set an image; v3 adds
+/// the snapshot ids each version's block devices name.
+const SCHEMA_VERSION: u32 = 3;
 
 /// Where the cache lives and how long a template's full scan stays trusted.
 #[derive(Clone, Debug)]
@@ -58,6 +59,9 @@ pub(crate) struct CachedVersion {
     pub(crate) image: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) created: Option<DateTime<Utc>>,
+    /// Snapshot ids the version's block device mappings name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) snapshots: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

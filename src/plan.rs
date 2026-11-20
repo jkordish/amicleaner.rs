@@ -7,6 +7,9 @@ use aws_sdk_ec2 as ec2;
 use chrono::{DateTime, Utc};
 use log::warn;
 
+use crate::accounts::{
+    AccountScans, SharedKind, accounts_to_scan, resolve_external_use, scan_accounts,
+};
 use crate::aws_backup::{
     apply_backup_classification, block_all_snapshot_deletions, classify_backup_snapshots,
     list_ebs_recovery_points, prune_released_snapshots,
@@ -19,10 +22,12 @@ use crate::inventory::{
 };
 use crate::lt_prune::{plan_launch_template_pruning, prune_block_reason};
 use crate::model::{
-    AmiInfo, Cutoffs, ExternalUse, KeepReason, Kept, RecycleBinCoverage, RegionPlan, SnapshotInfo,
+    AccountCheckSummary, AmiInfo, Cutoffs, ExternalUse, KeepReason, Kept, RecycleBinCoverage,
+    RegionPlan, SnapshotInfo,
 };
 use crate::policy::{
     ami_keep_reason, select_latest_ami_ids_by_family, should_deregister_ami, snapshot_keep_reason,
+    snapshot_reference_keep_reason,
 };
 use crate::recycle_bin::{RetentionRule, list_snapshot_retention_rules, recycle_bin_days};
 use crate::references::{AmiReferenceScan, ReferenceClients, collect_referenced_ami_ids};
@@ -58,14 +63,14 @@ pub(crate) async fn build_region_plan(
     ));
 
     // A failed reference scan only blocks AMI deregistration; snapshot cleanup doesn't depend on it.
-    let reference_scan = collect_referenced_ami_ids(ec2_client, reference_clients)
-        .await
-        .unwrap_or_else(|error| AmiReferenceScan {
-            unresolved_references: HashSet::from([format!(
-                "AMI reference scan failed: {}",
-                error_chain(error.as_ref())
-            )]),
-            ..AmiReferenceScan::default()
+    let reference_scan =
+        collect_referenced_ami_ids(ec2_client, reference_clients).await.unwrap_or_else(|error| {
+            let reason = format!("AMI reference scan failed: {}", error_chain(error.as_ref()));
+            AmiReferenceScan {
+                unresolved_references: HashSet::from([reason.clone()]),
+                failure: Some(reason),
+                ..AmiReferenceScan::default()
+            }
         });
 
     // Launch permissions are looked up per candidate, so only bother when deregistration can happen.
@@ -94,6 +99,18 @@ pub(crate) async fn build_region_plan(
                 lookup_ami_external_use(ec2_client, &candidates, concurrency, Some(&phase)).await;
             finish_sharing_phase(phase, &external_use);
         }
+    }
+
+    // --check-accounts: scan the accounts AMIs are shared with; one each of them leaves unused
+    // drops out of `external_use`, so the normal rules decide it.
+    let mut account_scans = AccountScans::new();
+    let mut unused_amis = 0;
+    if let Some(check) = &reference_clients.check_accounts {
+        let accounts = accounts_to_scan(&external_use, check);
+        scan_accounts(args, check, region, &accounts, &[], &mut account_scans).await;
+        let before = external_use.len();
+        resolve_external_use(&mut external_use, SharedKind::Ami, check, &account_scans);
+        unused_amis = before - external_use.len();
     }
 
     // Only read DLM policies and volumes when asked to; otherwise every DLM snapshot is kept.
@@ -172,6 +189,35 @@ pub(crate) async fn build_region_plan(
             lookup_snapshot_external_use(ec2_client, &snapshot_ids, concurrency, Some(&phase))
                 .await;
         finish_sharing_phase(phase, &snapshot_external_use);
+    }
+    if let Some(check) = &reference_clients.check_accounts {
+        let accounts = accounts_to_scan(&snapshot_external_use, check);
+        let candidates = snapshot_external_use
+            .iter()
+            .filter(|(_, usage)| matches!(usage, ExternalUse::Shared(_)))
+            .map(|(snapshot_id, _)| snapshot_id.as_str())
+            .collect::<Vec<_>>();
+        scan_accounts(args, check, region, &accounts, &candidates, &mut account_scans).await;
+        let before = snapshot_external_use.len();
+        resolve_external_use(
+            &mut snapshot_external_use,
+            SharedKind::Snapshot,
+            check,
+            &account_scans,
+        );
+        let mut scanned = account_scans
+            .iter()
+            .map(|(account, result)| {
+                let profile = check.profiles.get(account).map_or("?", String::as_str);
+                (format!("{profile} ({account})"), result.is_ok())
+            })
+            .collect::<Vec<_>>();
+        scanned.sort();
+        plan.account_check = Some(AccountCheckSummary {
+            accounts: scanned,
+            unused_amis,
+            unused_snapshots: before - snapshot_external_use.len(),
+        });
     }
     apply_snapshot_external_use(&mut plan, &snapshot_external_use);
 
@@ -278,7 +324,13 @@ pub(crate) fn plan_region(
         let reason = ami_keep_reason(ami, referenced_ami_ids, &keep_latest_ami_ids, cutoffs, args)
             .or_else(|| match external_use.get(&ami.ami_id) {
                 None => None,
-                Some(ExternalUse::Shared) => Some(KeepReason::Shared),
+                Some(ExternalUse::Shared(_)) => Some(KeepReason::Shared),
+                Some(ExternalUse::Kept(reason)) => {
+                    if reason.uncertain() {
+                        blocked.push(format!("AMI {} kept: {reason}", ami.ami_id));
+                    }
+                    Some(reason.clone())
+                }
                 Some(ExternalUse::Unknown(error)) => {
                     blocked.push(format!(
                         "AMI {} kept: launch permission lookup failed: {}",
@@ -342,18 +394,32 @@ pub(crate) fn plan_region(
     let mut delete_snapshots = Vec::new();
     let mut kept_snapshots = Vec::new();
 
+    let snapshot_references = match &reference_scan.failure {
+        Some(error) => Err(error.as_str()),
+        None => Ok(&reference_scan.snapshot_references),
+    };
+    let mut snapshot_references_unknown = false;
     for snapshot in owned_snapshots {
         let released = snapshots_released_by_ami.contains_key(&snapshot.snapshot_id);
-        match snapshot_keep_reason(
+        let reason = snapshot_keep_reason(
             snapshot,
             released,
             &remaining_ami_snapshot_refs,
             cutoffs.min_age,
             args,
-        ) {
+        )
+        .or_else(|| snapshot_reference_keep_reason(&snapshot.snapshot_id, snapshot_references));
+        match reason {
             None => delete_snapshots.push(snapshot.clone()),
-            Some(reason) => kept_snapshots.push(Kept { item: snapshot.clone(), reason }),
+            Some(reason) => {
+                snapshot_references_unknown |=
+                    matches!(reason, KeepReason::SnapshotReferencesUnknown(_));
+                kept_snapshots.push(Kept { item: snapshot.clone(), reason });
+            }
         }
+    }
+    if snapshot_references_unknown && let Some(error) = &reference_scan.failure {
+        blocked.push(format!("snapshot deletions cancelled: references unknown ({error})"));
     }
 
     let planned_snapshot_ids = delete_snapshots
@@ -385,11 +451,15 @@ pub(crate) fn plan_region(
         blocked,
         launch_template_prune: None,
         recycle_bin: RecycleBinCoverage::NotChecked,
+        account_check: None,
     }
 }
 
 fn finish_sharing_phase(phase: Phase, external_use: &HashMap<String, ExternalUse>) {
-    let shared = external_use.values().filter(|usage| **usage == ExternalUse::Shared).count();
+    let shared = external_use
+        .values()
+        .filter(|usage| matches!(usage, ExternalUse::Shared(_) | ExternalUse::Kept(_)))
+        .count();
     let unknown = external_use.len() - shared;
     if unknown > 0 {
         phase.warn(format!("{shared} shared, {unknown} lookups failed"));
@@ -409,7 +479,13 @@ pub(crate) fn apply_snapshot_external_use(
     plan.delete_snapshots.retain(|snapshot| {
         let reason = match external_use.get(&snapshot.snapshot_id) {
             None => return true,
-            Some(ExternalUse::Shared) => KeepReason::Shared,
+            Some(ExternalUse::Shared(_)) => KeepReason::Shared,
+            Some(ExternalUse::Kept(reason)) => {
+                if reason.uncertain() {
+                    blocked.push(format!("snapshot {} kept: {reason}", snapshot.snapshot_id));
+                }
+                reason.clone()
+            }
             Some(ExternalUse::Unknown(error)) => {
                 blocked.push(format!(
                     "snapshot {} kept: create-volume permission lookup failed: {}",

@@ -95,6 +95,8 @@ pub(crate) struct Settings {
     pub(crate) prune_launch_template_versions_keep: Option<u16>,
     pub(crate) delete_orphaned_dlm_snapshots: bool,
     pub(crate) require_recycle_bin: bool,
+    /// `--check-accounts` profiles.
+    pub(crate) check_accounts: Vec<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -144,8 +146,40 @@ pub(crate) struct RegionReport {
     /// Whether planned snapshot deletes would be recoverable from the Recycle Bin.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) recycle_bin: Option<RecycleBinReport>,
+    /// `--check-accounts`: the accounts checked and the shared items none of them uses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) account_check: Option<AccountCheckReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) execution: Option<ExecutionReport>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct AccountCheckReport {
+    /// "profile (account)" of every account scanned successfully.
+    pub(crate) checked: Vec<String>,
+    /// Accounts whose scan failed (what's shared with them stays kept).
+    pub(crate) failed: Vec<String>,
+    pub(crate) unused_shared_amis: usize,
+    pub(crate) unused_shared_snapshots: usize,
+}
+
+impl AccountCheckReport {
+    fn summary(&self) -> String {
+        let mut line = if self.checked.is_empty() && self.failed.is_empty() {
+            "Accounts: nothing was shared only with --check-accounts accounts".to_string()
+        } else {
+            format!(
+                "Accounts: checked {} · {} shared AMIs and {} shared snapshots unused there",
+                if self.checked.is_empty() { "none".to_string() } else { self.checked.join(", ") },
+                self.unused_shared_amis,
+                self.unused_shared_snapshots
+            )
+        };
+        if !self.failed.is_empty() {
+            line.push_str(&format!(" · couldn't check {}", self.failed.join(", ")));
+        }
+        line
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq, Serialize)]
@@ -366,6 +400,7 @@ impl Settings {
                 .then_some(args.keep_launch_template_versions),
             delete_orphaned_dlm_snapshots: args.delete_orphaned_dlm_snapshots,
             require_recycle_bin: args.require_recycle_bin,
+            check_accounts: args.check_accounts.clone(),
         }
     }
 }
@@ -439,6 +474,7 @@ impl RegionReport {
             snapshots: Vec::new(),
             launch_template_versions: None,
             recycle_bin: None,
+            account_check: None,
             execution: None,
         }
     }
@@ -626,6 +662,22 @@ impl RegionReport {
                 .as_ref()
                 .map(LaunchTemplateVersionsReport::from),
             recycle_bin: RecycleBinReport::from_plan(plan),
+            account_check: plan.account_check.as_ref().map(|check| AccountCheckReport {
+                checked: check
+                    .accounts
+                    .iter()
+                    .filter(|(_, ok)| *ok)
+                    .map(|(a, _)| a.clone())
+                    .collect(),
+                failed: check
+                    .accounts
+                    .iter()
+                    .filter(|(_, ok)| !*ok)
+                    .map(|(a, _)| a.clone())
+                    .collect(),
+                unused_shared_amis: check.unused_amis,
+                unused_shared_snapshots: check.unused_snapshots,
+            }),
             execution,
         }
     }
@@ -860,6 +912,15 @@ fn write_settings_markdown(out: &mut String, settings: &Settings) {
     );
     let _ = writeln!(
         out,
+        "| Check accounts | {} |",
+        if settings.check_accounts.is_empty() {
+            "none (shared items always kept)".to_string()
+        } else {
+            settings.check_accounts.join(", ")
+        }
+    );
+    let _ = writeln!(
+        out,
         "| Require Recycle Bin | {} |",
         if settings.require_recycle_bin {
             "yes (uncovered snapshots kept)"
@@ -912,6 +973,10 @@ fn write_region_markdown(out: &mut String, region: &RegionReport) {
         let _ = writeln!(out);
     }
 
+    if let Some(account_check) = &region.account_check {
+        let _ = writeln!(out, "{}", account_check.summary());
+        let _ = writeln!(out);
+    }
     if let Some(recycle_bin) = &region.recycle_bin {
         let _ = writeln!(out, "{}", recycle_bin.summary());
         let _ = writeln!(out);
@@ -1207,6 +1272,15 @@ pub(crate) fn render_region_text(region: &RegionReport) -> String {
             ))
             .dim()
         );
+    }
+    if let Some(account_check) = &region.account_check {
+        let line = account_check.summary();
+        let styled = if account_check.failed.is_empty() {
+            console::style(line).dim()
+        } else {
+            console::style(line).yellow()
+        };
+        let _ = writeln!(out, "             {styled}");
     }
     if let Some(recycle_bin) = &region.recycle_bin {
         let line = recycle_bin.summary();

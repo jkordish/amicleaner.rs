@@ -11,6 +11,9 @@ use aws_sdk_ec2 as ec2;
 use chrono::Utc;
 use ec2::error::{ProvideErrorMetadata, SdkError};
 
+use crate::accounts::{
+    AccountScans, SharedKind, accounts_to_scan, resolve_external_use, scan_accounts,
+};
 use crate::cli::Args;
 use crate::dlm::{load_dlm_inventory, orphaned_dlm_snapshots};
 use crate::errors::{describe_sdk_error, error_chain};
@@ -25,9 +28,10 @@ use crate::model::{
 use crate::policy::{
     backup_recovery_point_deletion_tag_allows, looks_backup_created,
     select_latest_ami_ids_by_family, should_deregister_ami, snapshot_is_deletable,
+    snapshot_reference_keep_reason,
 };
 use crate::recycle_bin::{list_snapshot_retention_rules, recycle_bin_days};
-use crate::references::{ReferenceClients, collect_referenced_ami_ids};
+use crate::references::{AmiReferenceScan, ReferenceClients, collect_referenced_ami_ids};
 use crate::ui::Phase;
 
 /// EC2 returns this error code when a `DryRun=true` request would have succeeded.
@@ -65,23 +69,43 @@ pub(crate) async fn execute_region_plan(
     let mut summary = ExecutionSummary { dry_run: args.dry_run, ..ExecutionSummary::default() };
     let cutoffs = Cutoffs::new(args, Utc::now());
 
+    // One fresh reference scan serves both phases: AMI references for deregistration, snapshot
+    // references for deletion.
+    let reference_scan = if plan.deregister_amis.is_empty()
+        && plan.delete_snapshots.is_empty()
+        && plan.delete_backup_recovery_points.is_empty()
+    {
+        None
+    } else {
+        Some(
+            collect_referenced_ami_ids(ec2_client, reference_clients)
+                .await
+                .map_err(|error| error_chain(error.as_ref())),
+        )
+    };
+
     let released_amis = execute_ami_deregistrations(
         ec2_client,
         reference_clients,
         plan,
         args,
-        cutoffs,
+        (cutoffs, reference_scan.as_ref()),
         &mut summary,
     )
     .await;
 
+    let snapshot_references = match &reference_scan {
+        Some(Ok(scan)) => Ok(&scan.snapshot_references),
+        Some(Err(error)) => Err(format!("reference scan failed at execution time: {error}")),
+        None => Err("no reference scan at execution time".to_string()),
+    };
     execute_snapshot_deletions(
         ec2_client,
         backup_client,
         reference_clients,
         plan,
         args,
-        &released_amis,
+        LiveReferences { released_amis: &released_amis, snapshot_references },
         &mut summary,
     )
     .await;
@@ -92,6 +116,14 @@ pub(crate) async fn execute_region_plan(
     summary
 }
 
+/// What the snapshot phase needs from earlier in the execution.
+struct LiveReferences<'a> {
+    /// AMIs this run deregistered (or that passed the dry-run check).
+    released_amis: &'a HashSet<String>,
+    /// Snapshot references from the execution-time scan, or why they're unknown.
+    snapshot_references: Result<&'a HashMap<String, Vec<String>>, String>,
+}
+
 /// Re-validates every planned AMI against live state and deregisters it. Returns the AMIs that
 /// were deregistered (or passed the dry-run check), whose snapshots the snapshot phase may free.
 async fn execute_ami_deregistrations(
@@ -99,7 +131,7 @@ async fn execute_ami_deregistrations(
     reference_clients: &ReferenceClients,
     plan: &RegionPlan,
     args: &Args,
-    cutoffs: Cutoffs,
+    (cutoffs, reference_scan): (Cutoffs, Option<&Result<AmiReferenceScan, String>>),
     summary: &mut ExecutionSummary,
 ) -> HashSet<String> {
     let mut released_amis = HashSet::new();
@@ -117,9 +149,9 @@ async fn execute_ami_deregistrations(
         summary.blocked.push(reason);
     };
 
-    let references = match collect_referenced_ami_ids(ec2_client, reference_clients).await {
-        Ok(scan) if scan.unresolved_references.is_empty() => scan.referenced_ami_ids,
-        Ok(scan) => {
+    let references = match reference_scan {
+        Some(Ok(scan)) if scan.unresolved_references.is_empty() => scan.referenced_ami_ids.clone(),
+        Some(Ok(scan)) => {
             block(
                 summary,
                 format!(
@@ -129,16 +161,16 @@ async fn execute_ami_deregistrations(
             );
             return released_amis;
         }
-        Err(error) => {
+        Some(Err(error)) => {
             block(
                 summary,
                 format!(
-                    "skipped AMI deregistration: AMI reference scan failed at execution time: {}",
-                    error_chain(error.as_ref())
+                    "skipped AMI deregistration: AMI reference scan failed at execution time: {error}"
                 ),
             );
             return released_amis;
         }
+        None => return released_amis,
     };
 
     let current_amis = match list_owned_amis(ec2_client).await {
@@ -176,9 +208,15 @@ async fn execute_ami_deregistrations(
 
     // Prefetched right before the deregistration loop, concurrently; the mutations stay sequential.
     let eligible_ids = eligible.iter().map(|ami| ami.ami_id.as_str()).collect::<Vec<&str>>();
-    let external_use =
+    let mut external_use =
         lookup_ami_external_use(ec2_client, &eligible_ids, usize::from(args.max_concurrency), None)
             .await;
+    if let Some(check) = &reference_clients.check_accounts {
+        let mut scans = AccountScans::new();
+        let accounts = accounts_to_scan(&external_use, check);
+        scan_accounts(args, check, &plan.region, &accounts, &[], &mut scans).await;
+        resolve_external_use(&mut external_use, SharedKind::Ami, check, &scans);
+    }
 
     let verb = if args.dry_run { "dry-run deregister" } else { "deregister" };
     let phase = Phase::with_total(format!("{} · {verb} AMIs", plan.region), eligible.len());
@@ -186,8 +224,15 @@ async fn execute_ami_deregistrations(
         phase.inc();
         match external_use.get(&ami.ami_id) {
             None => {}
-            Some(ExternalUse::Shared) => {
+            Some(ExternalUse::Shared(_)) => {
                 summary.skipped_amis += 1;
+                continue;
+            }
+            Some(ExternalUse::Kept(reason)) => {
+                summary.skipped_amis += 1;
+                if reason.uncertain() {
+                    summary.blocked.push(format!("skipped {}: {reason}", ami.ami_id));
+                }
                 continue;
             }
             Some(ExternalUse::Unknown(reason)) => {
@@ -232,9 +277,10 @@ async fn execute_snapshot_deletions(
     reference_clients: &ReferenceClients,
     plan: &RegionPlan,
     args: &Args,
-    released_amis: &HashSet<String>,
+    live: LiveReferences<'_>,
     summary: &mut ExecutionSummary,
 ) {
+    let released_amis = live.released_amis;
     // Taken now rather than at the start of the run: a later cutoff can only keep more.
     let cutoffs = Cutoffs::new(args, Utc::now());
     if plan.delete_snapshots.is_empty() && plan.delete_backup_recovery_points.is_empty() {
@@ -309,14 +355,20 @@ async fn execute_snapshot_deletions(
         }
     }
 
+    // Snapshots something in the account names stay, and unknown references keep them all.
+    let snapshot_references = live.snapshot_references.as_deref().map_err(String::as_str);
+    if let Err(error) = &snapshot_references {
+        summary.blocked.push(format!("snapshot deletions cancelled: references unknown ({error})"));
+    }
     let still_deletable = |snapshot_id: &str| -> Option<&SnapshotInfo> {
         let current = current_snapshots.get(snapshot_id)?;
         let released = plan
             .snapshots_released_by_ami
             .get(snapshot_id)
             .is_some_and(|ami_id| released_amis.contains(ami_id));
-        snapshot_is_deletable(current, released, &references, cutoffs.min_age, args)
-            .then_some(current)
+        (snapshot_is_deletable(current, released, &references, cutoffs.min_age, args)
+            && snapshot_reference_keep_reason(snapshot_id, snapshot_references).is_none())
+        .then_some(current)
     };
     let retry_policy = RetryPolicy::from_args(args);
 
@@ -376,13 +428,24 @@ async fn execute_snapshot_deletions(
         .map(|snapshot| snapshot.snapshot_id.as_str())
         .chain(recovery_point_deletes.iter().map(|point| point.snapshot_id.as_str()))
         .collect::<Vec<&str>>();
-    let external_use = lookup_snapshot_external_use(
+    let mut external_use = lookup_snapshot_external_use(
         ec2_client,
         &snapshot_ids,
         usize::from(args.max_concurrency),
         None,
     )
     .await;
+    if let Some(check) = &reference_clients.check_accounts {
+        let mut scans = AccountScans::new();
+        let accounts = accounts_to_scan(&external_use, check);
+        let candidates = external_use
+            .iter()
+            .filter(|(_, usage)| matches!(usage, ExternalUse::Shared(_)))
+            .map(|(snapshot_id, _)| snapshot_id.as_str())
+            .collect::<Vec<_>>();
+        scan_accounts(args, check, &plan.region, &accounts, &candidates, &mut scans).await;
+        resolve_external_use(&mut external_use, SharedKind::Snapshot, check, &scans);
+    }
 
     let failures_before = summary.failures.len();
     let verb = if args.dry_run { "dry-run delete" } else { "delete" };
@@ -464,7 +527,13 @@ fn snapshot_unshared(
 ) -> bool {
     match external_use.get(snapshot_id) {
         None => true,
-        Some(ExternalUse::Shared) => false,
+        Some(ExternalUse::Shared(_)) => false,
+        Some(ExternalUse::Kept(reason)) => {
+            if reason.uncertain() {
+                summary.blocked.push(format!("skipped {snapshot_id}: {reason}"));
+            }
+            false
+        }
         Some(ExternalUse::Unknown(reason)) => {
             summary.blocked.push(format!(
                 "skipped {snapshot_id}: create-volume permission check failed: {reason}"

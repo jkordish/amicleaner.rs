@@ -8,7 +8,7 @@ use futures_util::{StreamExt, stream};
 use log::warn;
 
 use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
-use crate::inventory::is_ami_id;
+use crate::inventory::{is_ami_id, is_snapshot_id};
 use crate::references::ReferenceCollector;
 
 /// Concurrent `GetTemplate` calls; CloudFormation throttles well below EC2's limits.
@@ -24,19 +24,45 @@ impl ReferenceCollector<'_> {
         let own = imagebuilder::types::Ownership::SelfValue;
 
         let mut parents = Vec::new();
+        let mut recipe_arns = Vec::new();
         let mut pages = client.list_image_recipes().owner(own.clone()).into_paginator().send();
         while let Some(page) = pages.next().await {
             let output = page.aws_context("ListImageRecipes")?;
             for recipe in output.image_recipe_summary_list() {
+                let source =
+                    format!("Image Builder recipe {}", recipe.name().unwrap_or("<unnamed>"));
                 if let Some(parent) = recipe.parent_image() {
-                    let source =
-                        format!("Image Builder recipe {}", recipe.name().unwrap_or("<unnamed>"));
                     parents.push((
                         parent.to_string(),
                         recipe.owner().map(ToString::to_string),
-                        source,
+                        source.clone(),
                     ));
                 }
+                let Some(arn) = recipe.arn() else {
+                    return Err("ListImageRecipes returned a recipe without an ARN".into());
+                };
+                recipe_arns.push((arn.to_string(), source));
+            }
+        }
+
+        // Block devices (which can name snapshots) are only in the full recipe.
+        let recipes = stream::iter(&recipe_arns)
+            .map(|(arn, _)| {
+                let request = client.get_image_recipe().image_recipe_arn(arn).send();
+                async move { request.await.aws_context("GetImageRecipe") }
+            })
+            .buffered(self.clients.concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        for ((_, source), recipe) in recipe_arns.iter().zip(recipes) {
+            for snapshot_id in recipe?
+                .image_recipe()
+                .map(|recipe| recipe.block_device_mappings())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|mapping| mapping.ebs().and_then(|ebs| ebs.snapshot_id()))
+            {
+                self.scan.add_snapshot_reference(snapshot_id, source);
             }
         }
 
@@ -116,6 +142,9 @@ impl ReferenceCollector<'_> {
                         for ami_id in find_ami_ids(value) {
                             self.scan.add_reference(ami_id, &source);
                         }
+                        for snapshot_id in find_snapshot_ids(value) {
+                            self.scan.add_snapshot_reference(&snapshot_id, &source);
+                        }
                     }
                 }
                 stack_ids.push(stack_id.to_string());
@@ -138,6 +167,9 @@ impl ReferenceCollector<'_> {
                 let source = format!("CloudFormation stack {stack_id} template");
                 for ami_id in find_ami_ids(body) {
                     self.scan.add_reference(ami_id, &source);
+                }
+                for snapshot_id in find_snapshot_ids(body) {
+                    self.scan.add_snapshot_reference(&snapshot_id, &source);
                 }
                 for parameter in find_ssm_dynamic_references(body) {
                     self.record_ssm_parameter_amis(&parameter, stack_id).await;
@@ -512,14 +544,23 @@ async fn own_image_builder_amis(
 /// Finds every well-formed AMI id in free text (templates, parameter values). Over-matching only
 /// keeps an AMI, so no word-boundary rules; ids are compared lowercased.
 pub(crate) fn find_ami_ids(text: &str) -> Vec<String> {
+    find_ids(text, "ami-", is_ami_id)
+}
+
+/// Snapshot ids (`snap-` + 8 or 17 hex digits) anywhere in `text`.
+pub(crate) fn find_snapshot_ids(text: &str) -> Vec<String> {
+    find_ids(text, "snap-", is_snapshot_id)
+}
+
+fn find_ids(text: &str, prefix: &str, is_id: fn(&str) -> bool) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
     let mut search_from = 0;
-    while let Some(offset) = text[search_from..].find("ami-") {
-        let hex_start = search_from + offset + 4;
+    while let Some(offset) = text[search_from..].find(prefix) {
+        let hex_start = search_from + offset + prefix.len();
         let hex_len = bytes[hex_start..].iter().take_while(|byte| byte.is_ascii_hexdigit()).count();
-        let candidate = text[hex_start - 4..hex_start + hex_len].to_ascii_lowercase();
-        if is_ami_id(&candidate) {
+        let candidate = text[hex_start - prefix.len()..hex_start + hex_len].to_ascii_lowercase();
+        if is_id(&candidate) {
             found.push(candidate);
         }
         search_from = hex_start;

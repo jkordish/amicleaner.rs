@@ -20,6 +20,10 @@ use clap::Parser;
 use ec2::error::ErrorMetadata;
 
 use super::{inert_flag_warnings, is_enabled_region, skipped_reference_sources_warning};
+use crate::accounts::{
+    AccountScans, AccountUse, CheckAccounts, SharedKind, accounts_to_scan, check_account,
+    resolve_external_use, shared_keep_reason,
+};
 use crate::aws_backup::{
     apply_backup_classification, block_all_snapshot_deletions, classify_backup_snapshots,
     snapshot_id_from_arn,
@@ -33,16 +37,16 @@ use crate::execute::{
     execute_region_plan, is_retryable_code, retry_delay_for_attempt, send_with_retries,
 };
 use crate::inventory::{
-    ami_has_external_launch_permissions, is_ami_id, list_owned_amis, lookup_snapshot_external_use,
+    ami_launch_grants, is_ami_id, list_owned_amis, lookup_snapshot_external_use,
 };
 use crate::lt_prune::{
     execute_launch_template_pruning, plan_launch_template_pruning, prune_block_reason,
 };
-use crate::model::Cutoffs;
 use crate::model::{
     AmiInfo, DlmOrphanCause, EXIT_BLOCKED, ExecutionSummary, ExternalUse, KeepReason, LastLaunched,
     RecoveryPointRecord, RecycleBinCoverage, RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
 };
+use crate::model::{Cutoffs, Grant};
 use crate::model::{LaunchTemplatePrunePlan, TemplatePrune, VersionKeepReason};
 use crate::plan::{apply_recycle_bin, apply_snapshot_external_use, plan_region};
 use crate::policy::{ami_keep_reason, looks_lifecycle_managed, snapshot_keep_reason};
@@ -58,7 +62,7 @@ use crate::references::lt_cache::{
     default_cache_dir, fetch_plan,
 };
 use crate::references::services::{
-    OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids,
+    OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids, find_snapshot_ids,
     find_ssm_dynamic_references, image_version_matches,
 };
 use crate::references::version_ranges;
@@ -78,6 +82,7 @@ const AMI_B: &str = "ami-0123456789abcdef1";
 const AMI_C: &str = "ami-0123456789abcdef2";
 const AMI_D: &str = "ami-0123456789abcdef3";
 const ACCOUNT: &str = "123456789012";
+const OTHER_ACCOUNT: &str = "210987654321";
 const SNAP_A: &str = "snap-0123456789abcdef0";
 const SNAP_B: &str = "snap-0123456789abcdef1";
 const SNAP_C: &str = "snap-0123456789abcdef2";
@@ -485,7 +490,10 @@ fn shared_amis_are_kept_and_failed_lookups_block() {
         make_ami(AMI_B, old, &[("cleanup", "true")], &[]),
     ];
     let external = HashMap::from([
-        (AMI_A.to_string(), ExternalUse::Shared),
+        (
+            AMI_A.to_string(),
+            ExternalUse::Shared(vec![Grant::Account(OTHER_ACCOUNT.to_string())]),
+        ),
         (AMI_B.to_string(), ExternalUse::Unknown("AccessDenied".to_string())),
     ]);
 
@@ -896,7 +904,9 @@ fn reference_clients(asg: autoscaling::Client, ssm: ssm::Client) -> ReferenceCli
         rbin: mock_client!(aws_sdk_rbin, RuleMode::MatchAny, Vec::<&aws_smithy_mocks::Rule>::new()),
         concurrency: 4,
         region: "us-east-1".to_string(),
+        label: "us-east-1".to_string(),
         lt_cache: None,
+        check_accounts: None,
     }
 }
 
@@ -1130,8 +1140,11 @@ async fn launch_permissions_mark_an_ami_as_shared() {
         });
     let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&shared, &private], no_sdk_retries);
 
-    assert!(ami_has_external_launch_permissions(&client, AMI_A).await.unwrap());
-    assert!(!ami_has_external_launch_permissions(&client, AMI_B).await.unwrap());
+    assert_eq!(
+        ami_launch_grants(&client, AMI_A).await.unwrap(),
+        vec![Grant::Account("210987654321".to_string())]
+    );
+    assert!(ami_launch_grants(&client, AMI_B).await.unwrap().is_empty());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1504,7 +1517,13 @@ async fn create_volume_permissions_mark_a_snapshot_as_shared() {
 
     let external_use = lookup_snapshot_external_use(&client, &[SNAP_A, SNAP_B], 4, None).await;
 
-    assert_eq!(external_use, HashMap::from([(SNAP_A.to_string(), ExternalUse::Shared)]));
+    assert_eq!(
+        external_use,
+        HashMap::from([(
+            SNAP_A.to_string(),
+            ExternalUse::Shared(vec![Grant::Account(OTHER_ACCOUNT.to_string())])
+        )])
+    );
 
     let failing = snapshot_permission_error_rule();
     let client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&failing], no_sdk_retries);
@@ -1535,7 +1554,10 @@ fn shared_snapshots_are_kept_and_failed_lookups_block() {
     apply_snapshot_external_use(
         &mut plan,
         &HashMap::from([
-            (SNAP_A.to_string(), ExternalUse::Shared),
+            (
+                SNAP_A.to_string(),
+                ExternalUse::Shared(vec![Grant::Account(OTHER_ACCOUNT.to_string())]),
+            ),
             (SNAP_B.to_string(), ExternalUse::Unknown("AccessDenied".to_string())),
         ]),
     );
@@ -1831,18 +1853,22 @@ async fn image_builder_recipes_reference_parents_and_builds_of_own_images() {
         imagebuilder::operation::list_image_recipes::ListImageRecipesOutput::builder()
             .image_recipe_summary_list(
                 imagebuilder::types::ImageRecipeSummary::builder()
+                    .arn(format!("arn:aws:imagebuilder:us-east-1:{ACCOUNT}:image-recipe/a/1.0.0"))
+                    .name("a")
                     .owner(ACCOUNT)
                     .parent_image(AMI_A)
                     .build(),
             )
             .image_recipe_summary_list(
                 imagebuilder::types::ImageRecipeSummary::builder()
+                    .arn(format!("arn:aws:imagebuilder:us-east-1:{ACCOUNT}:image-recipe/b/1.0.0"))
                     .owner(ACCOUNT)
                     .parent_image(own_parent.clone())
                     .build(),
             )
             .image_recipe_summary_list(
                 imagebuilder::types::ImageRecipeSummary::builder()
+                    .arn(format!("arn:aws:imagebuilder:us-east-1:{ACCOUNT}:image-recipe/c/1.0.0"))
                     .owner(ACCOUNT)
                     .parent_image(
                         "arn:aws:imagebuilder:us-east-1:aws:image/amazon-linux-2023-x86/x.x.x",
@@ -1900,10 +1926,43 @@ async fn image_builder_recipes_reference_parents_and_builds_of_own_images() {
             )
             .build()
     });
+    // Recipe "a" restores a data volume from a snapshot; the others have no block devices.
+    let recipe_a = mock!(imagebuilder::Client::get_image_recipe)
+        .match_requests(|request| request.image_recipe_arn().is_some_and(|arn| arn.contains("/a/")))
+        .then_output(|| {
+            imagebuilder::operation::get_image_recipe::GetImageRecipeOutput::builder()
+                .image_recipe(
+                    imagebuilder::types::ImageRecipe::builder()
+                        .block_device_mappings(
+                            imagebuilder::types::InstanceBlockDeviceMapping::builder()
+                                .ebs(
+                                    imagebuilder::types::EbsInstanceBlockDeviceSpecification::builder()
+                                        .snapshot_id(SNAP_A)
+                                        .build(),
+                                )
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build()
+        });
+    let other_recipes = mock!(imagebuilder::Client::get_image_recipe).then_output(|| {
+        imagebuilder::operation::get_image_recipe::GetImageRecipeOutput::builder()
+            .image_recipe(imagebuilder::types::ImageRecipe::builder().build())
+            .build()
+    });
     let image_builder = mock_client!(
         aws_sdk_imagebuilder,
         RuleMode::MatchAny,
-        [&recipes, &versions, &builds, &container_recipes, &container_recipe]
+        [
+            &recipes,
+            &recipe_a,
+            &other_recipes,
+            &versions,
+            &builds,
+            &container_recipes,
+            &container_recipe
+        ]
     );
     let ec2_client = empty_ec2();
     let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
@@ -1913,6 +1972,10 @@ async fn image_builder_recipes_reference_parents_and_builds_of_own_images() {
     collector.collect_image_builder_recipes().await.unwrap();
 
     assert_eq!(referenced(&collector), ids(&[AMI_A, AMI_B, AMI_C]), "2.0.0 doesn't match 1.x.x");
+    assert_eq!(
+        collector.scan.snapshot_references,
+        HashMap::from([(SNAP_A.to_string(), vec!["Image Builder recipe a".to_string()])])
+    );
     assert!(
         collector.scan.unresolved_references.is_empty(),
         "{:?}",
@@ -2539,7 +2602,10 @@ fn mixed_plan(args: &Args) -> RegionPlan {
     apply_snapshot_external_use(
         &mut plan,
         &HashMap::from([
-            (SNAP_B.to_string(), ExternalUse::Shared),
+            (
+                SNAP_B.to_string(),
+                ExternalUse::Shared(vec![Grant::Account(OTHER_ACCOUNT.to_string())]),
+            ),
             (
                 "snap-0123456789abcdef3".to_string(),
                 ExternalUse::Unknown("AccessDenied | x".to_string()),
@@ -2826,6 +2892,7 @@ fn cached_template(
                 let version = CachedVersion {
                     image: Some((*image).to_string()),
                     created: Some(Utc::now() - Duration::days(90)),
+                    snapshots: Vec::new(),
                 };
                 (*number, version)
             })
@@ -2955,6 +3022,14 @@ fn unusable_cache_files_are_ignored() {
     )
     .unwrap();
     assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty, "v1 format");
+
+    // v2 has no snapshot ids, so its versions can't protect snapshots: rebuilt like v1.
+    std::fs::write(
+        &path,
+        r#"{"schema_version":2,"account_id":"123456789012","region":"us-east-1","templates":{"lt-1":{"scanned_through":1,"full_scan_at":"2026-01-01T00:00:00Z","versions":{"1":{"image":"ami-0123456789abcdef0"}}}}}"#,
+    )
+    .unwrap();
+    assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty, "v2 format");
 
     std::fs::write(&path, "{ not json").unwrap();
     assert_eq!(LaunchTemplateCache::load(&path, CACHE_ACCOUNT, "us-east-1"), empty, "corrupt");
@@ -3144,7 +3219,7 @@ fn inventory(
                     .iter()
                     .find(|(version, _)| *version == number)
                     .map(|(_, image)| (*image).to_string());
-                (number, CachedVersion { image, created: Some(old) })
+                (number, CachedVersion { image, created: Some(old), snapshots: Vec::new() })
             })
             .collect(),
     }
@@ -4100,4 +4175,386 @@ async fn execution_rechecks_recycle_bin_rules() {
     // The rule was deleted since planning: skipped, not deleted permanently.
     let (summary, deletes) = run(Vec::new()).await;
     assert_eq!((summary.deleted_snapshots, summary.skipped_snapshots, deletes), (0, 1, 0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// --check-accounts: shared AMIs and snapshots checked against the accounts they're shared with
+// ---------------------------------------------------------------------------------------------
+
+const CHARLIE1: &str = "111111111111";
+const CHARLIE11: &str = "222222222222";
+
+fn check(profiles: &[(&str, &str)]) -> CheckAccounts {
+    CheckAccounts {
+        profiles: profiles
+            .iter()
+            .map(|(account, profile)| ((*account).to_string(), (*profile).to_string()))
+            .collect(),
+        owner: Some(ACCOUNT.to_string()),
+    }
+}
+
+fn account_use(amis: &[(&str, &str)], snapshots: &[(&str, &str)]) -> AccountUse {
+    let map = |pairs: &[(&str, &str)]| {
+        pairs.iter().map(|(id, source)| ((*id).to_string(), vec![(*source).to_string()])).collect()
+    };
+    AccountUse { amis: map(amis), snapshots: map(snapshots) }
+}
+
+fn accounts(ids: &[&str]) -> Vec<Grant> {
+    ids.iter().map(|id| Grant::Account((*id).to_string())).collect()
+}
+
+#[test]
+fn shared_items_need_every_account_checked_and_unused() {
+    let check = check(&[(CHARLIE1, "charlie1"), (CHARLIE11, "charlie11")]);
+    let scans: AccountScans = HashMap::from([
+        (
+            CHARLIE1.to_string(),
+            Ok(account_use(&[(AMI_B, "instance i-1")], &[(SNAP_B, "volume vol-1")])),
+        ),
+        (CHARLIE11.to_string(), Ok(AccountUse::default())),
+    ]);
+    let reason =
+        |grants: &[Grant], id: &str, kind| shared_keep_reason(grants, id, kind, &check, &scans);
+
+    // A launch permission for the owner account itself grants nothing: ignored.
+    assert_eq!(reason(&accounts(&[ACCOUNT]), AMI_A, SharedKind::Ami), None);
+    assert_eq!(reason(&accounts(&[ACCOUNT, CHARLIE11]), AMI_A, SharedKind::Ami), None);
+
+    // Shared only with checked accounts that don't use it: no reason to keep it.
+    assert_eq!(reason(&accounts(&[CHARLIE1, CHARLIE11]), AMI_A, SharedKind::Ami), None);
+    assert_eq!(reason(&accounts(&[CHARLIE11]), SNAP_A, SharedKind::Snapshot), None);
+
+    // Used somewhere: kept, naming the account and what uses it.
+    assert_eq!(
+        reason(&accounts(&[CHARLIE1, CHARLIE11]), AMI_B, SharedKind::Ami),
+        Some(KeepReason::UsedInOtherAccount(format!("charlie1 ({CHARLIE1}): instance i-1")))
+    );
+    assert!(matches!(
+        reason(&accounts(&[CHARLIE1]), SNAP_B, SharedKind::Snapshot),
+        Some(KeepReason::UsedInOtherAccount(detail)) if detail.contains("volume vol-1")
+    ));
+    // An AMI id used as a snapshot id doesn't count (and vice versa).
+    assert_eq!(reason(&accounts(&[CHARLIE1]), AMI_B, SharedKind::Snapshot), None);
+
+    // Grants that can't be enumerated or checked keep it.
+    assert_eq!(
+        reason(&[Grant::Public], AMI_A, SharedKind::Ami),
+        Some(KeepReason::SharedPublicly)
+    );
+    let org = "arn:aws:organizations::123456789012:organization/o-abc".to_string();
+    assert_eq!(
+        reason(
+            &[Grant::Account(CHARLIE1.into()), Grant::Organization(org.clone())],
+            AMI_A,
+            SharedKind::Ami
+        ),
+        Some(KeepReason::SharedWithOrganization(org))
+    );
+    assert_eq!(
+        reason(&[Grant::OrganizationalUnit("ou-arn".into())], AMI_A, SharedKind::Ami),
+        Some(KeepReason::SharedWithOrganization("ou-arn".into()))
+    );
+    assert_eq!(
+        reason(&accounts(&[CHARLIE1, "333333333333"]), AMI_A, SharedKind::Ami),
+        Some(KeepReason::SharedWithUncheckedAccount("333333333333".into()))
+    );
+
+    // A listed account that wasn't scanned, or whose scan failed, keeps it (and is uncertain).
+    let failed: AccountScans =
+        HashMap::from([(CHARLIE1.to_string(), Err("AccessDenied".to_string()))]);
+    let kept = shared_keep_reason(&accounts(&[CHARLIE1]), AMI_A, SharedKind::Ami, &check, &failed);
+    assert!(
+        matches!(&kept, Some(KeepReason::AccountCheckFailed(detail)) if detail.contains("AccessDenied"))
+    );
+    assert!(kept.unwrap().uncertain());
+    let missing =
+        shared_keep_reason(&accounts(&[CHARLIE11]), AMI_A, SharedKind::Ami, &check, &failed);
+    assert!(
+        matches!(missing, Some(KeepReason::AccountCheckFailed(detail)) if detail.contains("not scanned"))
+    );
+}
+
+#[test]
+fn only_items_shared_with_listed_accounts_cost_a_scan() {
+    let check = check(&[(CHARLIE1, "charlie1"), (CHARLIE11, "charlie11")]);
+    let mut external_use = HashMap::from([
+        (AMI_A.to_string(), ExternalUse::Shared(accounts(&[CHARLIE1]))),
+        (
+            AMI_B.to_string(),
+            ExternalUse::Shared(vec![Grant::Account(CHARLIE11.into()), Grant::Public]),
+        ),
+        (AMI_C.to_string(), ExternalUse::Shared(accounts(&["333333333333"]))),
+        (AMI_D.to_string(), ExternalUse::Unknown("throttled".into())),
+        (
+            "ami-0123456789abcdef4".to_string(),
+            ExternalUse::Shared(accounts(&[ACCOUNT, CHARLIE11])),
+        ),
+    ]);
+    assert_eq!(
+        accounts_to_scan(&external_use, &check).into_iter().collect::<Vec<_>>(),
+        vec![CHARLIE1.to_string(), CHARLIE11.to_string()],
+        "the owner's own grant neither blocks a scan nor gets scanned"
+    );
+
+    let scans: AccountScans = HashMap::from([
+        (CHARLIE1.to_string(), Ok(AccountUse::default())),
+        (CHARLIE11.to_string(), Ok(AccountUse::default())),
+    ]);
+    resolve_external_use(&mut external_use, SharedKind::Ami, &check, &scans);
+    assert!(!external_use.contains_key("ami-0123456789abcdef4"));
+    // AMI_A is unused everywhere it's shared: it drops out, so the normal rules decide it.
+    assert!(!external_use.contains_key(AMI_A));
+    assert_eq!(external_use[AMI_B], ExternalUse::Kept(KeepReason::SharedPublicly));
+    assert_eq!(
+        external_use[AMI_C],
+        ExternalUse::Kept(KeepReason::SharedWithUncheckedAccount("333333333333".into()))
+    );
+    assert_eq!(external_use[AMI_D], ExternalUse::Unknown("throttled".into()));
+}
+
+fn volumes_rule_for(pairs: &'static [(&'static str, &'static str)]) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_volumes).then_output(move || {
+        ec2::operation::describe_volumes::DescribeVolumesOutput::builder()
+            .set_volumes(Some(
+                pairs
+                    .iter()
+                    .map(|(volume, snapshot)| {
+                        ec2::types::Volume::builder()
+                            .volume_id(*volume)
+                            .snapshot_id(*snapshot)
+                            .build()
+                    })
+                    .collect(),
+            ))
+            .build()
+    })
+}
+
+fn instance_rule(instance_id: &'static str, image_id: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_instances).then_output(move || {
+        ec2::operation::describe_instances::DescribeInstancesOutput::builder()
+            .reservations(
+                ec2::types::Reservation::builder()
+                    .instances(
+                        ec2::types::Instance::builder()
+                            .instance_id(instance_id)
+                            .image_id(image_id)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    })
+}
+
+#[tokio::test]
+async fn checking_an_account_reads_its_references_and_volumes() {
+    let instances = instance_rule("i-1", AMI_A);
+    let volumes = volumes_rule_for(&[("vol-1", SNAP_A)]);
+    let mut rules = vec![instances];
+    rules.extend(empty_reference_scan_rules());
+    let ec2_client = ec2_with(rules, &[&volumes]);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+
+    let usage = check_account(&ec2_client, &clients, None, &[SNAP_A]).await.unwrap();
+    assert_eq!(usage.amis[AMI_A], vec!["instance i-1".to_string()]);
+    assert_eq!(usage.snapshots[SNAP_A], vec!["volume vol-1".to_string()]);
+
+    // Already scanned: only the volume check runs; a failed earlier scan stays failed.
+    let previous = Ok(AccountUse::default());
+    let usage = check_account(&ec2_client, &clients, Some(previous), &[SNAP_A]).await.unwrap();
+    assert!(usage.amis.is_empty());
+    assert_eq!(usage.snapshots[SNAP_A], vec!["volume vol-1".to_string()]);
+    let failed = check_account(&ec2_client, &clients, Some(Err("denied".into())), &[]).await;
+    assert_eq!(failed, Err("denied".to_string()));
+
+    // A volume lookup that fails makes the account unknown.
+    let denied = mock!(ec2::Client::describe_volumes).then_error(|| {
+        ec2::operation::describe_volumes::DescribeVolumesError::generic(ec2_error(
+            "UnauthorizedOperation",
+            "no",
+        ))
+    });
+    let ec2_client = ec2_with(empty_reference_scan_rules(), &[&denied]);
+    let error = check_account(&ec2_client, &clients, None, &[SNAP_A]).await.unwrap_err();
+    assert!(error.contains("UnauthorizedOperation"), "{error}");
+
+    // Unresolved references make the account unknown too.
+    let unresolved = instance_rule("i-2", "resolve:ssm:/missing/param");
+    let missing = mock!(ssm::Client::get_parameter).then_error(|| {
+        ssm::operation::get_parameter::GetParameterError::generic(ec2_error(
+            "ParameterNotFound",
+            "gone",
+        ))
+    });
+    let mut rules = vec![unresolved];
+    rules.extend(empty_reference_scan_rules());
+    let ec2_client = ec2_with(rules, &[]);
+    let ssm_client = mock_client!(aws_sdk_ssm, RuleMode::MatchAny, [&missing]);
+    let clients = reference_clients(empty_asg_client(), ssm_client);
+    let error = check_account(&ec2_client, &clients, None, &[]).await.unwrap_err();
+    assert!(error.contains("unresolved"), "{error}");
+}
+
+#[test]
+fn snapshot_ids_are_found_in_templates() {
+    assert_eq!(
+        find_snapshot_ids(
+            r#"{"SnapshotId": "snap-0123456789abcdef0", "Other": "snap-xyz", "Old": "snap-0123ABCD"}"#
+        ),
+        vec!["snap-0123456789abcdef0".to_string(), "snap-0123abcd".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn block_devices_name_snapshots_for_the_scan() {
+    let launch_configurations = mock!(autoscaling::Client::describe_launch_configurations).then_output(|| {
+        autoscaling::operation::describe_launch_configurations::DescribeLaunchConfigurationsOutput::builder()
+            .launch_configurations(
+                autoscaling::types::LaunchConfiguration::builder()
+                    .launch_configuration_name("legacy")
+                    .image_id(AMI_A)
+                    .block_device_mappings(
+                        autoscaling::types::BlockDeviceMapping::builder()
+                            .device_name("/dev/sdf")
+                            .ebs(autoscaling::types::Ebs::builder().snapshot_id(SNAP_A).build())
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let asg = mock_client!(aws_sdk_autoscaling, RuleMode::MatchAny, [&launch_configurations]);
+    let templates = launch_templates_rule(&["lt-0123456789abcdef1"]);
+    let versions = mock!(ec2::Client::describe_launch_template_versions).then_output(|| {
+        ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder()
+            .launch_template_versions(
+                ec2::types::LaunchTemplateVersion::builder()
+                    .launch_template_id("lt-0123456789abcdef1")
+                    .version_number(4)
+                    .launch_template_data(
+                        ec2::types::ResponseLaunchTemplateData::builder()
+                            .block_device_mappings(
+                                ec2::types::LaunchTemplateBlockDeviceMapping::builder()
+                                    .ebs(ec2::types::LaunchTemplateEbsBlockDevice::builder().snapshot_id(SNAP_B).build())
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build()
+    });
+    let ec2_client =
+        mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&templates, &versions], no_sdk_retries);
+    let clients = reference_clients(asg, no_ssm_client());
+    let mut collector = collector(&ec2_client, &clients);
+
+    collector.collect_launch_configurations().await.unwrap();
+    collector.collect_launch_templates().await.unwrap();
+
+    assert_eq!(
+        collector.scan.snapshot_references,
+        HashMap::from([
+            (SNAP_A.to_string(), vec!["launch configuration legacy".to_string()]),
+            (SNAP_B.to_string(), vec!["launch template lt-0123456789abcdef1 v4".to_string()]),
+        ])
+    );
+}
+
+#[test]
+fn referenced_or_unknown_snapshots_are_kept_by_the_plan() {
+    let mut args = test_args();
+    args.allow_untagged = true;
+    let old = Utc::now() - Duration::days(400);
+    let snapshots = [make_snapshot(SNAP_A, old, &[]), make_snapshot(SNAP_B, old, &[])];
+
+    let mut references = scan(&[], &[]);
+    references
+        .snapshot_references
+        .insert(SNAP_A.to_string(), vec!["launch template lt-1 v3".to_string()]);
+    let plan =
+        plan_region(&args, "us-east-1", Utc::now(), &[], &snapshots, &references, &HashMap::new());
+    assert_eq!(
+        plan.delete_snapshots.iter().map(|s| s.snapshot_id.as_str()).collect::<Vec<_>>(),
+        vec![SNAP_B]
+    );
+    assert_eq!(
+        plan.kept_snapshots[0].reason,
+        KeepReason::SnapshotReferenced("launch template lt-1 v3".into())
+    );
+    assert!(plan.blocked.is_empty());
+
+    // The reference scan failed: every snapshot it could have protected stays, and it blocks.
+    let mut failed = scan(&[], &["AMI reference scan failed: throttled"]);
+    failed.failure = Some("AMI reference scan failed: throttled".into());
+    let plan =
+        plan_region(&args, "us-east-1", Utc::now(), &[], &snapshots, &failed, &HashMap::new());
+    assert!(plan.delete_snapshots.is_empty());
+    assert!(
+        plan.kept_snapshots
+            .iter()
+            .all(|kept| matches!(kept.reason, KeepReason::SnapshotReferencesUnknown(_)))
+    );
+    assert_eq!(plan.blocked.len(), 1);
+}
+
+#[test]
+fn account_check_outcomes_flow_into_the_plan() {
+    let mut args = test_args();
+    args.allow_untagged = true;
+    let old = Utc::now() - Duration::days(400);
+    let amis = vec![
+        make_ami(AMI_A, old, &[], &[]),
+        make_ami(AMI_B, old, &[], &[]),
+        make_ami(AMI_C, old, &[], &[]),
+    ];
+    // AMI_A: unused everywhere (dropped from the map); AMI_B: used in charlie1; AMI_C: unknown.
+    let external = HashMap::from([
+        (
+            AMI_B.to_string(),
+            ExternalUse::Kept(KeepReason::UsedInOtherAccount("charlie1: asg web".into())),
+        ),
+        (
+            AMI_C.to_string(),
+            ExternalUse::Kept(KeepReason::AccountCheckFailed("charlie11: denied".into())),
+        ),
+    ]);
+    let plan = plan_region(&args, "us-east-1", Utc::now(), &amis, &[], &scan(&[], &[]), &external);
+    assert_eq!(
+        plan.deregister_amis.iter().map(|ami| ami.ami_id.as_str()).collect::<Vec<_>>(),
+        vec![AMI_A]
+    );
+    let kept = plan
+        .kept_amis
+        .iter()
+        .map(|kept| (kept.item.ami_id.as_str(), kept.reason.code()))
+        .collect::<Vec<_>>();
+    assert!(
+        kept.contains(&(AMI_B, "used_in_other_account"))
+            && kept.contains(&(AMI_C, "account_check_failed"))
+    );
+    assert_eq!(
+        plan.blocked.len(),
+        1,
+        "only the failed check is a safety block: {:?}",
+        plan.blocked
+    );
+
+    let mut plan = recycle_plan();
+    apply_snapshot_external_use(
+        &mut plan,
+        &HashMap::from([(
+            SNAP_A.to_string(),
+            ExternalUse::Kept(KeepReason::SharedWithUncheckedAccount("333333333333".into())),
+        )]),
+    );
+    assert_eq!(
+        plan.delete_snapshots.iter().map(|s| s.snapshot_id.as_str()).collect::<Vec<_>>(),
+        vec![SNAP_B]
+    );
+    assert_eq!(plan.kept_snapshots[0].reason.code(), "shared_with_unchecked_account");
+    assert!(plan.blocked.is_empty());
 }

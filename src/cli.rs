@@ -87,7 +87,14 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 0)]
     pub(crate) keep_latest_per_family: usize,
 
-    /// Comma-separated AMI reference sources to skip: image-builder, cloudformation, batch, emr.
+    /// Comma-separated AWS profiles of the accounts AMIs and snapshots are shared with. Each one
+    /// is scanned (same region) for what it uses; a shared AMI or snapshot is no longer kept just
+    /// for being shared when every account it's shared with is listed, was scanned cleanly, and
+    /// doesn't use it. Public, organization and OU shares are always kept.
+    #[arg(long, value_name = "PROFILE", value_delimiter = ',')]
+    pub(crate) check_accounts: Vec<String>,
+
+    /// Comma-separated AMI reference sources to skip: image-builder, cloudformation, batch, emr, eks.
     /// All are scanned by default; a source you can't read (e.g. missing IAM permission) blocks
     /// AMI deregistration rather than being ignored.
     #[arg(long, value_enum, value_delimiter = ',')]

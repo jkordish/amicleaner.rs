@@ -126,6 +126,21 @@ pub(crate) fn snapshot_keep_reason(
     None
 }
 
+/// Keeps a snapshot something in the account names (launch template or launch configuration block
+/// devices, fleets, Image Builder recipes, CloudFormation), or every snapshot when the reference
+/// scan failed. Plan and execute both apply it to snapshots the other rules would delete.
+pub(crate) fn snapshot_reference_keep_reason(
+    snapshot_id: &str,
+    references: Result<&HashMap<String, Vec<String>>, &str>,
+) -> Option<KeepReason> {
+    match references {
+        Err(error) => Some(KeepReason::SnapshotReferencesUnknown(error.to_string())),
+        Ok(references) => references
+            .get(snapshot_id)
+            .map(|sources| KeepReason::SnapshotReferenced(sources.join("; "))),
+    }
+}
+
 /// Whether a snapshot is authorized for deletion on delete-tag grounds. Age, references and the
 /// protect tag are checked separately by `snapshot_is_deletable` and can't be overridden here.
 ///

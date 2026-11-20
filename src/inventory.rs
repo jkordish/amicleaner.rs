@@ -9,7 +9,7 @@ use futures_util::{StreamExt, stream};
 use log::warn;
 
 use crate::errors::{AppResult, AwsResultExt, error_chain};
-use crate::model::{AmiInfo, ExternalUse, LastLaunched, SnapshotInfo};
+use crate::model::{AmiInfo, ExternalUse, Grant, LastLaunched, SnapshotInfo};
 use crate::ui::Phase;
 
 pub(crate) async fn list_owned_amis(ec2_client: &ec2::Client) -> AppResult<Vec<AmiInfo>> {
@@ -147,10 +147,14 @@ pub(crate) fn is_ami_id(value: &str) -> bool {
     is_resource_id(value, "ami-")
 }
 
-pub(crate) async fn ami_has_external_launch_permissions(
+pub(crate) fn is_snapshot_id(value: &str) -> bool {
+    is_resource_id(value, "snap-")
+}
+
+pub(crate) async fn ami_launch_grants(
     ec2_client: &ec2::Client,
     ami_id: &str,
-) -> AppResult<bool> {
+) -> AppResult<Vec<Grant>> {
     let output = ec2_client
         .describe_image_attribute()
         .image_id(ami_id)
@@ -158,15 +162,26 @@ pub(crate) async fn ami_has_external_launch_permissions(
         .send()
         .await
         .aws_context("DescribeImageAttribute")?;
-    Ok(!output.launch_permissions().is_empty())
+    Ok(output
+        .launch_permissions()
+        .iter()
+        .map(|permission| {
+            grant(
+                permission.user_id(),
+                permission.group(),
+                permission.organization_arn(),
+                permission.organizational_unit_arn(),
+            )
+        })
+        .collect())
 }
 
-/// Whether a snapshot grants create-volume permissions to anyone (other accounts, organizations,
-/// OUs, or the public). The owner never needs one, so any entry means someone else can use it.
-pub(crate) async fn snapshot_has_external_create_volume_permissions(
+/// Who a snapshot grants create-volume permissions to (other accounts or the public). The owner
+/// never needs one, so any entry means someone else can use it.
+pub(crate) async fn snapshot_volume_grants(
     ec2_client: &ec2::Client,
     snapshot_id: &str,
-) -> AppResult<bool> {
+) -> AppResult<Vec<Grant>> {
     let output = ec2_client
         .describe_snapshot_attribute()
         .snapshot_id(snapshot_id)
@@ -174,7 +189,35 @@ pub(crate) async fn snapshot_has_external_create_volume_permissions(
         .send()
         .await
         .aws_context("DescribeSnapshotAttribute")?;
-    Ok(!output.create_volume_permissions().is_empty())
+    Ok(output
+        .create_volume_permissions()
+        .iter()
+        .map(|permission| grant(permission.user_id(), permission.group(), None, None))
+        .collect())
+}
+
+/// One permission entry as a grant. An entry with nothing recognizable is treated as public,
+/// the widest reading, so it can never make a shared item look less shared.
+fn grant(
+    user_id: Option<&str>,
+    group: Option<&ec2::types::PermissionGroup>,
+    organization_arn: Option<&str>,
+    organizational_unit_arn: Option<&str>,
+) -> Grant {
+    fn non_empty(value: Option<&str>) -> Option<&str> {
+        value.map(str::trim).filter(|value| !value.is_empty())
+    }
+    if group.is_some() {
+        Grant::Public
+    } else if let Some(arn) = non_empty(organizational_unit_arn) {
+        Grant::OrganizationalUnit(arn.to_string())
+    } else if let Some(arn) = non_empty(organization_arn) {
+        Grant::Organization(arn.to_string())
+    } else if let Some(account) = non_empty(user_id) {
+        Grant::Account(account.to_string())
+    } else {
+        Grant::Public
+    }
 }
 
 /// Looks up, `concurrency` at a time, which AMIs grant launch permissions to anyone else.
@@ -185,10 +228,8 @@ pub(crate) async fn lookup_ami_external_use(
     concurrency: usize,
     phase: Option<&Phase>,
 ) -> HashMap<String, ExternalUse> {
-    lookup_external_use(ami_ids, concurrency, phase, |ami_id| {
-        ami_has_external_launch_permissions(ec2_client, ami_id)
-    })
-    .await
+    lookup_external_use(ami_ids, concurrency, phase, |ami_id| ami_launch_grants(ec2_client, ami_id))
+        .await
 }
 
 /// Looks up, `concurrency` at a time, which snapshots grant create-volume permissions to anyone
@@ -200,7 +241,7 @@ pub(crate) async fn lookup_snapshot_external_use(
     phase: Option<&Phase>,
 ) -> HashMap<String, ExternalUse> {
     lookup_external_use(snapshot_ids, concurrency, phase, |snapshot_id| {
-        snapshot_has_external_create_volume_permissions(ec2_client, snapshot_id)
+        snapshot_volume_grants(ec2_client, snapshot_id)
     })
     .await
 }
@@ -213,7 +254,7 @@ async fn lookup_external_use<'a, F, Fut>(
 ) -> HashMap<String, ExternalUse>
 where
     F: Fn(&'a str) -> Fut,
-    Fut: Future<Output = AppResult<bool>>,
+    Fut: Future<Output = AppResult<Vec<Grant>>>,
 {
     stream::iter(ids.iter().copied())
         .map(|id| {
@@ -228,8 +269,8 @@ where
         })
         .filter_map(|(id, result)| async move {
             match result {
-                Ok(false) => None,
-                Ok(true) => Some((id.to_string(), ExternalUse::Shared)),
+                Ok(grants) if grants.is_empty() => None,
+                Ok(grants) => Some((id.to_string(), ExternalUse::Shared(grants))),
                 Err(error) => {
                     Some((id.to_string(), ExternalUse::Unknown(error_chain(error.as_ref()))))
                 }

@@ -50,6 +50,16 @@ pub(crate) struct SnapshotInfo {
     pub(crate) dlm_orphan: Option<DlmOrphanCause>,
 }
 
+/// What `--check-accounts` found in one region.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccountCheckSummary {
+    /// "profile (account)" for every account scanned, and whether its scan succeeded.
+    pub(crate) accounts: Vec<(String, bool)>,
+    /// Shared AMIs / snapshots no checked account uses, so the normal rules decide them.
+    pub(crate) unused_amis: usize,
+    pub(crate) unused_snapshots: usize,
+}
+
 /// Whether planned snapshot deletes would land in the Recycle Bin.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum RecycleBinCoverage {
@@ -163,6 +173,8 @@ pub(crate) struct RegionPlan {
     /// Launch template versions to delete, with `--prune-launch-template-versions`.
     pub(crate) launch_template_prune: Option<LaunchTemplatePrunePlan>,
     pub(crate) recycle_bin: RecycleBinCoverage,
+    /// `--check-accounts`: what checking the other accounts found.
+    pub(crate) account_check: Option<AccountCheckSummary>,
 }
 
 // Count helpers used by the tests; reports derive their numbers from the lists directly.
@@ -216,6 +228,22 @@ pub(crate) enum KeepReason {
     NoRecycleBin,
     /// `--require-recycle-bin`: the Recycle Bin rules couldn't be read.
     RecycleBinUnknown(String),
+    /// `--check-accounts`: shared publicly, so the accounts using it can't be known.
+    SharedPublicly,
+    /// `--check-accounts`: shared with an organization or OU (the ARN), whose accounts can't be
+    /// enumerated.
+    SharedWithOrganization(String),
+    /// `--check-accounts`: shared with an account that isn't in the list (the account id).
+    SharedWithUncheckedAccount(String),
+    /// `--check-accounts`: an account it's shared with couldn't be checked (account and error).
+    AccountCheckFailed(String),
+    /// `--check-accounts`: a checked account uses it (account and what uses it).
+    UsedInOtherAccount(String),
+    /// A launch template, launch configuration, fleet, Image Builder recipe or CloudFormation
+    /// stack in this account names the snapshot (what names it).
+    SnapshotReferenced(String),
+    /// The reference scan failed, so snapshot references in this account aren't known.
+    SnapshotReferencesUnknown(String),
 }
 
 impl KeepReason {
@@ -240,6 +268,13 @@ impl KeepReason {
             Self::BackupDeleteTagMissing => "backup_delete_tag_missing",
             Self::NoRecycleBin => "no_recycle_bin",
             Self::RecycleBinUnknown(_) => "recycle_bin_unknown",
+            Self::SharedPublicly => "shared_publicly",
+            Self::SharedWithOrganization(_) => "shared_with_organization",
+            Self::SharedWithUncheckedAccount(_) => "shared_with_unchecked_account",
+            Self::AccountCheckFailed(_) => "account_check_failed",
+            Self::UsedInOtherAccount(_) => "used_in_other_account",
+            Self::SnapshotReferenced(_) => "snapshot_referenced",
+            Self::SnapshotReferencesUnknown(_) => "snapshot_references_unknown",
         }
     }
 
@@ -247,7 +282,11 @@ impl KeepReason {
     pub(crate) fn uncertain(&self) -> bool {
         matches!(
             self,
-            Self::SharingUnknown(_) | Self::UnresolvedReferences | Self::RecycleBinUnknown(_)
+            Self::SharingUnknown(_)
+                | Self::UnresolvedReferences
+                | Self::RecycleBinUnknown(_)
+                | Self::AccountCheckFailed(_)
+                | Self::SnapshotReferencesUnknown(_)
         )
     }
 }
@@ -285,6 +324,17 @@ impl fmt::Display for KeepReason {
             ),
             Self::RecycleBinUnknown(error) => {
                 write!(f, "Recycle Bin rules couldn't be read: {error} (--require-recycle-bin)")
+            }
+            Self::SharedPublicly => f.write_str("shared publicly"),
+            Self::SharedWithOrganization(arn) => write!(f, "shared with {arn}"),
+            Self::SharedWithUncheckedAccount(account) => {
+                write!(f, "shared with account {account}, which isn't in --check-accounts")
+            }
+            Self::AccountCheckFailed(detail) => write!(f, "couldn't check {detail}"),
+            Self::UsedInOtherAccount(detail) => write!(f, "used in {detail}"),
+            Self::SnapshotReferenced(source) => write!(f, "referenced by {source}"),
+            Self::SnapshotReferencesUnknown(error) => {
+                write!(f, "snapshot references unknown: {error}")
             }
         }
     }
@@ -387,11 +437,22 @@ impl LaunchTemplatePrunePlan {
 /// account and shared to others are the main case: deleting them breaks launches elsewhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExternalUse {
-    /// Launch (AMI) or create-volume (snapshot) permissions are granted to other accounts,
-    /// organizations, OUs or the public.
-    Shared,
+    /// Launch (AMI) or create-volume (snapshot) permissions are granted to these.
+    Shared(Vec<Grant>),
     /// The permission lookup failed.
     Unknown(String),
+    /// Shared, and checking the accounts it's shared with (`--check-accounts`) found this reason
+    /// to keep it. Shared items that every checked account leaves unused drop out of the map.
+    Kept(KeepReason),
+}
+
+/// Who a launch or create-volume permission is granted to.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum Grant {
+    Account(String),
+    Public,
+    Organization(String),
+    OrganizationalUnit(String),
 }
 
 #[derive(Clone, Copy, Debug)]

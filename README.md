@@ -16,7 +16,8 @@ Anything the tool can't determine blocks the deletions it affects:
 
 - An AMI reference that can't be resolved (for example an SSM parameter that doesn't hold an AMI id) cancels all AMI deregistrations in that region. Snapshot cleanup continues.
 - If the AWS Backup inventory can't be read, or a snapshot looks AWS Backup-created but has no matching recovery point, those snapshot deletions are cancelled.
-- Anything shared is kept. That means an AMI with any launch permission, or a snapshot with any create-volume permission, granted to another account, an Organization or OU, or the public. If the permission lookup fails, the resource is kept and the region exits with code 3. This protects the build-account pattern, where AMIs are built in one account and shared to the accounts that run them. A shared AMI also keeps its snapshots, because they stay referenced. The plan prints how many candidates were kept this way as `kept_shared_amis` and `kept_shared_snapshots`.
+- Anything shared is kept. That means an AMI with any launch permission, or a snapshot with any create-volume permission, granted to another account, an Organization or OU, or the public. If the permission lookup fails, the resource is kept and the region exits with code 3. This protects the build-account pattern, where AMIs are built in one account and shared to the accounts that run them. A shared AMI also keeps its snapshots, because they stay referenced. The plan prints how many candidates were kept this way as `kept_shared_amis` and `kept_shared_snapshots`. With `--check-accounts`, amicleaner looks inside the accounts you share with, and only treats something as unshared when none of them use it (see below).
+- A snapshot that a launch template, launch configuration, Spot Fleet or Spot request, Image Builder recipe, or CloudFormation stack in the account names is kept (`snapshot_referenced`), since it can still create volumes. If the reference scan fails, snapshot deletions in that region are cancelled (exit code 3).
 - AMIs created by AWS Backup and AMIs with missing or unparseable dates are kept.
 - Snapshots and AMIs created by Amazon Data Lifecycle Manager (an `aws:dlm:` tag, or a "Created for policy: policy-…" description) are always kept, even with the delete tag. DLM deletes them on its own retention schedule. The exception is snapshots DLM will never delete, which `--delete-orphaned-dlm-snapshots` can clean up (see below).
 - With `--execute`, every planned item is re-checked against live state right before it is deleted.
@@ -47,13 +48,15 @@ Read, per reference source (drop the ones you pass to `--skip-reference-sources`
 
 | source | permissions |
 |---|---|
-| `image-builder` | `imagebuilder:ListImageRecipes`, `imagebuilder:ListContainerRecipes`, `imagebuilder:GetContainerRecipe`, `imagebuilder:ListImages`, `imagebuilder:ListImageBuildVersions` |
+| `image-builder` | `imagebuilder:ListImageRecipes`, `imagebuilder:GetImageRecipe`, `imagebuilder:ListContainerRecipes`, `imagebuilder:GetContainerRecipe`, `imagebuilder:ListImages`, `imagebuilder:ListImageBuildVersions` |
 | `cloudformation` | `cloudformation:DescribeStacks`, `cloudformation:GetTemplate` |
 | `batch` | `batch:DescribeComputeEnvironments` |
 | `emr` | `elasticmapreduce:ListClusters`, `elasticmapreduce:DescribeCluster`, `elasticmapreduce:ListInstanceGroups`, `elasticmapreduce:ListInstanceFleets` |
 | `eks` (only with `--prune-launch-template-versions`) | `eks:ListClusters`, `eks:ListNodegroups`, `eks:DescribeNodegroup` |
 
 With `--delete-orphaned-dlm-snapshots`: `dlm:GetLifecyclePolicy` and `ec2:DescribeVolumes`.
+
+With `--check-accounts`: `sts:GetCallerIdentity` for every listed profile. In each checked account, the read permissions above (minus AWS Backup), plus `ec2:DescribeVolumes`.
 
 Recycle Bin coverage (whenever snapshots are planned for deletion): `rbin:ListRules` and `rbin:GetRule`. Without them the plan reports coverage as unknown. With `--require-recycle-bin`, missing permissions cancel the region's snapshot deletes.
 
@@ -104,6 +107,26 @@ Launch templates are free, but every old version that names an AMI keeps that AM
 Templates managed by EKS, Karpenter, Batch or CloudFormation (by tag), templates with the protect tag, and templates pinned to a version string amicleaner doesn't recognize are left alone. If any reference source failed or left unresolved references, or Batch or EKS is skipped, pruning is cancelled for the region (exit code 3). Execute re-reads everything and only deletes versions that both the plan and the re-check agree on, after the AMI and snapshot phases. AMIs that only the deleted versions referenced are reported as freed. They're considered on the *next* run, under every AMI rule. Needs `ec2:DeleteLaunchTemplateVersions`, plus the `eks` permissions above.
 
 Things amicleaner can't see, like scripts or pipelines that launch a specific version number by hand, aren't protected. Raise `--keep-launch-template-versions` if you have those.
+
+### checking the accounts you share with
+
+AMIs built in one account and shared to others are kept forever by default, because amicleaner can't see whether the other accounts still use them. If you have profiles for those accounts, pass them:
+
+```shell
+AWS_PROFILE=delta0 amicleaner --regions us-west-2 --check-accounts charlie1,charlie11,india0
+```
+
+amicleaner looks up each profile's account id. For every shared candidate, it reads who it's shared with, then scans those accounts in the same region with the same reference scan it runs on its own account. A shared AMI or snapshot is no longer kept just for being shared only when all of these hold:
+
+- **Only specific accounts.** Every grant is to an account. Public, organization and OU shares can't be enumerated, so they're always kept (`shared_publicly`, `shared_with_organization`).
+- **Every account checked.** Each of those accounts is in `--check-accounts` (otherwise `shared_with_unchecked_account`), and its scan finished cleanly with no unresolved references (otherwise `account_check_failed`, exit code 3).
+- **Nobody uses it.** None of those accounts uses it (otherwise `used_in_other_account`, naming the account and what uses it).
+  - For an AMI, "uses" means the full reference scan: instances, launch templates, Auto Scaling groups, launch configurations, fleets, Spot requests, Image Builder, CloudFormation, Batch and EMR.
+  - For a snapshot, it means block devices and CloudFormation that name it, plus any volume created from it.
+
+Everything else still applies: age, last launch, references in this account, tags, DLM, AWS Backup and the Recycle Bin. Execute re-reads the grants and re-scans the accounts before deleting, so something newly shared or newly used is skipped. Deregistering an AMI doesn't affect instances already running from it in other accounts, but nothing new can launch from it.
+
+Each checked account needs the same read permissions as the account being cleaned, plus `ec2:DescribeVolumes`. Its launch template cache is kept separately, by account. Only the region being cleaned is checked, since an AMI or snapshot can only be used in its own region (copies are independent).
 
 ### Recycle Bin
 
@@ -266,8 +289,11 @@ Options:
           
           [default: 0]
 
+      --check-accounts <PROFILE>
+          Comma-separated AWS profiles of the accounts AMIs and snapshots are shared with. Each one is scanned (same region) for what it uses; a shared AMI or snapshot is no longer kept just for being shared when every account it's shared with is listed, was scanned cleanly, and doesn't use it. Public, organization and OU shares are always kept
+
       --skip-reference-sources <SKIP_REFERENCE_SOURCES>
-          Comma-separated AMI reference sources to skip: image-builder, cloudformation, batch, emr. All are scanned by default; a source you can't read (e.g. missing IAM permission) blocks AMI deregistration rather than being ignored
+          Comma-separated AMI reference sources to skip: image-builder, cloudformation, batch, emr, eks. All are scanned by default; a source you can't read (e.g. missing IAM permission) blocks AMI deregistration rather than being ignored
 
           Possible values:
           - image-builder:  Image recipe parent images and container recipe build-instance AMIs

@@ -23,8 +23,9 @@ use ec2::error::ProvideErrorMetadata;
 use futures_util::{StreamExt, stream};
 use log::warn;
 
+use crate::accounts::CheckAccounts;
 use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
-use crate::inventory::is_ami_id;
+use crate::inventory::{is_ami_id, is_snapshot_id};
 use crate::references::lt_cache::{
     CachedTemplate, CachedVersion, FetchPlan, LaunchTemplateCache, LtCacheConfig, fetch_plan,
 };
@@ -64,10 +65,14 @@ pub(crate) struct ReferenceClients {
     /// Maximum concurrent requests for the fan-out lookups (launch template versions,
     /// CloudFormation templates).
     pub(crate) concurrency: usize,
-    /// Region name, for progress labels.
+    /// Region name (also names the launch template cache file).
     pub(crate) region: String,
+    /// Progress label prefix: the region, or "profile · region" when scanning another account.
+    pub(crate) label: String,
     /// Launch template version cache; `None` reads every version every run.
     pub(crate) lt_cache: Option<LtCacheConfig>,
+    /// `--check-accounts`: the accounts whose use of shared AMIs and snapshots is checked.
+    pub(crate) check_accounts: Option<CheckAccounts>,
 }
 
 impl ReferenceClients {
@@ -89,8 +94,20 @@ impl ReferenceClients {
             rbin: rbin::Client::new(config),
             concurrency: concurrency.max(1),
             region: config.region().map(ToString::to_string).unwrap_or_default(),
+            label: config.region().map(ToString::to_string).unwrap_or_default(),
             lt_cache: None,
+            check_accounts: None,
         }
+    }
+
+    pub(crate) fn with_label(mut self, label: String) -> Self {
+        self.label = label;
+        self
+    }
+
+    pub(crate) fn with_check_accounts(mut self, check_accounts: Option<CheckAccounts>) -> Self {
+        self.check_accounts = check_accounts;
+        self
     }
 
     /// Reads EKS node groups too (needed before pruning launch template versions), unless the
@@ -141,6 +158,11 @@ pub(crate) struct AmiReferenceScan {
     pub(crate) pinned_launch_template_versions: HashMap<String, HashSet<String>>,
     /// Every launch template whose versions were all read, with those versions.
     pub(crate) launch_templates: Vec<LaunchTemplateInventory>,
+    /// Snapshot id -> the first few things that name it (block device mappings, CloudFormation).
+    /// Something that names a snapshot can create a volume from it.
+    pub(crate) snapshot_references: HashMap<String, Vec<String>>,
+    /// Why the scan failed, when it did; snapshot references are then unknown.
+    pub(crate) failure: Option<String>,
 }
 
 /// One launch template and all its versions, for version pruning.
@@ -166,6 +188,17 @@ impl AmiReferenceScan {
         *self.reference_counts.entry(ami_id.clone()).or_default() += 1;
         self.referenced_ami_ids.insert(ami_id);
         self.references_seen += 1;
+    }
+
+    /// Records that `source` names a snapshot (ignored unless it's a strict snapshot id).
+    pub(crate) fn add_snapshot_reference(&mut self, snapshot_id: &str, source: &str) {
+        if !is_snapshot_id(snapshot_id) {
+            return;
+        }
+        let sources = self.snapshot_references.entry(snapshot_id.to_string()).or_default();
+        if sources.len() < MAX_SOURCES_PER_AMI && !sources.iter().any(|known| known == source) {
+            sources.push(source.to_string());
+        }
     }
 
     /// Notes that something launches from `version` of a template (by id and/or name). No version
@@ -198,7 +231,7 @@ pub(crate) enum ImageReferenceResolution {
 /// skipped source still gets a line so the output shows it wasn't scanned.
 macro_rules! scan_source {
     ($collector:ident, $name:expr, $enabled:expr, $call:expr) => {{
-        let phase = Phase::start(format!("{} · {}", $collector.clients.region, $name));
+        let phase = Phase::start(format!("{} · {}", $collector.clients.label, $name));
         if $enabled {
             let seen = $collector.scan.references_seen;
             let unresolved = $collector.scan.unresolved_references.len();
@@ -495,8 +528,11 @@ impl ReferenceCollector<'_> {
 
             // Replay every version (cached and new) as a reference; the cache only adds.
             for (number, version) in &versions {
+                let source = format!("launch template {label} v{number}");
+                for snapshot_id in &version.snapshots {
+                    self.scan.add_snapshot_reference(snapshot_id, &source);
+                }
                 if let Some(image_reference) = &version.image {
-                    let source = format!("launch template {label} v{number}");
                     self.record(image_reference, &source).await;
                 }
             }
@@ -622,18 +658,27 @@ impl ReferenceCollector<'_> {
         };
 
         let mut image_references = Vec::new();
+        let mut snapshot_ids = Vec::new();
         let mut pages = paginator.send();
         while let Some(page) = pages.next().await {
             match page {
-                Ok(output) => image_references.extend(
-                    output
+                Ok(output) => {
+                    for data in output
                         .launch_template_versions()
                         .iter()
-                        .filter_map(|version| {
-                            version.launch_template_data().and_then(|data| data.image_id())
-                        })
-                        .map(ToString::to_string),
-                ),
+                        .filter_map(|version| version.launch_template_data())
+                    {
+                        image_references.extend(data.image_id().map(ToString::to_string));
+                        snapshot_ids.extend(
+                            data.block_device_mappings()
+                                .iter()
+                                .filter_map(|mapping| {
+                                    mapping.ebs().and_then(|ebs| ebs.snapshot_id())
+                                })
+                                .map(ToString::to_string),
+                        );
+                    }
+                }
                 Err(error) if is_launch_template_not_found(error.code()) => {
                     warn!(
                         "Auto Scaling group {} references launch template {} which no longer exists ({}); ignoring",
@@ -659,6 +704,9 @@ impl ReferenceCollector<'_> {
             "Auto Scaling group {} (launch template {label})",
             group_name.unwrap_or("<unnamed>")
         );
+        for snapshot_id in snapshot_ids {
+            self.scan.add_snapshot_reference(&snapshot_id, &source);
+        }
         for image_reference in image_references {
             self.record(&image_reference, &source).await;
         }
@@ -676,11 +724,18 @@ impl ReferenceCollector<'_> {
         while let Some(page) = pages.next().await {
             let output = page.aws_context("DescribeLaunchConfigurations")?;
             for launch_configuration in output.launch_configurations() {
+                let source = format!(
+                    "launch configuration {}",
+                    launch_configuration.launch_configuration_name().unwrap_or("<unnamed>")
+                );
+                for snapshot_id in launch_configuration
+                    .block_device_mappings()
+                    .iter()
+                    .filter_map(|mapping| mapping.ebs().and_then(|ebs| ebs.snapshot_id()))
+                {
+                    self.scan.add_snapshot_reference(snapshot_id, &source);
+                }
                 if let Some(image_id) = launch_configuration.image_id() {
-                    let source = format!(
-                        "launch configuration {}",
-                        launch_configuration.launch_configuration_name().unwrap_or("<unnamed>")
-                    );
                     self.record(image_id, &source).await;
                 }
             }
@@ -757,6 +812,13 @@ impl ReferenceCollector<'_> {
                     request.spot_fleet_request_id().unwrap_or("<unknown>")
                 );
                 for spec in config.launch_specifications() {
+                    for snapshot_id in spec
+                        .block_device_mappings()
+                        .iter()
+                        .filter_map(|mapping| mapping.ebs().and_then(|ebs| ebs.snapshot_id()))
+                    {
+                        self.scan.add_snapshot_reference(snapshot_id, &source);
+                    }
                     if let Some(image_reference) = spec.image_id() {
                         self.record(image_reference, &source).await;
                     }
@@ -798,14 +860,21 @@ impl ReferenceCollector<'_> {
                     continue;
                 }
 
-                if let Some(image_reference) =
-                    request.launch_specification().and_then(|spec| spec.image_id())
-                {
-                    let source = format!(
-                        "Spot request {}",
-                        request.spot_instance_request_id().unwrap_or("<unknown>")
-                    );
-                    self.record(image_reference, &source).await;
+                let source = format!(
+                    "Spot request {}",
+                    request.spot_instance_request_id().unwrap_or("<unknown>")
+                );
+                if let Some(spec) = request.launch_specification() {
+                    for snapshot_id in spec
+                        .block_device_mappings()
+                        .iter()
+                        .filter_map(|mapping| mapping.ebs().and_then(|ebs| ebs.snapshot_id()))
+                    {
+                        self.scan.add_snapshot_reference(snapshot_id, &source);
+                    }
+                    if let Some(image_reference) = spec.image_id() {
+                        self.record(image_reference, &source).await;
+                    }
                 }
             }
         }
@@ -898,14 +967,21 @@ async fn launch_template_versions(
                 .into());
             };
             fetched.max_version = fetched.max_version.max(number);
-            let image = version
-                .launch_template_data()
-                .and_then(|data| data.image_id())
-                .map(ToString::to_string);
+            let data = version.launch_template_data();
+            let image = data.and_then(|data| data.image_id()).map(ToString::to_string);
+            let snapshots = data
+                .map(|data| {
+                    data.block_device_mappings()
+                        .iter()
+                        .filter_map(|mapping| mapping.ebs().and_then(|ebs| ebs.snapshot_id()))
+                        .map(ToString::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             let created = version
                 .create_time()
                 .and_then(|time| DateTime::from_timestamp(time.secs(), time.subsec_nanos()));
-            fetched.versions.push((number, CachedVersion { image, created }));
+            fetched.versions.push((number, CachedVersion { image, created, snapshots }));
         }
     }
     Ok(Some(fetched))

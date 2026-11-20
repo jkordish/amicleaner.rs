@@ -3,6 +3,7 @@
 //! `--execute` re-checks every item against live state and applies it (`execute`). Anything it
 //! can't determine blocks the deletions it affects; see the safety invariants in CLAUDE.md.
 
+mod accounts;
 mod aws_backup;
 mod cli;
 mod dlm;
@@ -91,6 +92,28 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
     let mut region_reports = Vec::new();
     let mut account_id = None;
 
+    // Resolved once: each --check-accounts profile's account id, for matching share grants.
+    let check_accounts = if args.check_accounts.is_empty() {
+        None
+    } else {
+        let owner = sts::Client::new(&shared_config)
+            .get_caller_identity()
+            .send()
+            .await
+            .ok()
+            .and_then(|identity| identity.account().map(ToString::to_string));
+        let resolved = accounts::resolve_check_accounts(args, owner.as_deref()).await;
+        if let Some(resolved) = &resolved {
+            let listed = resolved
+                .profiles
+                .iter()
+                .map(|(account, profile)| format!("{profile} ({account})"))
+                .collect::<Vec<_>>();
+            log::info!("checking shared AMIs and snapshots against: {}", listed.join(", "));
+        }
+        resolved
+    };
+
     for region in regions {
         let region_config =
             aws_config_loader(args).region(Region::new(region.clone())).load().await;
@@ -108,6 +131,7 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
             args.prune_launch_template_versions,
         )
         .with_dlm(&region_config, args.delete_orphaned_dlm_snapshots)
+        .with_check_accounts(check_accounts.clone())
         .with_lt_cache(lt_cache_config(args, &region_config, &mut account_id).await);
 
         let region_report =
@@ -164,7 +188,7 @@ const SDK_MAX_ATTEMPTS: u32 = 6;
 /// SDK config with a deadline per request attempt. Without one, a request whose connection is
 /// dropped silently (e.g. by a TLS-inspecting proxy) waits forever instead of being retried by the
 /// SDK's standard retry strategy; a delta0 plan run sat idle for 20 minutes that way.
-fn aws_config_loader(args: &Args) -> aws_config::ConfigLoader {
+pub(crate) fn aws_config_loader(args: &Args) -> aws_config::ConfigLoader {
     let timeouts = TimeoutConfig::builder()
         .connect_timeout(Duration::from_secs(10))
         .operation_attempt_timeout(Duration::from_secs(args.request_timeout_secs))
@@ -185,18 +209,6 @@ async fn lt_cache_config(
     if args.no_cache {
         return None;
     }
-    let dir = args.cache_dir.clone().or_else(|| {
-        default_cache_dir(
-            std::env::var("XDG_CACHE_HOME").ok().as_deref(),
-            std::env::var("HOME").ok().as_deref(),
-        )
-    });
-    let Some(dir) = dir else {
-        warn!(
-            "no cache directory (set --cache-dir or HOME); reading every launch template version"
-        );
-        return None;
-    };
     if account_id.is_none() {
         match sts::Client::new(region_config).get_caller_identity().send().await {
             Ok(identity) => *account_id = identity.account().map(ToString::to_string),
@@ -209,9 +221,30 @@ async fn lt_cache_config(
             }
         }
     }
+    lt_cache_for_account(args, account_id.as_deref()?)
+}
+
+/// Launch template cache settings for one account, or `None` when caching is off or there's no
+/// cache directory.
+pub(crate) fn lt_cache_for_account(args: &Args, account_id: &str) -> Option<LtCacheConfig> {
+    if args.no_cache {
+        return None;
+    }
+    let dir = args.cache_dir.clone().or_else(|| {
+        default_cache_dir(
+            std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+            std::env::var("HOME").ok().as_deref(),
+        )
+    });
+    let Some(dir) = dir else {
+        warn!(
+            "no cache directory (set --cache-dir or HOME); reading every launch template version"
+        );
+        return None;
+    };
     Some(LtCacheConfig {
         dir,
-        account_id: account_id.clone()?,
+        account_id: account_id.to_string(),
         max_age: chrono::Duration::days(i64::from(args.cache_max_age_days)),
     })
 }
