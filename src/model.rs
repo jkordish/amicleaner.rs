@@ -50,6 +50,19 @@ pub(crate) struct SnapshotInfo {
     pub(crate) dlm_orphan: Option<DlmOrphanCause>,
 }
 
+/// Whether planned snapshot deletes would land in the Recycle Bin.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RecycleBinCoverage {
+    /// Nothing to delete, so not looked up.
+    #[default]
+    NotChecked,
+    /// The rules couldn't be read.
+    Unknown(String),
+    /// Days each planned snapshot delete stays restorable; a planned snapshot without an entry
+    /// would be deleted permanently.
+    Checked(HashMap<String, u32>),
+}
+
 /// Why Data Lifecycle Manager will never retire a snapshot it made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum DlmOrphanCause {
@@ -149,6 +162,7 @@ pub(crate) struct RegionPlan {
     pub(crate) blocked: Vec<String>,
     /// Launch template versions to delete, with `--prune-launch-template-versions`.
     pub(crate) launch_template_prune: Option<LaunchTemplatePrunePlan>,
+    pub(crate) recycle_bin: RecycleBinCoverage,
 }
 
 // Count helpers used by the tests; reports derive their numbers from the lists directly.
@@ -198,6 +212,10 @@ pub(crate) enum KeepReason {
     SharingUnknown(String),
     UnresolvedReferences,
     BackupDeleteTagMissing,
+    /// `--require-recycle-bin`: no available retention rule would keep it after deletion.
+    NoRecycleBin,
+    /// `--require-recycle-bin`: the Recycle Bin rules couldn't be read.
+    RecycleBinUnknown(String),
 }
 
 impl KeepReason {
@@ -220,12 +238,17 @@ impl KeepReason {
             Self::SharingUnknown(_) => "sharing_unknown",
             Self::UnresolvedReferences => "unresolved_references",
             Self::BackupDeleteTagMissing => "backup_delete_tag_missing",
+            Self::NoRecycleBin => "no_recycle_bin",
+            Self::RecycleBinUnknown(_) => "recycle_bin_unknown",
         }
     }
 
     /// Kept because something couldn't be determined (a safety block), not because of a rule.
     pub(crate) fn uncertain(&self) -> bool {
-        matches!(self, Self::SharingUnknown(_) | Self::UnresolvedReferences)
+        matches!(
+            self,
+            Self::SharingUnknown(_) | Self::UnresolvedReferences | Self::RecycleBinUnknown(_)
+        )
     }
 }
 
@@ -255,6 +278,13 @@ impl fmt::Display for KeepReason {
             }
             Self::BackupDeleteTagMissing => {
                 f.write_str("AWS Backup recovery point without the backup delete tag")
+            }
+            Self::NoRecycleBin => f.write_str(
+                "no Recycle Bin retention rule covers it, so deleting it would be permanent \
+                 (--require-recycle-bin)",
+            ),
+            Self::RecycleBinUnknown(error) => {
+                write!(f, "Recycle Bin rules couldn't be read: {error} (--require-recycle-bin)")
             }
         }
     }

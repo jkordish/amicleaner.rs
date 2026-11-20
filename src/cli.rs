@@ -113,6 +113,13 @@ pub(crate) struct Args {
           value_parser = clap::value_parser!(u64).range(5..=600))]
     pub(crate) request_timeout_secs: u64,
 
+    /// Keep snapshots that no Recycle Bin retention rule would retain after deletion, so each
+    /// snapshot delete can be undone until the rule's period runs out. If the rules can't be
+    /// read, no snapshots are deleted in that region. Doesn't evaluate AWS Backup recovery-point
+    /// deletes. Without this flag the plan still reports whether deletes would be recoverable.
+    #[arg(long)]
+    pub(crate) require_recycle_bin: bool,
+
     /// Also delete Data Lifecycle Manager snapshots that DLM will never retire: those whose policy
     /// was deleted, whose schedule was removed, or whose count-based policy lost its source
     /// volume. Only once the newest snapshot of that volume and schedule is older than

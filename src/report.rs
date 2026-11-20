@@ -13,7 +13,8 @@ use crate::cli::Args;
 use crate::dlm::{DLM_POLICY_TAG, DLM_SCHEDULE_TAG};
 use crate::errors::AppResult;
 use crate::model::{
-    ExecutionSummary, KeepReason, Kept, LaunchTemplatePrunePlan, RegionPlan, SnapshotInfo,
+    ExecutionSummary, KeepReason, Kept, LaunchTemplatePrunePlan, RecycleBinCoverage, RegionPlan,
+    SnapshotInfo,
 };
 
 const SAVINGS_NOTE: &str = "Upper bound. EBS bills only the blocks a snapshot doesn't share with \
@@ -93,6 +94,7 @@ pub(crate) struct Settings {
     /// Newest versions kept per template when pruning; `None` when not pruning.
     pub(crate) prune_launch_template_versions_keep: Option<u16>,
     pub(crate) delete_orphaned_dlm_snapshots: bool,
+    pub(crate) require_recycle_bin: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -139,8 +141,65 @@ pub(crate) struct RegionReport {
     /// Only with `--prune-launch-template-versions` (and when not blocked).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) launch_template_versions: Option<LaunchTemplateVersionsReport>,
+    /// Whether planned snapshot deletes would be recoverable from the Recycle Bin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) recycle_bin: Option<RecycleBinReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) execution: Option<ExecutionReport>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct RecycleBinReport {
+    /// The rules couldn't be read; coverage is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+    /// Planned snapshot deletes a retention rule would keep restorable.
+    pub(crate) recoverable: usize,
+    /// Planned snapshot deletes no rule covers (permanent).
+    pub(crate) permanent: usize,
+    pub(crate) min_days: Option<u32>,
+    pub(crate) max_days: Option<u32>,
+}
+
+impl RecycleBinReport {
+    fn from_plan(plan: &RegionPlan) -> Option<Self> {
+        match &plan.recycle_bin {
+            RecycleBinCoverage::NotChecked => None,
+            RecycleBinCoverage::Unknown(error) => {
+                Some(Self { error: Some(error.clone()), ..Self::default() })
+            }
+            RecycleBinCoverage::Checked(days) => Some(Self {
+                error: None,
+                recoverable: days.len(),
+                permanent: plan.delete_snapshots.len().saturating_sub(days.len()),
+                min_days: days.values().min().copied(),
+                max_days: days.values().max().copied(),
+            }),
+        }
+    }
+
+    fn summary(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!("Recycle Bin: rules couldn't be read ({error}); recovery unknown");
+        }
+        let period = match (self.min_days, self.max_days) {
+            (Some(min), Some(max)) if min == max => format!(" for {min} days"),
+            (Some(min), Some(max)) => format!(" for {min}-{max} days"),
+            _ => String::new(),
+        };
+        match (self.recoverable, self.permanent) {
+            (0, _) => {
+                "Recycle Bin: no retention rule covers these snapshots; deletes are permanent"
+                    .to_string()
+            }
+            (recoverable, 0) => {
+                format!("Recycle Bin: all {recoverable} snapshot deletes restorable{period}")
+            }
+            (recoverable, permanent) => format!(
+                "Recycle Bin: {recoverable} snapshot deletes restorable{period}, {permanent} permanent"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -306,6 +365,7 @@ impl Settings {
                 .prune_launch_template_versions
                 .then_some(args.keep_launch_template_versions),
             delete_orphaned_dlm_snapshots: args.delete_orphaned_dlm_snapshots,
+            require_recycle_bin: args.require_recycle_bin,
         }
     }
 }
@@ -378,6 +438,7 @@ impl RegionReport {
             amis: Vec::new(),
             snapshots: Vec::new(),
             launch_template_versions: None,
+            recycle_bin: None,
             execution: None,
         }
     }
@@ -448,6 +509,12 @@ impl RegionReport {
                     ("eligible", "old, unreferenced, unshared and tagged for deletion".to_string())
                 }
             };
+            if let RecycleBinCoverage::Checked(days) = &plan.recycle_bin {
+                details.push(days.get(&snapshot.snapshot_id).map_or_else(
+                    || "permanent: no Recycle Bin rule covers it".to_string(),
+                    |days| format!("restorable from the Recycle Bin for {days} days"),
+                ));
+            }
             snapshots.push(snapshot_decision(
                 pricing,
                 snapshot,
@@ -558,6 +625,7 @@ impl RegionReport {
                 .launch_template_prune
                 .as_ref()
                 .map(LaunchTemplateVersionsReport::from),
+            recycle_bin: RecycleBinReport::from_plan(plan),
             execution,
         }
     }
@@ -792,6 +860,15 @@ fn write_settings_markdown(out: &mut String, settings: &Settings) {
     );
     let _ = writeln!(
         out,
+        "| Require Recycle Bin | {} |",
+        if settings.require_recycle_bin {
+            "yes (uncovered snapshots kept)"
+        } else {
+            "no (reported only)"
+        }
+    );
+    let _ = writeln!(
+        out,
         "| Orphaned DLM snapshots | {} |",
         if settings.delete_orphaned_dlm_snapshots { "deleted when eligible" } else { "kept" }
     );
@@ -832,6 +909,11 @@ fn write_region_markdown(out: &mut String, region: &RegionReport) {
             usd(region.estimated_monthly_savings_usd),
             region.estimated_savings_gib
         );
+        let _ = writeln!(out);
+    }
+
+    if let Some(recycle_bin) = &region.recycle_bin {
+        let _ = writeln!(out, "{}", recycle_bin.summary());
         let _ = writeln!(out);
     }
 
@@ -1125,6 +1207,15 @@ pub(crate) fn render_region_text(region: &RegionReport) -> String {
             ))
             .dim()
         );
+    }
+    if let Some(recycle_bin) = &region.recycle_bin {
+        let line = recycle_bin.summary();
+        let styled = if recycle_bin.error.is_none() && recycle_bin.permanent == 0 {
+            console::style(line).dim()
+        } else {
+            console::style(line).yellow()
+        };
+        let _ = writeln!(out, "             {styled}");
     }
     if let Some(versions) = &region.launch_template_versions {
         let _ = writeln!(

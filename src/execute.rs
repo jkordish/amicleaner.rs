@@ -26,6 +26,7 @@ use crate::policy::{
     backup_recovery_point_deletion_tag_allows, looks_backup_created,
     select_latest_ami_ids_by_family, should_deregister_ami, snapshot_is_deletable,
 };
+use crate::recycle_bin::{list_snapshot_retention_rules, recycle_bin_days};
 use crate::references::{ReferenceClients, collect_referenced_ami_ids};
 use crate::ui::Phase;
 
@@ -77,7 +78,7 @@ pub(crate) async fn execute_region_plan(
     execute_snapshot_deletions(
         ec2_client,
         backup_client,
-        reference_clients.dlm.as_ref(),
+        reference_clients,
         plan,
         args,
         &released_amis,
@@ -228,7 +229,7 @@ async fn execute_ami_deregistrations(
 async fn execute_snapshot_deletions(
     ec2_client: &ec2::Client,
     backup_client: &backup::Client,
-    dlm_client: Option<&aws_sdk_dlm::Client>,
+    reference_clients: &ReferenceClients,
     plan: &RegionPlan,
     args: &Args,
     released_amis: &HashSet<String>,
@@ -290,7 +291,7 @@ async fn execute_snapshot_deletions(
     // falls back to the lifecycle-managed keep.
     let planned_orphans =
         plan.delete_snapshots.iter().any(|snapshot| snapshot.dlm_orphan.is_some());
-    if let Some(dlm_client) = dlm_client.filter(|_| planned_orphans) {
+    if let Some(dlm_client) = reference_clients.dlm.as_ref().filter(|_| planned_orphans) {
         let snapshots = current_snapshots.values().cloned().collect::<Vec<_>>();
         let inventory = load_dlm_inventory(
             ec2_client,
@@ -319,12 +320,34 @@ async fn execute_snapshot_deletions(
     };
     let retry_policy = RetryPolicy::from_args(args);
 
+    // --require-recycle-bin: re-read the rules, since one may have been deleted or changed since
+    // planning, and only delete snapshots a rule still retains.
+    let recycle_bin_rules = if args.require_recycle_bin && !plan.delete_snapshots.is_empty() {
+        match list_snapshot_retention_rules(&reference_clients.rbin).await {
+            Ok(rules) => Some(rules),
+            Err(error) => {
+                summary.blocked.push(format!(
+                    "snapshot deletions cancelled: Recycle Bin rules couldn't be read at execution time: {error}"
+                ));
+                Some(Vec::new())
+            }
+        }
+    } else {
+        None
+    };
+    let recoverable = |current: &SnapshotInfo| {
+        recycle_bin_rules
+            .as_ref()
+            .is_none_or(|rules| recycle_bin_days(&current.tags, rules).is_some())
+    };
+
     let direct_deletes = plan
         .delete_snapshots
         .iter()
         .filter(|snapshot| {
             still_deletable(&snapshot.snapshot_id).is_some_and(|current| {
                 !looks_backup_created(&current.tags, current.description.as_deref())
+                    && recoverable(current)
             })
         })
         .collect::<Vec<&SnapshotInfo>>();

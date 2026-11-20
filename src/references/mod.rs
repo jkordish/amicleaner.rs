@@ -14,6 +14,7 @@ use aws_sdk_ec2 as ec2;
 use aws_sdk_eks as eks;
 use aws_sdk_emr as emr;
 use aws_sdk_imagebuilder as imagebuilder;
+use aws_sdk_rbin as rbin;
 use aws_sdk_ssm as ssm;
 use aws_types::SdkConfig;
 use chrono::{DateTime, Utc};
@@ -57,6 +58,9 @@ pub(crate) struct ReferenceClients {
     /// Data Lifecycle Manager, only for `--delete-orphaned-dlm-snapshots` (not a reference source;
     /// it lives here because these clients reach both plan and execute).
     pub(crate) dlm: Option<dlm::Client>,
+    /// Recycle Bin, to report whether snapshot deletes are recoverable (and enforce it with
+    /// `--require-recycle-bin`). Not a reference source either.
+    pub(crate) rbin: rbin::Client,
     /// Maximum concurrent requests for the fan-out lookups (launch template versions,
     /// CloudFormation templates).
     pub(crate) concurrency: usize,
@@ -82,6 +86,7 @@ impl ReferenceClients {
             // template scan misses, so EKS is only read when pruning versions (`with_eks`).
             eks: None,
             dlm: None,
+            rbin: rbin::Client::new(config),
             concurrency: concurrency.max(1),
             region: config.region().map(ToString::to_string).unwrap_or_default(),
             lt_cache: None,

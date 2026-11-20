@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Recycle Bin retention rule for EBS snapshots in this Region. Deleted snapshots are kept in the
+  Recycle Bin for RetentionDays and can be restored until then, which makes an amicleaner
+  --execute run reversible. Region-level: covers every snapshot, tagged or not, except those with
+  the optional exclusion tag. Deploy before the delete run; amicleaner --require-recycle-bin
+  refuses to delete snapshots this rule wouldn't retain.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Retention
+        Parameters:
+          - RetentionDays
+          - ExcludeTagKey
+          - ExcludeTagValue
+
+Parameters:
+  RetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 365
+    Description: >-
+      Days a deleted snapshot stays restorable. It bills at the normal snapshot rate meanwhile,
+      so this delays the savings by that many days.
+  ExcludeTagKey:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. Snapshots with this tag key (and ExcludeTagValue, if set) are deleted immediately
+      instead of being retained. Leave empty to retain every snapshot.
+  ExcludeTagValue:
+    Type: String
+    Default: ""
+    Description: Optional value for ExcludeTagKey. Leave empty to match any value.
+
+Conditions:
+  HasExclusion: !Not [!Equals [!Ref ExcludeTagKey, ""]]
+  HasExclusionValue: !Not [!Equals [!Ref ExcludeTagValue, ""]]
+
+Resources:
+  SnapshotRetentionRule:
+    Type: AWS::Rbin::Rule
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: >-
+          Undo window for snapshot cleanup: a snapshot deleted by mistake can be restored from
+          the Recycle Bin until the retention period ends.
+        must:
+          - Stay Region-level (no ResourceTags), so untagged snapshots are covered too.
+          - Stay unlocked (no LockConfiguration), so the rule can be removed after the cleanup.
+          - Exist and be available before any snapshot delete run that relies on it.
+    Properties:
+      Description: !Sub "Keep deleted EBS snapshots ${RetentionDays} days (stack ${AWS::StackName})"
+      ResourceType: EBS_SNAPSHOT
+      RetentionPeriod:
+        RetentionPeriodUnit: DAYS
+        RetentionPeriodValue: !Ref RetentionDays
+      Status: available
+      ExcludeResourceTags: !If
+        - HasExclusion
+        - - ResourceTagKey: !Ref ExcludeTagKey
+            ResourceTagValue: !If [HasExclusionValue, !Ref ExcludeTagValue, !Ref AWS::NoValue]
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: purpose
+          Value: snapshot-cleanup-undo
+
+Outputs:
+  RuleId:
+    Description: Recycle Bin retention rule id.
+    Value: !GetAtt SnapshotRetentionRule.Identifier
+  RuleArn:
+    Description: Recycle Bin retention rule ARN.
+    Value: !GetAtt SnapshotRetentionRule.Arn

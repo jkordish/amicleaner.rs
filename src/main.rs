@@ -13,6 +13,7 @@ mod lt_prune;
 mod model;
 mod plan;
 mod policy;
+mod recycle_bin;
 mod references;
 mod report;
 mod ui;

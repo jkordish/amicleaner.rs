@@ -11,6 +11,7 @@ use aws_sdk_dlm as dlm;
 use aws_sdk_ec2 as ec2;
 use aws_sdk_emr as emr;
 use aws_sdk_imagebuilder as imagebuilder;
+use aws_sdk_rbin as rbin;
 use aws_sdk_ssm as ssm;
 use aws_smithy_mocks::{RuleMode, mock, mock_client};
 use aws_types::SdkConfig;
@@ -40,16 +41,17 @@ use crate::lt_prune::{
 use crate::model::Cutoffs;
 use crate::model::{
     AmiInfo, DlmOrphanCause, EXIT_BLOCKED, ExecutionSummary, ExternalUse, KeepReason, LastLaunched,
-    RecoveryPointRecord, RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
+    RecoveryPointRecord, RecycleBinCoverage, RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
 };
 use crate::model::{LaunchTemplatePrunePlan, TemplatePrune, VersionKeepReason};
-use crate::plan::{apply_snapshot_external_use, plan_region};
+use crate::plan::{apply_recycle_bin, apply_snapshot_external_use, plan_region};
 use crate::policy::{ami_keep_reason, looks_lifecycle_managed, snapshot_keep_reason};
 use crate::policy::{
     backup_recovery_point_deletion_tag_allows, has_expected_tag, is_protected,
     looks_backup_created, optional_expected_value, select_latest_ami_ids_by_family,
 };
 use crate::policy::{parse_pinned_version, template_keep_reason};
+use crate::recycle_bin::{RetentionRule, RuleTag, list_snapshot_retention_rules, recycle_bin_days};
 use crate::references::LaunchTemplateInventory;
 use crate::references::lt_cache::{
     CachedTemplate, CachedVersion, FetchPlan, LaunchTemplateCache, LtCacheConfig,
@@ -891,6 +893,7 @@ fn reference_clients(asg: autoscaling::Client, ssm: ssm::Client) -> ReferenceCli
         emr: None,
         eks: None,
         dlm: None,
+        rbin: mock_client!(aws_sdk_rbin, RuleMode::MatchAny, Vec::<&aws_smithy_mocks::Rule>::new()),
         concurrency: 4,
         region: "us-east-1".to_string(),
         lt_cache: None,
@@ -3863,5 +3866,232 @@ async fn execution_rechecks_dlm_orphans_against_live_volumes() {
 
     // The volume came back (restored or re-attached), so DLM manages it again: skipped.
     let (summary, deletes) = run(&["vol-a"]).await;
+    assert_eq!((summary.deleted_snapshots, summary.skipped_snapshots, deletes), (0, 1, 0));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recycle Bin coverage (--require-recycle-bin)
+// ---------------------------------------------------------------------------------------------
+
+fn retention_rule(
+    id: &str,
+    days: u32,
+    resource: &[(&str, Option<&str>)],
+    exclude: &[(&str, Option<&str>)],
+) -> RetentionRule {
+    let rule_tags = |pairs: &[(&str, Option<&str>)]| {
+        pairs
+            .iter()
+            .map(|(key, value)| RuleTag {
+                key: (*key).to_string(),
+                value: value.map(str::to_string),
+            })
+            .collect()
+    };
+    RetentionRule {
+        id: id.to_string(),
+        available: true,
+        days: Some(days),
+        resource_tags: rule_tags(resource),
+        exclude_tags: rule_tags(exclude),
+    }
+}
+
+#[test]
+fn recycle_bin_days_follows_rule_matching() {
+    let untagged = HashMap::new();
+    let temp = tags(&[("Temp", "yes")]);
+    let dev = tags(&[("Mode", "Dev")]);
+
+    let region = retention_rule("region", 14, &[], &[("Temp", Some("yes"))]);
+    assert_eq!(recycle_bin_days(&untagged, std::slice::from_ref(&region)), Some(14));
+    // Exclusion tags opt a snapshot out of a Region-level rule.
+    assert_eq!(recycle_bin_days(&temp, std::slice::from_ref(&region)), None);
+    assert_eq!(
+        recycle_bin_days(&tags(&[("Temp", "no")]), std::slice::from_ref(&region)),
+        Some(14)
+    );
+
+    // A matching tag-level rule wins over the Region-level one, even when shorter.
+    let tag_rule = retention_rule("dev", 1, &[("Mode", Some("Dev"))], &[]);
+    let both = [region.clone(), tag_rule];
+    assert_eq!(recycle_bin_days(&dev, &both), Some(1));
+    assert_eq!(recycle_bin_days(&untagged, &both), Some(14));
+    // A tag rule without a value matches any value of that key.
+    let any_value = [retention_rule("any", 7, &[("Mode", None)], &[])];
+    assert_eq!(recycle_bin_days(&dev, &any_value), Some(7));
+    assert_eq!(recycle_bin_days(&untagged, &any_value), None);
+
+    // Rules that aren't available retain nothing; unreadable periods count as not covered.
+    let mut pending = region.clone();
+    pending.available = false;
+    assert_eq!(recycle_bin_days(&untagged, &[pending]), None);
+    let mut odd_unit = region;
+    odd_unit.days = None;
+    assert_eq!(recycle_bin_days(&untagged, &[odd_unit]), None);
+    assert_eq!(recycle_bin_days(&untagged, &[]), None);
+}
+
+fn recycle_plan() -> RegionPlan {
+    let old = Utc::now() - Duration::days(400);
+    RegionPlan {
+        region: "us-east-1".to_string(),
+        delete_snapshots: vec![
+            make_snapshot(SNAP_A, old, &[]),
+            make_snapshot(SNAP_B, old, &[("Temp", "yes")]),
+        ],
+        snapshots_released_by_ami: HashMap::from([(SNAP_B.to_string(), AMI_A.to_string())]),
+        ..RegionPlan::default()
+    }
+}
+
+#[test]
+fn apply_recycle_bin_reports_and_optionally_enforces() {
+    let rules = vec![retention_rule("region", 14, &[], &[("Temp", Some("yes"))])];
+
+    // Reported only: both deletes stay planned; SNAP_B would be permanent.
+    let mut plan = recycle_plan();
+    apply_recycle_bin(&mut plan, Ok(rules.clone()), false);
+    assert_eq!(plan.delete_snapshots.len(), 2);
+    assert_eq!(
+        plan.recycle_bin,
+        RecycleBinCoverage::Checked(HashMap::from([(SNAP_A.to_string(), 14)]))
+    );
+    let report = RegionReport::from_plan(&plan, None, PRICING);
+    let summary = report
+        .recycle_bin
+        .as_ref()
+        .map(|recycle_bin| (recycle_bin.recoverable, recycle_bin.permanent));
+    assert_eq!(summary, Some((1, 1)));
+
+    // Required: the uncovered snapshot is kept, and no longer counts as released by its AMI.
+    let mut plan = recycle_plan();
+    apply_recycle_bin(&mut plan, Ok(rules), true);
+    assert_eq!(
+        plan.delete_snapshots.iter().map(|s| s.snapshot_id.as_str()).collect::<Vec<_>>(),
+        vec![SNAP_A]
+    );
+    assert_eq!(plan.kept_snapshots[0].reason, KeepReason::NoRecycleBin);
+    assert!(plan.snapshots_released_by_ami.is_empty());
+    assert!(plan.blocked.is_empty());
+
+    // Rules unreadable: reported as unknown, and with the requirement nothing is deleted.
+    let mut plan = recycle_plan();
+    apply_recycle_bin(&mut plan, Err("ListRules failed: AccessDeniedException".into()), false);
+    assert_eq!(plan.delete_snapshots.len(), 2);
+    assert!(matches!(plan.recycle_bin, RecycleBinCoverage::Unknown(_)));
+    assert!(plan.blocked.is_empty());
+
+    let mut plan = recycle_plan();
+    apply_recycle_bin(&mut plan, Err("ListRules failed: AccessDeniedException".into()), true);
+    assert!(plan.delete_snapshots.is_empty());
+    assert!(
+        plan.kept_snapshots
+            .iter()
+            .all(|kept| matches!(kept.reason, KeepReason::RecycleBinUnknown(_)))
+    );
+    assert_eq!(plan.blocked.len(), 1);
+}
+
+fn rbin_rules(rules: Vec<(&'static str, Option<&'static str>)>) -> rbin::Client {
+    // (rule id, exclusion tag key): every rule is a 14-day Region-level EBS snapshot rule.
+    let ids = rules.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let list = mock!(rbin::Client::list_rules).then_output(move || {
+        rbin::operation::list_rules::ListRulesOutput::builder()
+            .set_rules(Some(
+                ids.iter()
+                    .map(|id| rbin::types::RuleSummary::builder().identifier(*id).build())
+                    .collect(),
+            ))
+            .build()
+    });
+    let mut all = vec![list];
+    for (id, exclude) in rules {
+        all.push(
+            mock!(rbin::Client::get_rule)
+                .match_requests(move |request| request.identifier() == Some(id))
+                .then_output(move || {
+                    let mut builder = rbin::operation::get_rule::GetRuleOutput::builder()
+                        .identifier(id)
+                        .status(rbin::types::RuleStatus::Available)
+                        .resource_type(rbin::types::ResourceType::EbsSnapshot)
+                        .retention_period(
+                            rbin::types::RetentionPeriod::builder()
+                                .retention_period_value(14)
+                                .retention_period_unit(rbin::types::RetentionPeriodUnit::Days)
+                                .build()
+                                .expect("valid period"),
+                        );
+                    if let Some(key) = exclude {
+                        builder = builder.exclude_resource_tags(
+                            rbin::types::ResourceTag::builder()
+                                .resource_tag_key(key)
+                                .build()
+                                .expect("valid tag"),
+                        );
+                    }
+                    builder.build()
+                }),
+        );
+    }
+    mock_client!(aws_sdk_rbin, RuleMode::MatchAny, all.iter())
+}
+
+#[tokio::test]
+async fn retention_rules_are_read_in_full() {
+    let client = rbin_rules(vec![("abcdefghijk", Some("Temp"))]);
+    let rules = list_snapshot_retention_rules(&client).await.unwrap();
+    assert_eq!(rules, vec![retention_rule("abcdefghijk", 14, &[], &[("Temp", None)])]);
+
+    let denied = mock!(rbin::Client::list_rules).then_error(|| {
+        rbin::operation::list_rules::ListRulesError::generic(
+            ErrorMetadata::builder().code("AccessDeniedException").message("no").build(),
+        )
+    });
+    let client = mock_client!(aws_sdk_rbin, RuleMode::MatchAny, [&denied], |builder| {
+        builder.retry_config(rbin::config::retry::RetryConfig::disabled())
+    });
+    let error = list_snapshot_retention_rules(&client).await.unwrap_err();
+    assert!(error.contains("AccessDeniedException"), "{error}");
+}
+
+#[tokio::test]
+async fn execution_rechecks_recycle_bin_rules() {
+    let mut args = test_args();
+    args.execute = true;
+    args.dry_run = true;
+    args.require_recycle_bin = true;
+    let old = Utc::now() - Duration::days(365);
+    let plan = plan(
+        &args,
+        Vec::new(),
+        vec![make_snapshot(SNAP_A, old, &[("cleanup", "true")])],
+        &scan(&[], &[]),
+    );
+    assert_eq!(plan.delete_snapshots.len(), 1);
+
+    let run = |rules: Vec<(&'static str, Option<&'static str>)>| {
+        let (args, plan) = (&args, &plan);
+        async move {
+            let images = images_rule(Vec::new());
+            let snapshots = snapshots_rule(vec![ec2_snapshot(SNAP_A, &[("cleanup", "true")])]);
+            let delete = delete_snapshot_dry_run_rule();
+            let ec2_client =
+                ec2_with(empty_reference_scan_rules(), &[&images, &snapshots, &delete]);
+            let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+            clients.rbin = rbin_rules(rules);
+            let summary =
+                execute_region_plan(&ec2_client, &no_backup_client(), &clients, plan, args).await;
+            (summary, delete.num_calls())
+        }
+    };
+
+    // The rule still exists at execution time: deleted.
+    let (summary, deletes) = run(vec![("abcdefghijk", None)]).await;
+    assert!(summary.failures.is_empty() && summary.blocked.is_empty(), "{summary:?}");
+    assert_eq!((summary.deleted_snapshots, deletes), (1, 1));
+
+    // The rule was deleted since planning: skipped, not deleted permanently.
+    let (summary, deletes) = run(Vec::new()).await;
     assert_eq!((summary.deleted_snapshots, summary.skipped_snapshots, deletes), (0, 1, 0));
 }

@@ -18,10 +18,13 @@ use crate::inventory::{
     list_owned_amis, list_owned_snapshots, lookup_ami_external_use, lookup_snapshot_external_use,
 };
 use crate::lt_prune::{plan_launch_template_pruning, prune_block_reason};
-use crate::model::{AmiInfo, Cutoffs, ExternalUse, KeepReason, Kept, RegionPlan, SnapshotInfo};
+use crate::model::{
+    AmiInfo, Cutoffs, ExternalUse, KeepReason, Kept, RecycleBinCoverage, RegionPlan, SnapshotInfo,
+};
 use crate::policy::{
     ami_keep_reason, select_latest_ami_ids_by_family, should_deregister_ami, snapshot_keep_reason,
 };
+use crate::recycle_bin::{RetentionRule, list_snapshot_retention_rules, recycle_bin_days};
 use crate::references::{AmiReferenceScan, ReferenceClients, collect_referenced_ami_ids};
 use crate::ui::{Phase, thousands};
 
@@ -191,7 +194,66 @@ pub(crate) async fn build_region_plan(
         }
     }
 
+    // Last, so it sees exactly the deletes that remain.
+    if !plan.delete_snapshots.is_empty() {
+        let phase = Phase::start(format!("{region} · Recycle Bin rules"));
+        let rules = list_snapshot_retention_rules(&reference_clients.rbin).await;
+        match &rules {
+            Ok(rules) => phase.finish(format!("{} EBS snapshot retention rules", rules.len())),
+            Err(error) => {
+                phase.warn("rules unavailable");
+                warn!("region {region}: Recycle Bin coverage unknown: {error}");
+            }
+        }
+        apply_recycle_bin(&mut plan, rules, args.require_recycle_bin);
+    }
+
     Ok(plan)
+}
+
+/// Records how long each planned snapshot delete stays restorable. With `require`, snapshots no
+/// rule would retain are kept, and an unreadable rule set keeps them all and blocks.
+pub(crate) fn apply_recycle_bin(
+    plan: &mut RegionPlan,
+    rules: Result<Vec<RetentionRule>, String>,
+    require: bool,
+) {
+    let rules = match rules {
+        Ok(rules) => rules,
+        Err(error) => {
+            if require {
+                let reason = KeepReason::RecycleBinUnknown(error.clone());
+                plan.kept_snapshots.extend(
+                    plan.delete_snapshots
+                        .drain(..)
+                        .map(|snapshot| Kept { item: snapshot, reason: reason.clone() }),
+                );
+                plan.blocked.push(format!(
+                    "snapshot deletions cancelled: Recycle Bin rules couldn't be read: {error}"
+                ));
+                prune_released_snapshots(plan);
+            }
+            plan.recycle_bin = RecycleBinCoverage::Unknown(error);
+            return;
+        }
+    };
+
+    let mut days = HashMap::new();
+    let mut kept = Vec::new();
+    plan.delete_snapshots.retain(|snapshot| match recycle_bin_days(&snapshot.tags, &rules) {
+        Some(period) => {
+            days.insert(snapshot.snapshot_id.clone(), period);
+            true
+        }
+        None if require => {
+            kept.push(Kept { item: snapshot.clone(), reason: KeepReason::NoRecycleBin });
+            false
+        }
+        None => true,
+    });
+    plan.kept_snapshots.extend(kept);
+    prune_released_snapshots(plan);
+    plan.recycle_bin = RecycleBinCoverage::Checked(days);
 }
 
 pub(crate) fn plan_region(
@@ -322,6 +384,7 @@ pub(crate) fn plan_region(
         ami_reference_sources,
         blocked,
         launch_template_prune: None,
+        recycle_bin: RecycleBinCoverage::NotChecked,
     }
 }
 

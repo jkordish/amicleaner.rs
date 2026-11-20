@@ -55,6 +55,8 @@ Read, per reference source (drop the ones you pass to `--skip-reference-sources`
 
 With `--delete-orphaned-dlm-snapshots`: `dlm:GetLifecyclePolicy` and `ec2:DescribeVolumes`.
 
+Recycle Bin coverage (whenever snapshots are planned for deletion): `rbin:ListRules` and `rbin:GetRule`. Without them the plan reports coverage as unknown. With `--require-recycle-bin`, missing permissions cancel the region's snapshot deletes.
+
 Write (`--execute`): `ec2:DeregisterImage`, `ec2:DeleteSnapshot`, `backup:DeleteRecoveryPoint` for `--execute-backup-recovery-point-deletes`, and `ec2:DeleteLaunchTemplateVersions` for `--prune-launch-template-versions`.
 
 A missing read permission fails closed: AMI deregistrations or snapshot deletions in that region are cancelled, not attempted blind.
@@ -103,6 +105,30 @@ Templates managed by EKS, Karpenter, Batch or CloudFormation (by tag), templates
 
 Things amicleaner can't see, like scripts or pipelines that launch a specific version number by hand, aren't protected. Raise `--keep-launch-template-versions` if you have those.
 
+### Recycle Bin
+
+An EBS [Recycle Bin](https://docs.aws.amazon.com/ebs/latest/userguide/recycle-bin.html) retention rule turns snapshot deletes into an undo window. A deleted snapshot stays restorable for the rule's period, billed at the normal snapshot rate, and is then gone for good.
+
+Whenever a plan deletes snapshots, amicleaner reads the region's EBS snapshot rules and reports:
+
+- **Summary line:** for example, "Recycle Bin: all 1241 snapshot deletes restorable for 14 days", or "no retention rule covers these snapshots; deletes are permanent".
+- **Per snapshot:** each snapshot to delete carries a "restorable for N days" or "permanent" detail.
+
+Matching follows AWS's rules:
+
+- only `available` rules count
+- tag-level rules (match on tag key and, if set, value) take precedence over Region-level rules
+- a Region-level rule's exclusion tags opt a snapshot out
+
+`--require-recycle-bin` turns the report into a gate. Snapshots no rule would retain are kept (`no_recycle_bin`). If the rules can't be read, the region's snapshot deletes are cancelled (exit code 3). Execute re-reads the rules before deleting, so a rule removed after planning stops the deletes. It doesn't evaluate AWS Backup recovery-point deletes (`--execute-backup-recovery-point-deletes`).
+
+[`examples/recycle-bin-rule.yaml`](examples/recycle-bin-rule.yaml) is a small CloudFormation template for a Region-level rule, with a 14-day default and an optional exclusion tag. It's unlocked, so it can be removed after the cleanup:
+
+```shell
+aws cloudformation deploy --stack-name snapshot-recycle-bin \
+  --template-file examples/recycle-bin-rule.yaml --parameter-overrides RetentionDays=14
+```
+
 ### orphaned DLM snapshots
 
 Data Lifecycle Manager stops retiring its snapshots in three cases, and leaves them forever:
@@ -122,7 +148,7 @@ To stay safe:
 
 Reports give each one's cause (`dlm_volume_deleted`, `dlm_policy_deleted`, `dlm_schedule_removed`) and its policy, schedule and source volume.
 
-The last snapshots of a deleted volume may be someone's only copy of it. Check with the policy's owner first, and consider an EBS Recycle Bin retention rule so deletes can be undone for a while.
+The last snapshots of a deleted volume may be someone's only copy of it. Check with the policy's owner first, and run with `--require-recycle-bin` behind a Recycle Bin rule (see above), so deletes can be undone for a while.
 
 ### launch template cache
 
@@ -264,6 +290,9 @@ Options:
           Seconds before a single AWS request attempt is abandoned and retried. Protects against connections that a proxy drops without closing
           
           [default: 60]
+
+      --require-recycle-bin
+          Keep snapshots that no Recycle Bin retention rule would retain after deletion, so each snapshot delete can be undone until the rule's period runs out. If the rules can't be read, no snapshots are deleted in that region. Doesn't evaluate AWS Backup recovery-point deletes. Without this flag the plan still reports whether deletes would be recoverable
 
       --delete-orphaned-dlm-snapshots
           Also delete Data Lifecycle Manager snapshots that DLM will never retire: those whose policy was deleted, whose schedule was removed, or whose count-based policy lost its source volume. Only once the newest snapshot of that volume and schedule is older than --min-age-days. The normal rules still apply, including the delete tag (or --allow-untagged), the protect tag, sharing and AWS Backup
