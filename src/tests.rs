@@ -7,6 +7,7 @@ use aws_sdk_autoscaling as autoscaling;
 use aws_sdk_backup as backup;
 use aws_sdk_batch as batch;
 use aws_sdk_cloudformation as cloudformation;
+use aws_sdk_dlm as dlm;
 use aws_sdk_ec2 as ec2;
 use aws_sdk_emr as emr;
 use aws_sdk_imagebuilder as imagebuilder;
@@ -23,6 +24,9 @@ use crate::aws_backup::{
     snapshot_id_from_arn,
 };
 use crate::cli::{Args, parse_region};
+use crate::dlm::{
+    DlmInventory, DlmOrphanScan, PolicyState, Retention, load_dlm_inventory, orphaned_dlm_snapshots,
+};
 use crate::errors::error_chain;
 use crate::execute::{
     execute_region_plan, is_retryable_code, retry_delay_for_attempt, send_with_retries,
@@ -35,7 +39,7 @@ use crate::lt_prune::{
 };
 use crate::model::Cutoffs;
 use crate::model::{
-    AmiInfo, EXIT_BLOCKED, ExecutionSummary, ExternalUse, KeepReason, LastLaunched,
+    AmiInfo, DlmOrphanCause, EXIT_BLOCKED, ExecutionSummary, ExternalUse, KeepReason, LastLaunched,
     RecoveryPointRecord, RegionPlan, RetryPolicy, RunOutcome, SnapshotInfo,
 };
 use crate::model::{LaunchTemplatePrunePlan, TemplatePrune, VersionKeepReason};
@@ -117,6 +121,8 @@ fn make_snapshot(
         start_time,
         description: None,
         tags: tags(tag_pairs),
+        volume_id: None,
+        dlm_orphan: None,
     }
 }
 
@@ -884,6 +890,7 @@ fn reference_clients(asg: autoscaling::Client, ssm: ssm::Client) -> ReferenceCli
         batch: None,
         emr: None,
         eks: None,
+        dlm: None,
         concurrency: 4,
         region: "us-east-1".to_string(),
         lt_cache: None,
@@ -3483,4 +3490,378 @@ async fn execute_blocks_pruning_when_a_pin_source_is_skipped() {
     assert_eq!(summary.deleted_launch_template_versions, 0);
     assert_eq!(summary.skipped_launch_template_versions, 2);
     assert_eq!(summary.blocked.len(), 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Orphaned Data Lifecycle Manager snapshots (--delete-orphaned-dlm-snapshots)
+// ---------------------------------------------------------------------------------------------
+
+const DLM_POLICY: &str = "policy-0a7e727b0daa17cf7";
+const DLM_SCHEDULE: &str = "Default Schedule";
+
+fn dlm_snapshot(
+    id: &str,
+    volume: &str,
+    start: DateTime<Utc>,
+    extra: &[(&str, &str)],
+) -> SnapshotInfo {
+    let mut pairs = vec![
+        ("aws:dlm:lifecycle-policy-id", DLM_POLICY),
+        ("aws:dlm:lifecycle-schedule-name", DLM_SCHEDULE),
+    ];
+    pairs.extend_from_slice(extra);
+    let mut snapshot = make_snapshot(id, start, &pairs);
+    snapshot.description =
+        Some(format!("Created for policy: {DLM_POLICY} schedule: {DLM_SCHEDULE}"));
+    snapshot.volume_id = Some(volume.to_string());
+    snapshot
+}
+
+fn dlm_inventory(state: PolicyState, live: &[&str]) -> DlmInventory {
+    DlmInventory {
+        policies: HashMap::from([(DLM_POLICY.to_string(), state)]),
+        live_volumes: Ok(live.iter().map(ToString::to_string).collect()),
+    }
+}
+
+fn snapshot_policy(retention: Retention) -> PolicyState {
+    PolicyState::SnapshotPolicy {
+        schedules: HashMap::from([(DLM_SCHEDULE.to_string(), retention)]),
+    }
+}
+
+fn orphans(snapshots: &[SnapshotInfo], inventory: &DlmInventory) -> DlmOrphanScan {
+    let now = Utc::now();
+    orphaned_dlm_snapshots(snapshots, inventory, now, now - Duration::days(14))
+}
+
+#[test]
+fn dlm_orphan_rules() {
+    let old = Utc::now() - Duration::days(400);
+    let snapshot = dlm_snapshot(SNAP_A, "vol-a", old, &[]);
+    let cause = |inventory: &DlmInventory, snapshot: &SnapshotInfo| {
+        orphans(std::slice::from_ref(snapshot), inventory).orphans.get(SNAP_A).copied()
+    };
+
+    // Count-based schedule: orphaned only once the source volume is gone.
+    let count = snapshot_policy(Retention::Count);
+    assert_eq!(
+        cause(&dlm_inventory(count.clone(), &[]), &snapshot),
+        Some(DlmOrphanCause::VolumeDeleted)
+    );
+    assert_eq!(cause(&dlm_inventory(count.clone(), &["vol-a"]), &snapshot), None);
+    // Age-based schedules keep expiring snapshots after the volume is deleted.
+    assert_eq!(cause(&dlm_inventory(snapshot_policy(Retention::Other), &[]), &snapshot), None);
+    // Policy deleted, or the schedule that made it removed.
+    assert_eq!(
+        cause(&dlm_inventory(PolicyState::Deleted, &["vol-a"]), &snapshot),
+        Some(DlmOrphanCause::PolicyDeleted)
+    );
+    let renamed = PolicyState::SnapshotPolicy {
+        schedules: HashMap::from([("Nightly".to_string(), Retention::Count)]),
+    };
+    assert_eq!(
+        cause(&dlm_inventory(renamed, &["vol-a"]), &snapshot),
+        Some(DlmOrphanCause::ScheduleRemoved)
+    );
+    // AMI, event-based and default policies never orphan anything.
+    assert_eq!(cause(&dlm_inventory(PolicyState::OtherPolicy, &[]), &snapshot), None);
+
+    // Copies (cross-region/account) name a policy that lives elsewhere: never orphaned.
+    let copy = dlm_snapshot(SNAP_A, "vol-ffffffff", old, &[]);
+    assert_eq!(cause(&dlm_inventory(PolicyState::Deleted, &[]), &copy), None);
+    let mut no_volume = copy.clone();
+    no_volume.volume_id = None;
+    assert_eq!(cause(&dlm_inventory(PolicyState::Deleted, &[]), &no_volume), None);
+
+    // A pending or unreadable DLM expiry keeps it; a past one doesn't.
+    let deleted = dlm_inventory(PolicyState::Deleted, &[]);
+    let future = (Utc::now() + Duration::days(3)).to_rfc3339();
+    let past = (Utc::now() - Duration::days(3)).to_rfc3339();
+    for (value, expected) in [
+        (future.as_str(), None),
+        ("soon", None),
+        (past.as_str(), Some(DlmOrphanCause::PolicyDeleted)),
+    ] {
+        let tagged = dlm_snapshot(SNAP_A, "vol-a", old, &[("aws:dlm:expirationTime", value)]);
+        assert_eq!(cause(&deleted, &tagged), expected, "expiration {value}");
+    }
+
+    // Matched by description only (no policy tag): kept.
+    let mut description_only = snapshot.clone();
+    description_only.tags.clear();
+    assert_eq!(cause(&deleted, &description_only), None);
+    // No schedule tag: unclear which retention applies, kept.
+    let mut no_schedule = snapshot.clone();
+    no_schedule.tags.remove("aws:dlm:lifecycle-schedule-name");
+    assert_eq!(
+        cause(&dlm_inventory(snapshot_policy(Retention::Count), &[]), &no_schedule),
+        None
+    );
+}
+
+#[test]
+fn dlm_orphan_grace_keeps_a_recently_orphaned_group() {
+    let now = Utc::now();
+    let inventory = dlm_inventory(snapshot_policy(Retention::Count), &[]);
+    // vol-a's newest snapshot is 3 days old: the volume was deleted recently, keep all of it.
+    // vol-b's newest is 30 days old: past the 14-day grace, all of it goes.
+    let snapshots = vec![
+        dlm_snapshot(SNAP_A, "vol-a", now - Duration::days(200), &[]),
+        dlm_snapshot(SNAP_B, "vol-a", now - Duration::days(3), &[]),
+        dlm_snapshot(SNAP_C, "vol-b", now - Duration::days(30), &[]),
+    ];
+    let scan = orphans(&snapshots, &inventory);
+    assert_eq!(scan.orphans.keys().collect::<Vec<_>>(), vec![SNAP_C]);
+}
+
+#[test]
+fn dlm_orphan_lookup_failures_keep_snapshots_and_say_why() {
+    let old = Utc::now() - Duration::days(400);
+    let snapshots = [dlm_snapshot(SNAP_A, "vol-a", old, &[])];
+
+    let unknown = dlm_inventory(
+        PolicyState::Unknown("GetLifecyclePolicy failed: AccessDeniedException".into()),
+        &[],
+    );
+    let scan = orphans(&snapshots, &unknown);
+    assert!(scan.orphans.is_empty());
+    assert_eq!(scan.undecided.len(), 1);
+    assert!(scan.undecided[0].contains("AccessDeniedException"), "{:?}", scan.undecided);
+
+    let mut volumes_failed = dlm_inventory(snapshot_policy(Retention::Count), &[]);
+    volumes_failed.live_volumes = Err("DescribeVolumes failed: UnauthorizedOperation".into());
+    let scan = orphans(&snapshots, &volumes_failed);
+    assert!(scan.orphans.is_empty());
+    assert!(scan.undecided[0].contains("1 snapshot(s) stay kept"), "{:?}", scan.undecided);
+}
+
+#[test]
+fn orphaned_dlm_snapshots_still_need_every_other_rule() {
+    let old = Utc::now() - Duration::days(400);
+    let snapshot = dlm_snapshot(SNAP_A, "vol-a", old, &[]);
+    let mut orphan = snapshot.clone();
+    orphan.dlm_orphan = Some(DlmOrphanCause::VolumeDeleted);
+    let plan_with = |args: &Args, snapshot: &SnapshotInfo| {
+        plan_region(
+            args,
+            "us-east-1",
+            Utc::now(),
+            &[],
+            std::slice::from_ref(snapshot),
+            &scan(&[], &[]),
+            &HashMap::new(),
+        )
+    };
+    let first_keep =
+        |plan: &RegionPlan| plan.kept_snapshots.first().map(|kept| kept.reason.clone());
+
+    // Not found orphaned (or the flag is off): DLM snapshots stay kept.
+    let mut args = test_args();
+    args.allow_untagged = true;
+    assert_eq!(first_keep(&plan_with(&args, &snapshot)), Some(KeepReason::LifecycleManaged));
+
+    // Orphaned and authorized: planned, with its cause.
+    let plan = plan_with(&args, &orphan);
+    assert_eq!(plan.delete_snapshots.len(), 1);
+    assert_eq!(plan.delete_snapshots[0].dlm_orphan, Some(DlmOrphanCause::VolumeDeleted));
+
+    // Orphaned but not authorized (no delete tag, no --allow-untagged).
+    assert_eq!(first_keep(&plan_with(&test_args(), &orphan)), Some(KeepReason::NoDeleteTag));
+
+    // Orphaned but protected.
+    let mut protected = orphan.clone();
+    protected.tags.insert(args.protect_tag.clone(), "true".to_string());
+    assert_eq!(first_keep(&plan_with(&args, &protected)), Some(KeepReason::Protected));
+}
+
+fn dlm_policy_rule(
+    policy_id: &'static str,
+    retention_count: Option<i32>,
+) -> aws_smithy_mocks::Rule {
+    mock!(dlm::Client::get_lifecycle_policy)
+        .match_requests(move |request| request.policy_id() == Some(policy_id))
+        .then_output(move || {
+            let retain = match retention_count {
+                Some(count) => dlm::types::RetainRule::builder().count(count).build(),
+                None => dlm::types::RetainRule::builder()
+                    .interval(30)
+                    .interval_unit(dlm::types::RetentionIntervalUnitValues::Days)
+                    .build(),
+            };
+            dlm::operation::get_lifecycle_policy::GetLifecyclePolicyOutput::builder()
+                .policy(
+                    dlm::types::LifecyclePolicy::builder()
+                        .policy_id(policy_id)
+                        .policy_details(
+                            dlm::types::PolicyDetails::builder()
+                                .policy_type(dlm::types::PolicyTypeValues::EbsSnapshotManagement)
+                                .schedules(
+                                    dlm::types::Schedule::builder()
+                                        .name(DLM_SCHEDULE)
+                                        .retain_rule(retain)
+                                        .build(),
+                                )
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build()
+        })
+}
+
+fn dlm_ami_policy_rule(policy_id: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(dlm::Client::get_lifecycle_policy)
+        .match_requests(move |request| request.policy_id() == Some(policy_id))
+        .then_output(move || {
+            dlm::operation::get_lifecycle_policy::GetLifecyclePolicyOutput::builder()
+                .policy(
+                    dlm::types::LifecyclePolicy::builder()
+                        .policy_id(policy_id)
+                        .policy_details(
+                            dlm::types::PolicyDetails::builder()
+                                .policy_type(dlm::types::PolicyTypeValues::ImageManagement)
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build()
+        })
+}
+
+fn dlm_policy_error_rule(policy_id: &'static str, code: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(dlm::Client::get_lifecycle_policy)
+        .match_requests(move |request| request.policy_id() == Some(policy_id))
+        .then_error(move || {
+            dlm::operation::get_lifecycle_policy::GetLifecyclePolicyError::generic(
+                ErrorMetadata::builder().code(code).message("mocked").build(),
+            )
+        })
+}
+
+fn volumes_rule(live: &'static [&'static str]) -> aws_smithy_mocks::Rule {
+    mock!(ec2::Client::describe_volumes).then_output(move || {
+        ec2::operation::describe_volumes::DescribeVolumesOutput::builder()
+            .set_volumes(Some(
+                live.iter()
+                    .map(|id| ec2::types::Volume::builder().volume_id(*id).build())
+                    .collect(),
+            ))
+            .build()
+    })
+}
+
+#[tokio::test]
+async fn dlm_inventory_reads_policies_and_live_volumes() {
+    let old = Utc::now() - Duration::days(400);
+    let tagged = |id: &str, volume: &str, policy: &str| {
+        let mut snapshot = dlm_snapshot(id, volume, old, &[]);
+        snapshot.tags.insert("aws:dlm:lifecycle-policy-id".into(), policy.into());
+        snapshot
+    };
+    let snapshots = vec![
+        tagged(SNAP_A, "vol-a", "policy-count"),
+        tagged(SNAP_B, "vol-b", "policy-gone"),
+        tagged(SNAP_C, "vol-c", "policy-denied"),
+        tagged("snap-0123456789abcdef4", "vol-d", "policy-age"),
+        tagged("snap-0123456789abcdef5", "vol-e", "policy-ami"),
+    ];
+    let count = dlm_policy_rule("policy-count", Some(15));
+    let gone = dlm_policy_error_rule("policy-gone", "ResourceNotFoundException");
+    let denied = dlm_policy_error_rule("policy-denied", "AccessDeniedException");
+    let age = dlm_policy_rule("policy-age", None);
+    let ami = dlm_ami_policy_rule("policy-ami");
+    let rules = [&count, &gone, &denied, &age, &ami];
+    let dlm_client = mock_client!(aws_sdk_dlm, RuleMode::MatchAny, rules, |builder| {
+        builder.retry_config(dlm::config::retry::RetryConfig::disabled())
+    });
+    let volumes = volumes_rule(&["vol-b"]);
+    let ec2_client = ec2_with(Vec::new(), &[&volumes]);
+
+    let inventory = load_dlm_inventory(&ec2_client, &dlm_client, &snapshots, 4).await;
+
+    assert_eq!(inventory.policies["policy-count"], snapshot_policy(Retention::Count));
+    assert_eq!(inventory.policies["policy-gone"], PolicyState::Deleted);
+    assert_eq!(inventory.policies["policy-age"], snapshot_policy(Retention::Other));
+    assert_eq!(inventory.policies["policy-ami"], PolicyState::OtherPolicy);
+    assert!(
+        matches!(&inventory.policies["policy-denied"], PolicyState::Unknown(error) if error.contains("AccessDeniedException"))
+    );
+    assert_eq!(inventory.live_volumes, Ok(HashSet::from(["vol-b".to_string()])));
+
+    let scan = orphans(&snapshots, &inventory);
+    assert_eq!(
+        scan.orphans,
+        HashMap::from([
+            (SNAP_A.to_string(), DlmOrphanCause::VolumeDeleted),
+            (SNAP_B.to_string(), DlmOrphanCause::PolicyDeleted),
+        ])
+    );
+    assert_eq!(scan.undecided.len(), 1, "the denied policy's snapshot is undecided");
+}
+
+fn ec2_dlm_snapshot(snapshot_id: &str, volume: &str) -> ec2::types::Snapshot {
+    ec2::types::Snapshot::builder()
+        .snapshot_id(snapshot_id)
+        .volume_id(volume)
+        .start_time(ec2::primitives::DateTime::from_secs(1_577_836_800))
+        .tags(
+            ec2::types::Tag::builder().key("aws:dlm:lifecycle-policy-id").value(DLM_POLICY).build(),
+        )
+        .tags(
+            ec2::types::Tag::builder()
+                .key("aws:dlm:lifecycle-schedule-name")
+                .value(DLM_SCHEDULE)
+                .build(),
+        )
+        .build()
+}
+
+#[tokio::test]
+async fn execution_rechecks_dlm_orphans_against_live_volumes() {
+    let mut args = test_args();
+    args.execute = true;
+    args.dry_run = true;
+    args.allow_untagged = true;
+    args.delete_orphaned_dlm_snapshots = true;
+    let old = Utc::now() - Duration::days(400);
+    let mut orphan = dlm_snapshot(SNAP_A, "vol-a", old, &[]);
+    orphan.dlm_orphan = Some(DlmOrphanCause::VolumeDeleted);
+    let plan = plan_region(
+        &args,
+        "us-east-1",
+        Utc::now(),
+        &[],
+        &[orphan],
+        &scan(&[], &[]),
+        &HashMap::new(),
+    );
+    assert_eq!(plan.delete_snapshots.len(), 1);
+
+    let run = |live: &'static [&'static str]| {
+        let (args, plan) = (&args, &plan);
+        async move {
+            let images = images_rule(Vec::new());
+            let snapshots = snapshots_rule(vec![ec2_dlm_snapshot(SNAP_A, "vol-a")]);
+            let volumes = volumes_rule(live);
+            let delete = delete_snapshot_dry_run_rule();
+            let ec2_client =
+                ec2_with(empty_reference_scan_rules(), &[&images, &snapshots, &volumes, &delete]);
+            let policy = dlm_policy_rule(DLM_POLICY, Some(15));
+            let mut clients = reference_clients(empty_asg_client(), no_ssm_client());
+            clients.dlm = Some(mock_client!(aws_sdk_dlm, RuleMode::MatchAny, [&policy]));
+            let summary =
+                execute_region_plan(&ec2_client, &no_backup_client(), &clients, plan, args).await;
+            (summary, delete.num_calls())
+        }
+    };
+
+    // Still orphaned at execution time: deleted.
+    let (summary, deletes) = run(&[]).await;
+    assert!(summary.failures.is_empty() && summary.blocked.is_empty(), "{summary:?}");
+    assert_eq!((summary.deleted_snapshots, deletes), (1, 1));
+
+    // The volume came back (restored or re-attached), so DLM manages it again: skipped.
+    let (summary, deletes) = run(&["vol-a"]).await;
+    assert_eq!((summary.deleted_snapshots, summary.skipped_snapshots, deletes), (0, 1, 0));
 }

@@ -5,6 +5,7 @@
 
 mod aws_backup;
 mod cli;
+mod dlm;
 mod errors;
 mod execute;
 mod inventory;
@@ -105,6 +106,7 @@ async fn run(args: &Args) -> AppResult<RunOutcome> {
             &args.skip_reference_sources,
             args.prune_launch_template_versions,
         )
+        .with_dlm(&region_config, args.delete_orphaned_dlm_snapshots)
         .with_lt_cache(lt_cache_config(args, &region_config, &mut account_id).await);
 
         let region_report =

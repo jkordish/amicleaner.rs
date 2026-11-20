@@ -11,6 +11,7 @@ dependencies = [
  "aws-sdk-backup",
  "aws-sdk-batch",
  "aws-sdk-cloudformation",
+ "aws-sdk-dlm",
  "aws-sdk-ec2",
  "aws-sdk-eks",
  "aws-sdk-emr",
@@ -307,6 +308,31 @@ dependencies = [
  "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
+ "fastrand",
+ "http 1.5.0",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-dlm"
+version = "1.120.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc270f4215c22fe9151d1e64d4e1e0a56355fcdb28fb5202f98f30509f38e061"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
  "fastrand",
  "http 1.5.0",
  "regex-lite",

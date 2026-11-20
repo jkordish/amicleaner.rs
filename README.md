@@ -18,7 +18,7 @@ Anything the tool can't determine blocks the deletions it affects:
 - If the AWS Backup inventory can't be read, or a snapshot looks AWS Backup-created but has no matching recovery point, those snapshot deletions are cancelled.
 - Anything shared is kept. That means an AMI with any launch permission, or a snapshot with any create-volume permission, granted to another account, an Organization or OU, or the public. If the permission lookup fails, the resource is kept and the region exits with code 3. This protects the build-account pattern, where AMIs are built in one account and shared to the accounts that run them. A shared AMI also keeps its snapshots, because they stay referenced. The plan prints how many candidates were kept this way as `kept_shared_amis` and `kept_shared_snapshots`.
 - AMIs created by AWS Backup and AMIs with missing or unparseable dates are kept.
-- Snapshots and AMIs created by Amazon Data Lifecycle Manager (an `aws:dlm:` tag, or a "Created for policy: policy-…" description) are always kept, even with the delete tag. DLM deletes them on its own retention schedule.
+- Snapshots and AMIs created by Amazon Data Lifecycle Manager (an `aws:dlm:` tag, or a "Created for policy: policy-…" description) are always kept, even with the delete tag. DLM deletes them on its own retention schedule. The exception is snapshots DLM will never delete, which `--delete-orphaned-dlm-snapshots` can clean up (see below).
 - With `--execute`, every planned item is re-checked against live state right before it is deleted.
 
 Tags:
@@ -52,6 +52,8 @@ Read, per reference source (drop the ones you pass to `--skip-reference-sources`
 | `batch` | `batch:DescribeComputeEnvironments` |
 | `emr` | `elasticmapreduce:ListClusters`, `elasticmapreduce:DescribeCluster`, `elasticmapreduce:ListInstanceGroups`, `elasticmapreduce:ListInstanceFleets` |
 | `eks` (only with `--prune-launch-template-versions`) | `eks:ListClusters`, `eks:ListNodegroups`, `eks:DescribeNodegroup` |
+
+With `--delete-orphaned-dlm-snapshots`: `dlm:GetLifecyclePolicy` and `ec2:DescribeVolumes`.
 
 Write (`--execute`): `ec2:DeregisterImage`, `ec2:DeleteSnapshot`, `backup:DeleteRecoveryPoint` for `--execute-backup-recovery-point-deletes`, and `ec2:DeleteLaunchTemplateVersions` for `--prune-launch-template-versions`.
 
@@ -101,6 +103,27 @@ Templates managed by EKS, Karpenter, Batch or CloudFormation (by tag), templates
 
 Things amicleaner can't see, like scripts or pipelines that launch a specific version number by hand, aren't protected. Raise `--keep-launch-template-versions` if you have those.
 
+### orphaned DLM snapshots
+
+Data Lifecycle Manager stops retiring its snapshots in three cases, and leaves them forever:
+
+- a **count-based** schedule ("keep the newest N") whose source volume was deleted: DLM only deletes an old snapshot when it takes a new one of the same volume
+- the **policy was deleted**: its snapshots aren't deleted with it
+- the **schedule was renamed or removed** from the policy: snapshots made under the old name are no longer managed
+
+`--delete-orphaned-dlm-snapshots` treats those snapshots like any other snapshot instead of keeping them as lifecycle managed. They still need everything else: the delete tag (or `--allow-untagged`), no protect tag, not used by a remaining AMI, not shared, and not in AWS Backup. Plan mode just reports them.
+
+To stay safe:
+
+- **Grace period.** The snapshots of one volume under one schedule only count once the newest of them is older than `--min-age-days`. A volume or policy deleted last week keeps its whole set.
+- **Narrow scope.** Only snapshots with the `aws:dlm:lifecycle-policy-id` tag and a real source volume are considered. Cross-region and cross-account copies (`vol-ffffffff`) are skipped, because their policy lives elsewhere. So are snapshots with a pending `aws:dlm:expirationTime`, age-based schedules (DLM keeps expiring those), AMI policies, event-based policies and default policies.
+- **Fails closed.** If a policy or volume lookup fails, the affected snapshots stay kept, and the region exits with code 3.
+- **Re-checked at execute.** Execute re-reads the policies and volumes. A snapshot whose volume came back, or whose schedule was restored, is skipped.
+
+Reports give each one's cause (`dlm_volume_deleted`, `dlm_policy_deleted`, `dlm_schedule_removed`) and its policy, schedule and source volume.
+
+The last snapshots of a deleted volume may be someone's only copy of it. Check with the policy's owner first, and consider an EBS Recycle Bin retention rule so deletes can be undone for a while.
+
 ### launch template cache
 
 Reading every launch template version is usually the slowest step: a build account can have tens of thousands of versions, and EC2 can't filter them by image. A version never changes once it's created and version numbers are never reused, so amicleaner caches each version's image reference in `~/.cache/amicleaner/launch-templates-<account>-<region>.json` (or under `$XDG_CACHE_HOME`, or `--cache-dir`). Later runs fetch only versions newer than the cache, so after the first run this step takes seconds instead of minutes.
@@ -148,7 +171,7 @@ Must have Docker installed and running. Checkout the [build.sh](build.sh) for wh
 ```shell
 Conservative EC2 AMI + EBS snapshot mark-and-sweep cleanup
 
-Usage: amicleaner-plan [OPTIONS]
+Usage: amicleaner [OPTIONS]
 
 Options:
       --execute
@@ -241,6 +264,9 @@ Options:
           Seconds before a single AWS request attempt is abandoned and retried. Protects against connections that a proxy drops without closing
           
           [default: 60]
+
+      --delete-orphaned-dlm-snapshots
+          Also delete Data Lifecycle Manager snapshots that DLM will never retire: those whose policy was deleted, whose schedule was removed, or whose count-based policy lost its source volume. Only once the newest snapshot of that volume and schedule is older than --min-age-days. The normal rules still apply, including the delete tag (or --allow-untagged), the protect tag, sharing and AWS Backup
 
       --prune-launch-template-versions
           Also delete old launch template versions: those older than --min-age-days that aren't among the newest --keep-launch-template-versions, the default version, or launched by number from an Auto Scaling group, fleet, Batch environment or EKS node group. Templates managed by EKS, Karpenter, Batch or CloudFormation are left alone. Frees the AMIs only old versions referenced on the next run

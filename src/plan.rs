@@ -12,6 +12,7 @@ use crate::aws_backup::{
     list_ebs_recovery_points, prune_released_snapshots,
 };
 use crate::cli::Args;
+use crate::dlm::{load_dlm_inventory, orphaned_dlm_snapshots};
 use crate::errors::{AppResult, error_chain};
 use crate::inventory::{
     list_owned_amis, list_owned_snapshots, lookup_ami_external_use, lookup_snapshot_external_use,
@@ -40,7 +41,7 @@ pub(crate) async fn build_region_plan(
         AppResult::Ok((amis, snapshots))
     }
     .await;
-    let (owned_amis, owned_snapshots) = match inventory {
+    let (owned_amis, mut owned_snapshots) = match inventory {
         Ok(inventory) => inventory,
         Err(error) => {
             phase.fail("failed");
@@ -92,6 +93,32 @@ pub(crate) async fn build_region_plan(
         }
     }
 
+    // Only read DLM policies and volumes when asked to; otherwise every DLM snapshot is kept.
+    let mut dlm_undecided = Vec::new();
+    if let Some(dlm_client) =
+        reference_clients.dlm.as_ref().filter(|_| args.delete_orphaned_dlm_snapshots)
+    {
+        let phase = Phase::start(format!("{region} · DLM policies and volumes"));
+        let inventory =
+            load_dlm_inventory(ec2_client, dlm_client, &owned_snapshots, concurrency).await;
+        let scan = orphaned_dlm_snapshots(
+            &owned_snapshots,
+            &inventory,
+            now,
+            Cutoffs::new(args, now).min_age,
+        );
+        let done = format!("{} orphaned DLM snapshots", thousands(scan.orphans.len()));
+        if scan.undecided.is_empty() {
+            phase.finish(done);
+        } else {
+            phase.warn(done);
+        }
+        for snapshot in &mut owned_snapshots {
+            snapshot.dlm_orphan = scan.orphans.get(&snapshot.snapshot_id).copied();
+        }
+        dlm_undecided = scan.undecided;
+    }
+
     let mut plan = plan_region(
         args,
         region,
@@ -101,6 +128,10 @@ pub(crate) async fn build_region_plan(
         &reference_scan,
         &external_use,
     );
+    for reason in dlm_undecided {
+        warn!("region {region}: {reason}");
+        plan.blocked.push(reason);
+    }
 
     if args.prune_launch_template_versions {
         match prune_block_reason(&reference_scan, reference_clients) {

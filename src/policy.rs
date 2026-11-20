@@ -112,8 +112,12 @@ pub(crate) fn snapshot_keep_reason(
         return Some(KeepReason::Protected);
     }
     // DLM retires its own snapshots on schedule; deleting them early breaks someone's backups,
-    // and a delete tag (or an AMI being deregistered) doesn't change that.
-    if looks_lifecycle_managed(&snapshot.tags, snapshot.description.as_deref()) {
+    // and a delete tag (or an AMI being deregistered) doesn't change that. The exception is a
+    // snapshot DLM will never retire (`dlm_orphan`, see `dlm.rs`), which then faces every other
+    // rule, delete authorization included.
+    if snapshot.dlm_orphan.is_none()
+        && looks_lifecycle_managed(&snapshot.tags, snapshot.description.as_deref())
+    {
         return Some(KeepReason::LifecycleManaged);
     }
     if !snapshot_deletion_authorized(&snapshot.tags, released_by_deregistered_ami, args) {

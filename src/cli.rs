@@ -113,6 +113,14 @@ pub(crate) struct Args {
           value_parser = clap::value_parser!(u64).range(5..=600))]
     pub(crate) request_timeout_secs: u64,
 
+    /// Also delete Data Lifecycle Manager snapshots that DLM will never retire: those whose policy
+    /// was deleted, whose schedule was removed, or whose count-based policy lost its source
+    /// volume. Only once the newest snapshot of that volume and schedule is older than
+    /// --min-age-days. The normal rules still apply, including the delete tag (or
+    /// --allow-untagged), the protect tag, sharing and AWS Backup.
+    #[arg(long)]
+    pub(crate) delete_orphaned_dlm_snapshots: bool,
+
     /// Also delete old launch template versions: those older than --min-age-days that aren't
     /// among the newest --keep-launch-template-versions, the default version, or launched by
     /// number from an Auto Scaling group, fleet, Batch environment or EKS node group. Templates

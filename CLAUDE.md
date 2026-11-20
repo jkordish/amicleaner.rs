@@ -37,6 +37,7 @@ Source layout (everything is `pub(crate)` at most; tests live in `src/tests.rs`,
 | `references/mod.rs` | `ReferenceCollector` + EC2/ASG/SSM sources, `ReferenceClients`, `resolve_image_reference` |
 | `references/lt_cache.rs` | launch template version cache: `fetch_plan` (full / from version n / up to date), atomic load/save, pruning |
 | `references/services.rs` | Image Builder, CloudFormation, Batch, EMR sources and their parsers |
+| `dlm.rs` | orphaned Data Lifecycle Manager snapshots: `load_dlm_inventory` (policies, live volumes), `orphaned_dlm_snapshots` (pure) |
 | `lt_prune.rs` | opt-in launch template version pruning: `prune_block_reason`, `plan_launch_template_pruning` (pure), `execute_launch_template_pruning` (re-scan, re-plan, delete the intersection) |
 | `execute.rs` | execute phase, `send_with_retries`, retry classification |
 | `report.rs` | `Report` model built from `RegionPlan` (a decision + reason for every resource, savings estimate); renders the stdout summary, Markdown and JSON |
@@ -64,6 +65,7 @@ Per region, two phases:
 - **Read error codes, never `Display`.** `SdkError`'s `Display` is just "service error". Use `error.code()` to classify and `describe_sdk_error()` / `.aws_context("Op")` / `error_chain()` to build messages.
 - **The launch template cache only adds references.** Every cached version is replayed through `record()`; it stores raw image references (SSM resolved per run); `fetch_plan` falls back to `Full` on anything surprising; expiry (`--cache-max-age-days`) is what forgets deleted versions. Never let a cache entry suppress a fetched reference.
 - **Version pruning keeps the default version and every explicit pin, and blocks on any doubt.** Pins come from ASGs, fleets, Batch and EKS (`AmiReferenceScan::pin_launch_template`); unresolved references or a skipped Batch/EKS source cancel pruning (`prune_block_reason`). Rules live in `template_keep_reason` / `version_keep_reason` and execute re-runs them. The EKS client exists only when pruning (`ReferenceClients::with_eks`), so EKS permissions never block AMI cleanup.
+- **Orphaned DLM snapshots are opt-in and narrow.** `dlm::orphaned_dlm_snapshots` (pure) sets `SnapshotInfo::dlm_orphan` only for DLM-tagged snapshots from a real volume (not `vol-ffffffff`), with no pending expiry, whose policy is deleted, whose schedule is gone, or whose count-based schedule lost its volume, and only once the group's newest snapshot is past `--min-age-days`. It only lifts the `LifecycleManaged` keep in `snapshot_keep_reason`; every other rule still applies. Lookup failures leave `dlm_orphan` as `None` and go to `blocked`. Execute recomputes it from live data. The DLM client exists only with the flag (`ReferenceClients::with_dlm`).
 - New reference sources belong in `ReferenceCollector`, must use SDK paginators (`into_paginator()`), and need a mock test plus a README IAM-permission entry, since a missing permission fails closed.
 
 ### Testing pattern

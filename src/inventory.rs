@@ -109,6 +109,8 @@ pub(crate) async fn list_owned_snapshots(ec2_client: &ec2::Client) -> AppResult<
                 start_time,
                 description: snapshot.description().map(ToString::to_string),
                 tags: tags_to_map(snapshot.tags()),
+                volume_id: snapshot.volume_id().map(ToString::to_string),
+                dlm_orphan: None,
             });
         }
     }

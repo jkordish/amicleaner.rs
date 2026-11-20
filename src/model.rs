@@ -43,6 +43,46 @@ pub(crate) struct SnapshotInfo {
     pub(crate) start_time: DateTime<Utc>,
     pub(crate) description: Option<String>,
     pub(crate) tags: HashMap<String, String>,
+    /// Volume the snapshot was taken from (`vol-ffffffff` for copies).
+    pub(crate) volume_id: Option<String>,
+    /// Set by `dlm::orphaned_dlm_snapshots` for a DLM snapshot DLM will never retire, and only
+    /// with `--delete-orphaned-dlm-snapshots`. `None` keeps the lifecycle-managed rule in force.
+    pub(crate) dlm_orphan: Option<DlmOrphanCause>,
+}
+
+/// Why Data Lifecycle Manager will never retire a snapshot it made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum DlmOrphanCause {
+    /// The policy no longer exists; deleting a policy doesn't delete its snapshots.
+    PolicyDeleted,
+    /// The schedule that made it was renamed or removed from the policy.
+    ScheduleRemoved,
+    /// Count-based schedule whose source volume is gone; the policy stops managing those.
+    VolumeDeleted,
+}
+
+impl DlmOrphanCause {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::PolicyDeleted => "dlm_policy_deleted",
+            Self::ScheduleRemoved => "dlm_schedule_removed",
+            Self::VolumeDeleted => "dlm_volume_deleted",
+        }
+    }
+}
+
+impl fmt::Display for DlmOrphanCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::PolicyDeleted => "orphaned DLM snapshot: its policy was deleted",
+            Self::ScheduleRemoved => {
+                "orphaned DLM snapshot: its schedule was removed from the policy"
+            }
+            Self::VolumeDeleted => {
+                "orphaned DLM snapshot: source volume deleted (count-based policy)"
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug)]

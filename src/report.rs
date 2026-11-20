@@ -10,6 +10,7 @@ use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::cli::Args;
+use crate::dlm::{DLM_POLICY_TAG, DLM_SCHEDULE_TAG};
 use crate::errors::AppResult;
 use crate::model::{
     ExecutionSummary, KeepReason, Kept, LaunchTemplatePrunePlan, RegionPlan, SnapshotInfo,
@@ -91,6 +92,7 @@ pub(crate) struct Settings {
     pub(crate) launch_template_cache: bool,
     /// Newest versions kept per template when pruning; `None` when not pruning.
     pub(crate) prune_launch_template_versions_keep: Option<u16>,
+    pub(crate) delete_orphaned_dlm_snapshots: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -194,6 +196,8 @@ pub(crate) struct Counts {
     pub(crate) delete_recovery_points: usize,
     pub(crate) blocked_snapshots: usize,
     pub(crate) kept_snapshots: usize,
+    /// Planned snapshot deletions that are orphaned DLM snapshots (included in `delete_snapshots`).
+    pub(crate) orphaned_dlm_snapshots: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -301,6 +305,7 @@ impl Settings {
             prune_launch_template_versions_keep: args
                 .prune_launch_template_versions
                 .then_some(args.keep_launch_template_versions),
+            delete_orphaned_dlm_snapshots: args.delete_orphaned_dlm_snapshots,
         }
     }
 }
@@ -422,17 +427,33 @@ impl RegionReport {
             .collect::<HashMap<&str, &SnapshotInfo>>();
         let mut snapshots = Vec::new();
         for snapshot in &plan.delete_snapshots {
-            let details = plan
+            let mut details = plan
                 .snapshots_released_by_ami
                 .get(&snapshot.snapshot_id)
                 .map(|ami_id| vec![format!("freed by deregistering {ami_id}")])
                 .unwrap_or_default();
+            let (reason_code, reason) = match snapshot.dlm_orphan {
+                Some(cause) => {
+                    details.extend(
+                        [DLM_POLICY_TAG, DLM_SCHEDULE_TAG]
+                            .iter()
+                            .filter_map(|key| snapshot.tags.get(*key))
+                            .map(|value| format!("DLM {value}")),
+                    );
+                    details
+                        .extend(snapshot.volume_id.iter().map(|volume| format!("from {volume}")));
+                    (cause.code(), cause.to_string())
+                }
+                None => {
+                    ("eligible", "old, unreferenced, unshared and tagged for deletion".to_string())
+                }
+            };
             snapshots.push(snapshot_decision(
                 pricing,
                 snapshot,
                 Action::Delete,
-                "eligible",
-                "old, unreferenced, unshared and tagged for deletion".to_string(),
+                reason_code,
+                reason,
                 details,
             ));
         }
@@ -517,6 +538,11 @@ impl RegionReport {
                 delete_recovery_points: plan.delete_backup_recovery_points.len(),
                 blocked_snapshots: plan.blocked_backup_snapshots.len(),
                 kept_snapshots: plan.kept_snapshots.len(),
+                orphaned_dlm_snapshots: plan
+                    .delete_snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.dlm_orphan.is_some())
+                    .count(),
             },
             estimated_monthly_savings_usd: round2(savings_usd),
             estimated_savings_gib: round2(savings_gib),
@@ -763,6 +789,11 @@ fn write_settings_markdown(out: &mut String, settings: &Settings) {
             || "off".to_string(),
             |keep| format!("keep newest {keep} + latest + default")
         )
+    );
+    let _ = writeln!(
+        out,
+        "| Orphaned DLM snapshots | {} |",
+        if settings.delete_orphaned_dlm_snapshots { "deleted when eligible" } else { "kept" }
     );
     let _ = writeln!(out);
     let _ = writeln!(out, "</details>");
@@ -1084,6 +1115,17 @@ pub(crate) fn render_region_text(region: &RegionReport) -> String {
         counts.kept_snapshots
     );
     write_reason_line(&mut out, &region.kept_snapshots_by_reason);
+    if counts.orphaned_dlm_snapshots > 0 {
+        let _ = writeln!(
+            out,
+            "             {}",
+            console::style(format!(
+                "to delete includes {} orphaned DLM snapshots (DLM will never retire them)",
+                counts.orphaned_dlm_snapshots
+            ))
+            .dim()
+        );
+    }
     if let Some(versions) = &region.launch_template_versions {
         let _ = writeln!(
             out,

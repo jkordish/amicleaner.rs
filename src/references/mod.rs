@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use aws_sdk_autoscaling as autoscaling;
 use aws_sdk_batch as batch;
 use aws_sdk_cloudformation as cloudformation;
+use aws_sdk_dlm as dlm;
 use aws_sdk_ec2 as ec2;
 use aws_sdk_eks as eks;
 use aws_sdk_emr as emr;
@@ -53,6 +54,9 @@ pub(crate) struct ReferenceClients {
     pub(crate) batch: Option<batch::Client>,
     pub(crate) emr: Option<emr::Client>,
     pub(crate) eks: Option<eks::Client>,
+    /// Data Lifecycle Manager, only for `--delete-orphaned-dlm-snapshots` (not a reference source;
+    /// it lives here because these clients reach both plan and execute).
+    pub(crate) dlm: Option<dlm::Client>,
     /// Maximum concurrent requests for the fan-out lookups (launch template versions,
     /// CloudFormation templates).
     pub(crate) concurrency: usize,
@@ -77,6 +81,7 @@ impl ReferenceClients {
             // Node groups pin template versions but launch no AMI of their own that the launch
             // template scan misses, so EKS is only read when pruning versions (`with_eks`).
             eks: None,
+            dlm: None,
             concurrency: concurrency.max(1),
             region: config.region().map(ToString::to_string).unwrap_or_default(),
             lt_cache: None,
@@ -93,6 +98,13 @@ impl ReferenceClients {
     ) -> Self {
         self.eks =
             (enabled && !skip.contains(&ReferenceSource::Eks)).then(|| eks::Client::new(config));
+        self
+    }
+
+    /// Creates the DLM client only when orphaned DLM snapshots are wanted, so DLM permissions
+    /// never affect other runs.
+    pub(crate) fn with_dlm(mut self, config: &SdkConfig, enabled: bool) -> Self {
+        self.dlm = enabled.then(|| dlm::Client::new(config));
         self
     }
 

@@ -12,6 +12,7 @@ use chrono::Utc;
 use ec2::error::{ProvideErrorMetadata, SdkError};
 
 use crate::cli::Args;
+use crate::dlm::{load_dlm_inventory, orphaned_dlm_snapshots};
 use crate::errors::{describe_sdk_error, error_chain};
 use crate::inventory::{
     list_owned_amis, list_owned_snapshots, lookup_ami_external_use, lookup_snapshot_external_use,
@@ -76,9 +77,9 @@ pub(crate) async fn execute_region_plan(
     execute_snapshot_deletions(
         ec2_client,
         backup_client,
+        reference_clients.dlm.as_ref(),
         plan,
         args,
-        cutoffs,
         &released_amis,
         &mut summary,
     )
@@ -227,12 +228,14 @@ async fn execute_ami_deregistrations(
 async fn execute_snapshot_deletions(
     ec2_client: &ec2::Client,
     backup_client: &backup::Client,
+    dlm_client: Option<&aws_sdk_dlm::Client>,
     plan: &RegionPlan,
     args: &Args,
-    cutoffs: Cutoffs,
     released_amis: &HashSet<String>,
     summary: &mut ExecutionSummary,
 ) {
+    // Taken now rather than at the start of the run: a later cutoff can only keep more.
+    let cutoffs = Cutoffs::new(args, Utc::now());
     if plan.delete_snapshots.is_empty() && plan.delete_backup_recovery_points.is_empty() {
         return;
     }
@@ -265,7 +268,7 @@ async fn execute_snapshot_deletions(
         .flat_map(|ami| ami.snapshot_ids.iter().cloned())
         .collect::<HashSet<String>>();
 
-    let current_snapshots = match list_owned_snapshots(ec2_client).await {
+    let mut current_snapshots = match list_owned_snapshots(ec2_client).await {
         Ok(snapshots) => snapshots
             .into_iter()
             .map(|snapshot| (snapshot.snapshot_id.clone(), snapshot))
@@ -281,6 +284,29 @@ async fn execute_snapshot_deletions(
             return;
         }
     };
+
+    // Orphaned DLM snapshots are re-derived from the live policies, volumes and snapshots with the
+    // same function the plan used; one that DLM manages again (volume back, schedule restored)
+    // falls back to the lifecycle-managed keep.
+    let planned_orphans =
+        plan.delete_snapshots.iter().any(|snapshot| snapshot.dlm_orphan.is_some());
+    if let Some(dlm_client) = dlm_client.filter(|_| planned_orphans) {
+        let snapshots = current_snapshots.values().cloned().collect::<Vec<_>>();
+        let inventory = load_dlm_inventory(
+            ec2_client,
+            dlm_client,
+            &snapshots,
+            usize::from(args.max_concurrency),
+        )
+        .await;
+        let scan = orphaned_dlm_snapshots(&snapshots, &inventory, Utc::now(), cutoffs.min_age);
+        summary.blocked.extend(
+            scan.undecided.into_iter().map(|reason| format!("{reason} (at execution time)")),
+        );
+        for (snapshot_id, snapshot) in &mut current_snapshots {
+            snapshot.dlm_orphan = scan.orphans.get(snapshot_id).copied();
+        }
+    }
 
     let still_deletable = |snapshot_id: &str| -> Option<&SnapshotInfo> {
         let current = current_snapshots.get(snapshot_id)?;
