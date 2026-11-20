@@ -344,14 +344,16 @@ async fn execute_snapshot_deletions(
         plan.delete_snapshots.iter().any(|snapshot| snapshot.dlm_orphan.is_some());
     if let Some(dlm_client) = reference_clients.dlm.as_ref().filter(|_| planned_orphans) {
         let snapshots = current_snapshots.values().cloned().collect::<Vec<_>>();
+        let now = Utc::now();
         let inventory = load_dlm_inventory(
             ec2_client,
             dlm_client,
             &snapshots,
+            now,
             usize::from(args.max_concurrency),
         )
         .await;
-        let scan = orphaned_dlm_snapshots(&snapshots, &inventory, Utc::now(), cutoffs.min_age);
+        let scan = orphaned_dlm_snapshots(&snapshots, &inventory, now, cutoffs.min_age);
         summary.blocked.extend(
             scan.undecided.into_iter().map(|reason| format!("{reason} (at execution time)")),
         );

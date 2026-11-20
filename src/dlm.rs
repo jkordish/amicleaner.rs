@@ -1,7 +1,8 @@
 //! Orphaned Data Lifecycle Manager snapshots (`--delete-orphaned-dlm-snapshots`).
 //!
 //! DLM snapshots are normally kept because DLM retires them itself. It stops doing so when:
-//! - a count-based schedule's source volume is deleted (the policy no longer manages them);
+//! - a count-based schedule's source volume is deleted (the policy no longer manages them; only
+//!   for policies that target volumes: instance policies count snapshot sets per instance);
 //! - the policy is deleted (its snapshots aren't deleted with it);
 //! - the schedule that made them is renamed or removed.
 //!
@@ -12,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use aws_sdk_dlm as dlm;
-use aws_sdk_dlm::types::PolicyTypeValues;
+use aws_sdk_dlm::types::{PolicyTypeValues, ResourceTypeValues};
 use aws_sdk_ec2 as ec2;
 use aws_sdk_ec2::error::ProvideErrorMetadata;
 use chrono::{DateTime, Utc};
@@ -80,8 +81,16 @@ fn tag<'a>(snapshot: &'a SnapshotInfo, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
-/// The source volume, unless it's missing or the copy placeholder.
+/// The source volume, unless it's missing or the snapshot is a copy. A copy's volume id is
+/// arbitrary (`vol-ffffffff` in practice), and a cross-region copy carries the source region's
+/// policy id, which looks deleted here; so copies are recognized by description too.
 fn source_volume(snapshot: &SnapshotInfo) -> Option<&str> {
+    let copied = snapshot.description.as_deref().is_some_and(|description| {
+        description.contains("Copied snap-") || description.contains("Copied for")
+    });
+    if copied {
+        return None;
+    }
     snapshot.volume_id.as_deref().filter(|volume| {
         volume.starts_with("vol-") && !volume.eq_ignore_ascii_case(COPY_PLACEHOLDER_VOLUME)
     })
@@ -108,13 +117,15 @@ fn candidates(
 
 /// Reads the policies and volumes the candidates depend on. Never fails as a whole: errors are
 /// recorded per policy, or for the volume lookup, and keep the affected snapshots.
+/// `now` must be the same instant later given to `orphaned_dlm_snapshots`, so both pick the same
+/// candidates (an expiry passing in between would leave a candidate whose policy wasn't read).
 pub(crate) async fn load_dlm_inventory(
     ec2_client: &ec2::Client,
     dlm_client: &dlm::Client,
     snapshots: &[SnapshotInfo],
+    now: DateTime<Utc>,
     concurrency: usize,
 ) -> DlmInventory {
-    let now = Utc::now();
     let mut policy_ids = HashSet::new();
     let mut volume_ids = HashSet::new();
     for snapshot in candidates(snapshots, now) {
@@ -157,13 +168,17 @@ fn policy_state(policy: &dlm::types::LifecyclePolicy) -> PolicyState {
     if !custom_snapshot_policy {
         return PolicyState::OtherPolicy;
     }
+    // An instance policy's count applies to snapshot sets per instance: a detached and deleted
+    // volume's snapshots still rotate out with their sets, so they're never orphaned by volume.
+    let targets_volumes =
+        !details.resource_types().iter().any(|resource| resource == &ResourceTypeValues::Instance);
     let schedules = details
         .schedules()
         .iter()
         .filter_map(|schedule| {
             let retention = match schedule.retain_rule().and_then(|rule| rule.count()) {
-                Some(_) => Retention::Count,
-                None => Retention::Other,
+                Some(_) if targets_volumes => Retention::Count,
+                _ => Retention::Other,
             };
             schedule.name().map(|name| (name.to_string(), retention))
         })
@@ -208,8 +223,9 @@ fn key(snapshot: &SnapshotInfo) -> Option<GroupKey<'_>> {
 }
 
 /// Decides which DLM snapshots are orphaned (pure). A group (policy, schedule, volume) counts only
-/// once its newest snapshot is older than `min_age_cutoff`, so a volume or policy deleted recently
-/// keeps its whole set for the grace period.
+/// once its newest snapshot is older than `min_age_cutoff`: that's when DLM last acted on it. It
+/// isn't when the volume or policy was deleted, which nothing here can see, so a schedule that ran
+/// rarely (monthly, say) can lose its volume today and be orphaned on the next run.
 pub(crate) fn orphaned_dlm_snapshots(
     snapshots: &[SnapshotInfo],
     inventory: &DlmInventory,

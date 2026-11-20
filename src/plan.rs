@@ -121,7 +121,7 @@ pub(crate) async fn build_region_plan(
     {
         let phase = Phase::start(format!("{region} · DLM policies and volumes"));
         let inventory =
-            load_dlm_inventory(ec2_client, dlm_client, &owned_snapshots, concurrency).await;
+            load_dlm_inventory(ec2_client, dlm_client, &owned_snapshots, now, concurrency).await;
         let scan = orphaned_dlm_snapshots(
             &owned_snapshots,
             &inventory,

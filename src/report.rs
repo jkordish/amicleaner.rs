@@ -533,10 +533,17 @@ impl RegionReport {
                 .unwrap_or_default();
             let (reason_code, reason) = match snapshot.dlm_orphan {
                 Some(cause) => {
+                    // Matched case-insensitively, like `dlm.rs` does.
                     details.extend(
                         [DLM_POLICY_TAG, DLM_SCHEDULE_TAG]
                             .iter()
-                            .filter_map(|key| snapshot.tags.get(*key))
+                            .filter_map(|key| {
+                                snapshot
+                                    .tags
+                                    .iter()
+                                    .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                                    .map(|(_, value)| value)
+                            })
                             .map(|value| format!("DLM {value}")),
                     );
                     details

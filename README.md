@@ -159,7 +159,7 @@ aws cloudformation deploy --stack-name snapshot-recycle-bin \
 
 Data Lifecycle Manager stops retiring its snapshots in three cases, and leaves them forever:
 
-- a **count-based** schedule ("keep the newest N") whose source volume was deleted: DLM only deletes an old snapshot when it takes a new one of the same volume
+- a **count-based** schedule ("keep the newest N") whose source volume was deleted: DLM only deletes an old snapshot when it takes a new one of the same volume. Only for policies that target volumes; an instance policy counts snapshot sets per instance, so its snapshots aren't treated as orphaned by a deleted volume
 - the **policy was deleted**: its snapshots aren't deleted with it
 - the **schedule was renamed or removed** from the policy: snapshots made under the old name are no longer managed
 
@@ -167,8 +167,8 @@ Data Lifecycle Manager stops retiring its snapshots in three cases, and leaves t
 
 To stay safe:
 
-- **Grace period.** The snapshots of one volume under one schedule only count once the newest of them is older than `--min-age-days`. A volume or policy deleted last week keeps its whole set.
-- **Narrow scope.** Only snapshots with the `aws:dlm:lifecycle-policy-id` tag and a real source volume are considered. Cross-region and cross-account copies (`vol-ffffffff`) are skipped, because their policy lives elsewhere. So are snapshots with a pending `aws:dlm:expirationTime`, age-based schedules (DLM keeps expiring those), AMI policies, event-based policies and default policies.
+- **Grace period.** The snapshots of one volume under one schedule only count once the newest of them is older than `--min-age-days`. That's measured from DLM's last snapshot, not from when the volume or policy was deleted, which amicleaner can't see. A daily schedule gets about `--min-age-days` of grace; a monthly one whose volume was deleted today may get none.
+- **Narrow scope.** Only snapshots with the `aws:dlm:lifecycle-policy-id` tag and a real source volume are considered. Cross-region and cross-account copies (`vol-ffffffff`, or a "Copied snap-…" description) are skipped, because their policy lives elsewhere. So are snapshots with a pending `aws:dlm:expirationTime`, age-based schedules (DLM keeps expiring those), AMI policies, event-based policies and default policies.
 - **Fails closed.** If a policy or volume lookup fails, the affected snapshots stay kept, and the region exits with code 3.
 - **Re-checked at execute.** Execute re-reads the policies and volumes. A snapshot whose volume came back, or whose schedule was restored, is skipped.
 

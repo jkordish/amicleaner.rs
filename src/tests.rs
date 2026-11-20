@@ -3695,6 +3695,11 @@ fn dlm_orphan_rules() {
     // Copies (cross-region/account) name a policy that lives elsewhere: never orphaned.
     let copy = dlm_snapshot(SNAP_A, "vol-ffffffff", old, &[]);
     assert_eq!(cause(&dlm_inventory(PolicyState::Deleted, &[]), &copy), None);
+    // A copy with some other volume id is still recognized by its description: its policy id is
+    // the source region's, which looks deleted here.
+    let mut copy = dlm_snapshot(SNAP_A, "vol-0123456789abcdef0", old, &[]);
+    copy.description = Some("[Copied snap-0123456789abcdef9 from us-east-1]".into());
+    assert_eq!(cause(&dlm_inventory(PolicyState::Deleted, &[]), &copy), None);
     let mut no_volume = copy.clone();
     no_volume.volume_id = None;
     assert_eq!(cause(&dlm_inventory(PolicyState::Deleted, &[]), &no_volume), None);
@@ -3835,6 +3840,35 @@ fn dlm_policy_rule(
         })
 }
 
+/// A count-based snapshot policy that targets instances (snapshot sets per instance).
+fn dlm_instance_policy_rule(policy_id: &'static str) -> aws_smithy_mocks::Rule {
+    mock!(dlm::Client::get_lifecycle_policy)
+        .match_requests(move |request| request.policy_id() == Some(policy_id))
+        .then_output(move || {
+            dlm::operation::get_lifecycle_policy::GetLifecyclePolicyOutput::builder()
+                .policy(
+                    dlm::types::LifecyclePolicy::builder()
+                        .policy_id(policy_id)
+                        .policy_details(
+                            dlm::types::PolicyDetails::builder()
+                                .policy_type(dlm::types::PolicyTypeValues::EbsSnapshotManagement)
+                                .resource_types(dlm::types::ResourceTypeValues::Instance)
+                                .schedules(
+                                    dlm::types::Schedule::builder()
+                                        .name(DLM_SCHEDULE)
+                                        .retain_rule(
+                                            dlm::types::RetainRule::builder().count(7).build(),
+                                        )
+                                        .build(),
+                                )
+                                .build(),
+                        )
+                        .build(),
+                )
+                .build()
+        })
+}
+
 fn dlm_ami_policy_rule(policy_id: &'static str) -> aws_smithy_mocks::Rule {
     mock!(dlm::Client::get_lifecycle_policy)
         .match_requests(move |request| request.policy_id() == Some(policy_id))
@@ -3890,25 +3924,29 @@ async fn dlm_inventory_reads_policies_and_live_volumes() {
         tagged(SNAP_C, "vol-c", "policy-denied"),
         tagged("snap-0123456789abcdef4", "vol-d", "policy-age"),
         tagged("snap-0123456789abcdef5", "vol-e", "policy-ami"),
+        tagged("snap-0123456789abcdef6", "vol-f", "policy-instance"),
     ];
     let count = dlm_policy_rule("policy-count", Some(15));
     let gone = dlm_policy_error_rule("policy-gone", "ResourceNotFoundException");
     let denied = dlm_policy_error_rule("policy-denied", "AccessDeniedException");
     let age = dlm_policy_rule("policy-age", None);
     let ami = dlm_ami_policy_rule("policy-ami");
-    let rules = [&count, &gone, &denied, &age, &ami];
+    let instance = dlm_instance_policy_rule("policy-instance");
+    let rules = [&count, &gone, &denied, &age, &ami, &instance];
     let dlm_client = mock_client!(aws_sdk_dlm, RuleMode::MatchAny, rules, |builder| {
         builder.retry_config(dlm::config::retry::RetryConfig::disabled())
     });
     let volumes = volumes_rule(&["vol-b"]);
     let ec2_client = ec2_with(Vec::new(), &[&volumes]);
 
-    let inventory = load_dlm_inventory(&ec2_client, &dlm_client, &snapshots, 4).await;
+    let inventory = load_dlm_inventory(&ec2_client, &dlm_client, &snapshots, Utc::now(), 4).await;
 
     assert_eq!(inventory.policies["policy-count"], snapshot_policy(Retention::Count));
     assert_eq!(inventory.policies["policy-gone"], PolicyState::Deleted);
     assert_eq!(inventory.policies["policy-age"], snapshot_policy(Retention::Other));
     assert_eq!(inventory.policies["policy-ami"], PolicyState::OtherPolicy);
+    // Instance policies count snapshot sets per instance, not per volume.
+    assert_eq!(inventory.policies["policy-instance"], snapshot_policy(Retention::Other));
     assert!(
         matches!(&inventory.policies["policy-denied"], PolicyState::Unknown(error) if error.contains("AccessDeniedException"))
     );
