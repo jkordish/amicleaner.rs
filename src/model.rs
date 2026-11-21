@@ -129,7 +129,6 @@ pub(crate) struct RecoveryPointRecord {
     pub(crate) vault_locked: bool,
     pub(crate) vault_type: Option<String>,
     pub(crate) recovery_point_arn: Option<String>,
-    pub(crate) resource_arn: Option<String>,
     pub(crate) status: Option<String>,
     pub(crate) is_parent: bool,
     pub(crate) parent_recovery_point_arn: Option<String>,
@@ -389,6 +388,9 @@ pub(crate) enum VersionKeepReason {
     Protected,
     /// Something pins a version string we can't interpret, so the whole template is kept.
     UnrecognizedPin(String),
+    /// A Batch compute environment names `$Default`/`$Latest` (or no version). Batch resolves it
+    /// at creation and at infrastructure updates, so the version in use may be any older one.
+    BatchSymbolicPin(String),
 }
 
 impl VersionKeepReason {
@@ -402,6 +404,7 @@ impl VersionKeepReason {
             Self::ManagedTemplate(_) => "managed_template",
             Self::Protected => "protected",
             Self::UnrecognizedPin(_) => "unrecognized_pin",
+            Self::BatchSymbolicPin(_) => "batch_symbolic_pin",
         }
     }
 }
@@ -416,6 +419,11 @@ impl fmt::Display for VersionKeepReason {
             Self::CreateTimeUnknown => f.write_str("creation time unknown"),
             Self::ManagedTemplate(tag) => write!(f, "template managed by another service ({tag})"),
             Self::Protected => f.write_str("template has the protect tag"),
+            Self::BatchSymbolicPin(version) => write!(
+                f,
+                "a Batch compute environment uses {version}, resolved at its last infrastructure \
+                 update, so any version may be in use"
+            ),
             Self::UnrecognizedPin(version) => {
                 write!(f, "pinned to unrecognized version {version:?}")
             }

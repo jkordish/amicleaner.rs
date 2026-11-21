@@ -31,7 +31,10 @@ use crate::policy::{
     snapshot_reference_keep_reason,
 };
 use crate::recycle_bin::{RetentionRule, list_snapshot_retention_rules, recycle_bin_days};
-use crate::references::{AmiReferenceScan, ReferenceClients, collect_referenced_ami_ids};
+use crate::references::{
+    AmiReferenceScan, ReferenceClients, collect_referenced_ami_ids,
+    refresh_launch_template_versions,
+};
 use crate::ui::{Phase, thousands};
 
 pub(crate) async fn build_region_plan(
@@ -64,7 +67,7 @@ pub(crate) async fn build_region_plan(
     ));
 
     // A failed reference scan only blocks AMI deregistration; snapshot cleanup doesn't depend on it.
-    let reference_scan =
+    let mut reference_scan =
         collect_referenced_ami_ids(ec2_client, reference_clients).await.unwrap_or_else(|error| {
             let reason = format!("AMI reference scan failed: {}", error_chain(error.as_ref()));
             AmiReferenceScan {
@@ -162,13 +165,45 @@ pub(crate) async fn build_region_plan(
             }
             None => {
                 let owned_ids = owned_amis.iter().map(|ami| ami.ami_id.as_str()).collect();
-                plan.launch_template_prune = Some(plan_launch_template_pruning(
-                    &reference_scan,
-                    &owned_ids,
-                    usize::from(args.keep_launch_template_versions),
-                    Cutoffs::new(args, now).min_age,
-                    args,
-                ));
+                let prune = |scan: &AmiReferenceScan| {
+                    plan_launch_template_pruning(
+                        scan,
+                        &owned_ids,
+                        usize::from(args.keep_launch_template_versions),
+                        Cutoffs::new(args, now).min_age,
+                        args,
+                    )
+                };
+                let first = prune(&reference_scan);
+                // Cached inventories may hold versions deleted since; re-read the templates that
+                // would lose versions, then decide on exact inventories.
+                let template_ids = first
+                    .templates
+                    .iter()
+                    .map(|template| template.template_id.clone())
+                    .collect::<Vec<_>>();
+                if template_ids.is_empty() || reference_clients.lt_cache.is_none() {
+                    plan.launch_template_prune = Some(first);
+                } else {
+                    match refresh_launch_template_versions(
+                        ec2_client,
+                        reference_clients,
+                        &mut reference_scan,
+                        &template_ids,
+                    )
+                    .await
+                    {
+                        Ok(()) => plan.launch_template_prune = Some(prune(&reference_scan)),
+                        Err(error) => {
+                            let reason = format!(
+                                "launch template version pruning cancelled: couldn't re-read versions: {}",
+                                error_chain(error.as_ref())
+                            );
+                            warn!("region {region}: {reason}");
+                            plan.blocked.push(reason);
+                        }
+                    }
+                }
             }
         }
     }

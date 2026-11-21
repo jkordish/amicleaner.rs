@@ -63,14 +63,14 @@ use crate::references::lt_cache::{
     default_cache_dir, fetch_plan,
 };
 use crate::references::services::{
-    OtherAccountImage, OwnImageBuilderImage, ParentImage, classify_parent_image, find_ami_ids,
-    find_snapshot_ids, find_ssm_dynamic_references, image_version_matches,
+    OtherAccountImage, OwnImageBuilderImage, ParentImage, batch_pin, classify_parent_image,
+    find_ami_ids, find_snapshot_ids, find_ssm_dynamic_references, image_version_matches,
 };
 use crate::references::version_ranges;
 use crate::references::{
     AmiReferenceScan, ImageReferenceResolution, LaunchTemplateRef, ReferenceClients,
     ReferenceCollector, ReferenceSource, collect_referenced_ami_ids, extract_ssm_parameter_name,
-    resolve_image_reference,
+    refresh_launch_template_versions, resolve_image_reference,
 };
 use crate::report::{
     Action, Pricing, RegionReport, RegionStatus, Report, parse_report_path, render_json,
@@ -652,10 +652,6 @@ fn ebs_record(snapshot_id: &str) -> RecoveryPointRecord {
         vault_locked: false,
         vault_type: Some("BACKUP_VAULT".to_string()),
         recovery_point_arn: Some(format!("arn:aws:ec2:us-east-1::snapshot/{snapshot_id}")),
-        // For EBS the resource ARN is the *volume*, which is what the old code parsed.
-        resource_arn: Some(
-            "arn:aws:ec2:us-east-1:123456789012:volume/vol-0123456789abcdef0".to_string(),
-        ),
         status: Some("COMPLETED".to_string()),
         is_parent: false,
         parent_recovery_point_arn: None,
@@ -767,6 +763,16 @@ fn unmappable_recovery_points_block_every_candidate() {
     assert!(classification.direct_delete.is_empty());
     assert_eq!(classification.blocked.len(), 1);
     assert!(classification.blocked[0].uncertain);
+
+    // In a logically air-gapped vault the copy belongs to AWS Backup, not to this account, so a
+    // non-snapshot ARN there doesn't make every candidate unknown.
+    let mut air_gapped = ebs_record(SNAP_B);
+    air_gapped.recovery_point_arn =
+        Some("arn:aws:backup:us-east-1:123:recovery-point:abc".to_string());
+    air_gapped.vault_type = Some("LOGICALLY_AIR_GAPPED_BACKUP_VAULT".to_string());
+    let classification = classify_backup_snapshots(&candidates, &[air_gapped], &args);
+    assert_eq!(classification.direct_delete.len(), 1);
+    assert!(classification.blocked.is_empty());
 }
 
 #[test]
@@ -3530,6 +3536,54 @@ fn managed_protected_and_oddly_pinned_templates_are_left_alone() {
         Some(VersionKeepReason::UnrecognizedPin("banana".to_string()))
     );
     assert_eq!(template_keep_reason(&plain, &HashSet::from(["7".to_string()]), &args), None);
+    // Batch resolved $Default at its last infrastructure update: any version may be in use.
+    let batch = HashSet::from(["batch:$Default".to_string(), "7".to_string()]);
+    assert_eq!(
+        template_keep_reason(&plain, &batch, &args),
+        Some(VersionKeepReason::BatchSymbolicPin("$Default".to_string()))
+    );
+}
+
+#[test]
+fn batch_pins_symbolic_versions_as_unknown() {
+    assert_eq!(batch_pin(Some("7")), "7");
+    assert_eq!(batch_pin(Some("$Latest")), "batch:$Latest");
+    assert_eq!(batch_pin(Some("$Default")), "batch:$Default");
+    assert_eq!(batch_pin(None), "batch:$Default", "no version means $Default");
+}
+
+/// Pruning re-reads the templates it would delete from, so versions deleted outside the tool but
+/// still cached are neither planned for deletion nor counted among the newest.
+#[tokio::test]
+async fn refreshing_drops_cached_versions_that_no_longer_exist() {
+    let versions = mock!(ec2::Client::describe_launch_template_versions).then_output(|| {
+        let version = |number: i64| {
+            ec2::types::LaunchTemplateVersion::builder()
+                .launch_template_id("lt-a")
+                .version_number(number)
+                .build()
+        };
+        ec2::operation::describe_launch_template_versions::DescribeLaunchTemplateVersionsOutput::builder()
+            .launch_template_versions(version(1))
+            .launch_template_versions(version(2))
+            .launch_template_versions(version(5))
+            .build()
+    });
+    let ec2_client = mock_client!(aws_sdk_ec2, RuleMode::MatchAny, [&versions], no_sdk_retries);
+    let clients = reference_clients(empty_asg_client(), no_ssm_client());
+    let mut scan = AmiReferenceScan {
+        launch_templates: vec![inventory("lt-a", 5, 5, &[], &[])],
+        ..AmiReferenceScan::default()
+    };
+
+    refresh_launch_template_versions(&ec2_client, &clients, &mut scan, &["lt-a".to_string()])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        scan.launch_templates[0].versions.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 5]
+    );
 }
 
 #[test]

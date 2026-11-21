@@ -9,6 +9,7 @@ use log::warn;
 
 use crate::errors::{AppResult, AwsResultExt, describe_sdk_error};
 use crate::inventory::{is_ami_id, is_snapshot_id};
+use crate::policy::BATCH_SYMBOLIC_PIN_PREFIX;
 use crate::references::ReferenceCollector;
 
 /// Concurrent `GetTemplate` calls; CloudFormation throttles well below EC2's limits.
@@ -236,13 +237,13 @@ impl ReferenceCollector<'_> {
                     self.scan.pin_launch_template(
                         template.launch_template_id(),
                         template.launch_template_name(),
-                        template.version(),
+                        Some(&batch_pin(template.version())),
                     );
                     for template_override in template.overrides() {
                         self.scan.pin_launch_template(
                             template_override.launch_template_id(),
                             template_override.launch_template_name(),
-                            template_override.version(),
+                            Some(&batch_pin(template_override.version())),
                         );
                     }
                 }
@@ -411,6 +412,18 @@ impl ReferenceCollector<'_> {
                 self.scan.unresolved_references.insert(reason);
             }
         }
+    }
+}
+
+/// How a Batch launch template version is pinned. A number pins that version. `$Default`,
+/// `$Latest` or no version (meaning `$Default`) were resolved when the environment was created or
+/// last had an infrastructure update, so the version in use is unknown: pinned as a marker that
+/// keeps the whole template.
+pub(crate) fn batch_pin(version: Option<&str>) -> String {
+    let version = version.map(str::trim).filter(|version| !version.is_empty());
+    match version {
+        Some(version) if version.parse::<i64>().is_ok() => version.to_string(),
+        other => format!("{BATCH_SYMBOLIC_PIN_PREFIX}{}", other.unwrap_or("$Default")),
     }
 }
 

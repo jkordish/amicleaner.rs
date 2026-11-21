@@ -645,6 +645,7 @@ where
 }
 
 /// Like `send_with_retries`, but returns the response (`None` when a dry run passed).
+#[cfg(test)]
 pub(crate) async fn send_with_retries_output<T, E, R, F, Fut>(
     policy: RetryPolicy,
     dry_run: bool,

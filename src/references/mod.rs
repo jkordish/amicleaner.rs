@@ -891,6 +891,74 @@ impl ReferenceCollector<'_> {
     }
 }
 
+/// Re-reads every version of `template_ids` (templates pruning would delete from) and makes the
+/// scan's inventory of them exact. Cached versions can include ones deleted outside this tool
+/// since (they stay until the cache expires): planning to delete those would fail, and counting
+/// them among "the newest N" would keep fewer real versions. They're dropped from the cache too.
+/// References they recorded stay in the scan, which only keeps more.
+pub(crate) async fn refresh_launch_template_versions(
+    ec2_client: &ec2::Client,
+    clients: &ReferenceClients,
+    scan: &mut AmiReferenceScan,
+    template_ids: &[String],
+) -> AppResult<()> {
+    let mut phantom: Vec<(String, Vec<i64>)> = Vec::new();
+    for id in template_ids {
+        let Some(index) = scan.launch_templates.iter().position(|template| &template.id == id)
+        else {
+            continue;
+        };
+        let reference = LaunchTemplateRef {
+            launch_template_id: Some(id.clone()),
+            launch_template_name: None,
+            version: None,
+        };
+        let latest = scan.launch_templates[index].latest_version;
+        let mut fetched = BTreeMap::new();
+        let mut gone = false;
+        for range in version_ranges(1, latest) {
+            match launch_template_versions(ec2_client, &reference, &range).await? {
+                Some(versions) => fetched.extend(versions.versions),
+                None => gone = true,
+            }
+        }
+        if gone {
+            // Deleted since the scan: nothing left to prune.
+            scan.launch_templates.remove(index);
+            continue;
+        }
+        let template = &mut scan.launch_templates[index];
+        let missing = template
+            .versions
+            .keys()
+            .filter(|number| !fetched.contains_key(*number))
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            warn!(
+                "launch template {id}: {} cached version(s) no longer exist; not counting them",
+                missing.len()
+            );
+            phantom.push((id.clone(), missing));
+        }
+        template.versions = fetched;
+    }
+
+    if let Some(config) = &clients.lt_cache
+        && !phantom.is_empty()
+    {
+        let path = config.path(&clients.region);
+        let mut cache = LaunchTemplateCache::load(&path, &config.account_id, &clients.region);
+        for (id, versions) in &phantom {
+            cache.remove_versions(id, versions);
+        }
+        if let Err(error) = cache.save(&path) {
+            warn!("couldn't update launch template cache {}: {error}", path.display());
+        }
+    }
+    Ok(())
+}
+
 /// Versions per range when splitting a launch template; matches the API's maximum page size.
 const VERSION_RANGE: i64 = 200;
 

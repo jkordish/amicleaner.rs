@@ -47,7 +47,6 @@ pub(crate) async fn list_ebs_recovery_points(
                         recovery_point_arn: recovery_point
                             .recovery_point_arn()
                             .map(ToString::to_string),
-                        resource_arn: recovery_point.resource_arn().map(ToString::to_string),
                         status: recovery_point.status().map(|status| status.as_str().to_string()),
                         is_parent: recovery_point.is_parent(),
                         parent_recovery_point_arn: recovery_point
@@ -79,6 +78,13 @@ pub(crate) fn classify_backup_snapshots(
     for record in records {
         match recovery_point_snapshot_id(record) {
             Some(snapshot_id) => records_by_snapshot.entry(snapshot_id).or_default().push(record),
+            // Logically air-gapped (and other non-standard) vaults keep copies AWS Backup owns in
+            // its own account, never this account's snapshots: a recovery point there that isn't
+            // a snapshot ARN can't be one of the candidates.
+            None if record
+                .vault_type
+                .as_deref()
+                .is_some_and(|vault_type| vault_type != "BACKUP_VAULT") => {}
             None => unmappable.push(record),
         }
     }
@@ -146,12 +152,10 @@ pub(crate) fn classify_backup_snapshots(
     classification
 }
 
+/// The snapshot a recovery point *is*: only its own ARN says. `ResourceArn` is the source (a
+/// volume for EBS, or a snapshot for a copy of one), so it never stands in for it.
 fn recovery_point_snapshot_id(record: &RecoveryPointRecord) -> Option<&str> {
-    record
-        .recovery_point_arn
-        .as_deref()
-        .and_then(snapshot_id_from_arn)
-        .or_else(|| record.resource_arn.as_deref().and_then(snapshot_id_from_arn))
+    record.recovery_point_arn.as_deref().and_then(snapshot_id_from_arn)
 }
 
 /// Extracts `snap-…` from an EC2 snapshot ARN (`arn:aws:ec2:<region>::snapshot/snap-…`).

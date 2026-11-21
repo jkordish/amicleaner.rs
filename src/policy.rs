@@ -287,6 +287,10 @@ const MANAGED_TEMPLATE_TAG_PREFIXES: &[&str] = &[
     "aws:ec2launchtemplate:",
 ];
 
+/// Prefix of the pin a Batch compute environment records for `$Default`/`$Latest`: Batch fixes
+/// the version those meant at its last infrastructure update, so it isn't the current one.
+pub(crate) const BATCH_SYMBOLIC_PIN_PREFIX: &str = "batch:";
+
 /// Why a whole launch template is left alone, or `None` when its versions may be pruned.
 /// `pins` is every version string something launches this template with.
 pub(crate) fn template_keep_reason(
@@ -303,6 +307,9 @@ pub(crate) fn template_keep_reason(
     }
     if is_protected(&template.tags, args) {
         return Some(VersionKeepReason::Protected);
+    }
+    if let Some(pin) = pins.iter().find_map(|pin| pin.strip_prefix(BATCH_SYMBOLIC_PIN_PREFIX)) {
+        return Some(VersionKeepReason::BatchSymbolicPin(pin.to_string()));
     }
     if let Some(pin) = pins.iter().find(|pin| parse_pinned_version(pin).is_none()) {
         return Some(VersionKeepReason::UnrecognizedPin(pin.clone()));

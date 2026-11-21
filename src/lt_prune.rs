@@ -9,11 +9,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use aws_sdk_ec2 as ec2;
+use aws_sdk_ec2::types::LaunchTemplateErrorCode;
 use chrono::{DateTime, Utc};
 
 use crate::cli::Args;
 use crate::errors::error_chain;
-use crate::execute::send_with_retries_output;
+use crate::execute::{Sent, send_mutation};
 use crate::inventory::is_ami_id;
 use crate::model::{
     Cutoffs, ExecutionSummary, LaunchTemplatePrunePlan, RegionPlan, RetryPolicy, TemplatePrune,
@@ -24,6 +25,9 @@ use crate::policy::{
 use crate::references::lt_cache::LaunchTemplateCache;
 use crate::references::{AmiReferenceScan, ReferenceClients, collect_referenced_ami_ids};
 use crate::ui::Phase;
+
+/// The whole template is gone.
+const TEMPLATE_GONE: &[&str] = &["InvalidLaunchTemplateId.NotFound"];
 
 /// Most versions `DeleteLaunchTemplateVersions` accepts in one call.
 const DELETE_BATCH: usize = 200;
@@ -198,7 +202,7 @@ pub(crate) async fn execute_launch_template_pruning(
 
         for batch in eligible.chunks(DELETE_BATCH) {
             let versions = batch.iter().map(ToString::to_string).collect::<Vec<_>>();
-            let result = send_with_retries_output(retry_policy, args.dry_run, || {
+            let result = send_mutation(retry_policy, args.dry_run, TEMPLATE_GONE, || {
                 ec2_client
                     .delete_launch_template_versions()
                     .launch_template_id(&template.template_id)
@@ -212,8 +216,15 @@ pub(crate) async fn execute_launch_template_pruning(
             }
             match result {
                 // Dry run: the request would have succeeded.
-                Ok(None) => summary.deleted_launch_template_versions += batch.len(),
-                Ok(Some(output)) => {
+                Ok(Sent::Done(None)) => summary.deleted_launch_template_versions += batch.len(),
+                Ok(Sent::Gone(code)) => {
+                    log::warn!(
+                        "launch template {} no longer exists ({code})",
+                        template.template_id
+                    );
+                    summary.skipped_launch_template_versions += batch.len();
+                }
+                Ok(Sent::Done(Some(output))) => {
                     let done = output
                         .successfully_deleted_launch_template_versions()
                         .iter()
@@ -223,13 +234,23 @@ pub(crate) async fn execute_launch_template_pruning(
                     deleted.entry(template.template_id.as_str()).or_default().extend(done);
                     for item in output.unsuccessfully_deleted_launch_template_versions() {
                         let error = item.response_error();
+                        let code = error.and_then(|error| error.code());
+                        // Already deleted (outside this tool, or by a lost earlier attempt): not a
+                        // failure, and the cache should forget it.
+                        if code == Some(&LaunchTemplateErrorCode::LaunchTemplateVersionDoesNotExist)
+                        {
+                            summary.skipped_launch_template_versions += 1;
+                            deleted
+                                .entry(template.template_id.as_str())
+                                .or_default()
+                                .extend(item.version_number());
+                            continue;
+                        }
                         summary.failures.push(format!(
                             "delete {} v{} failed: {}: {}",
                             template.template_id,
                             item.version_number().unwrap_or_default(),
-                            error
-                                .and_then(|error| error.code())
-                                .map_or("unknown", |code| code.as_str()),
+                            code.map_or("unknown", |code| code.as_str()),
                             error.and_then(|error| error.message()).unwrap_or("no message")
                         ));
                     }
